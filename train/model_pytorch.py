@@ -131,7 +131,11 @@ class BiasMask(torch.nn.Module):
         self.scale = None
 
     def set_scale(self, scale: Optional[float]):
-        self.scale = scale
+        del self.scale
+        if scale is not None:
+            self.register_buffer("scale", torch.tensor([scale,], dtype=torch.float32), persistent=False)
+        else:
+            self.scale = None
 
     def add_reg_dict(self, reg_dict:Dict[str,List]):
         if self.is_after_batchnorm:
@@ -249,7 +253,11 @@ class NormMask(torch.nn.Module):
             assert False, f"Unimplemented norm_kind: {self.norm_kind}"
 
     def set_scale(self, scale: Optional[float]):
-        self.scale = scale
+        del self.scale
+        if scale is not None:
+            self.register_buffer("scale", torch.tensor([scale,], dtype=torch.float32), persistent=False)
+        else:
+            self.scale = None
 
     def add_reg_dict(self, reg_dict:Dict[str,List]):
         if self.is_last_batchnorm:
@@ -1082,9 +1090,9 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         self.ffn_linear1 = torch.nn.Linear(c_main, self.ffn_dim, bias=False)
         if self.use_swiglu:
             self.ffn_linear_gate = torch.nn.Linear(c_main, self.ffn_dim, bias=False)
-            self.ffn_act = torch.nn.SiLU(inplace=True)
+            self.ffn_act = torch.nn.SiLU(inplace=False)  # Only QAT-int8 training requires inplace=False, but for normal training it will not be harmful after compilation
         else:
-            self.ffn_act = act(activation, inplace=True)
+            self.ffn_act = act(activation, inplace=False) # Only QAT-int8 training requires inplace=False, but for normal training it will not be harmful after compilation
             
         self.ffn_linear2 = torch.nn.Linear(self.ffn_dim, c_main, bias=False)
         

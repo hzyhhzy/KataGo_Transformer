@@ -22,6 +22,8 @@ from collections import defaultdict
 from typing import Dict, List
 
 import torch
+import torch._dynamo
+torch._dynamo.config.recompile_limit = 32
 import torch.ao.quantization
 import torch.nn
 import torch.optim
@@ -212,6 +214,81 @@ def reset_nan_batchnorm(model, verbose=True):
     # Iterate over the underlying model's buffers
 #    for (name_swa, buf_swa), (name_raw, buf_raw) in zip(swa_model.module.named_buffers(), raw_model.named_buffers()):
 #        logging.info(f"Checking buffer {name_swa} {name_raw}: SWA shape {buf_swa.shape}, Raw shape {buf_raw.shape}")
+
+#def fix_qat_zero_points(model):
+    # Iterate over all modules and find those that have zero_point
+    # Round zero_point to nearest integer and clamp to quant_min/quant_max
+#    for m in model.modules():
+        # Check if it's a FakeQuantize module (which has zero_point, scale, quant_min, quant_max)
+#        if hasattr(m, "zero_point") and hasattr(m, "quant_min") and hasattr(m, "quant_max"):
+#            with torch.no_grad():
+#                m.zero_point.copy_(m.zero_point.round().clamp(m.quant_min, m.quant_max))
+
+def disable_qat_for_unsupported_modules(model):
+    # Disable QAT for input layers and heads/final trunk layers
+    # (the parts inside autocast(enabled=False) and the very beginning)
+    modules_to_disable = [
+        "conv_spatial", "linear_global", "metadata_encoder",
+        "norm_trunkfinal", "act_trunkfinal", "policy_head", "value_head",
+        "norm_intermediate_trunkfinal", "act_intermediate_trunkfinal",
+        "intermediate_policy_head", "intermediate_value_head"
+    ]
+    for module_name in modules_to_disable:
+        module = getattr(model, module_name, None)
+        if module is not None:
+            module.qconfig = None
+
+def is_qat_checkpoint(state_dict):
+    # Check for the existence of common QAT-specific keys
+    # Usually QAT models contain activation_post_process or fake_quant modules
+    # and these modules have scale and zero_point buffers
+    qat_keys = [k for k in state_dict.keys() if "activation_post_process" in k or "fake_quant" in k]
+    if not qat_keys:
+        return False
+    has_scale = any("scale" in k for k in qat_keys)
+    has_zp = any("zero_point" in k for k in qat_keys)
+    return has_scale and has_zp
+    
+
+def get_tensorrt_qat_qconfig():
+    """
+    针对 TensorRT 优化的 QAT 配置 (兼容 PyTorch 2.x+)
+    """
+    
+    import torch
+    # 从顶层引入基础类，而不是依赖不稳定的预设实例
+    from torch.ao.quantization import (
+        FakeQuantize, 
+        MovingAverageMinMaxObserver, 
+        PerChannelMinMaxObserver, 
+        QConfig
+    )
+    # -------------------------------------------------------------------------
+    # 1. 权重配置 (Weights): Per-Channel Symmetric
+    # -------------------------------------------------------------------------
+    # 使用 FakeQuantize 类直接构建
+    weight_qconfig = FakeQuantize.with_args(
+        observer=PerChannelMinMaxObserver,
+        quant_min=-128, 
+        quant_max=127,
+        dtype=torch.qint8,
+        qscheme=torch.per_channel_symmetric,
+        ch_axis=0  # 明确指定通道轴 (通常 Conv2d 的输出通道是第 0 维)
+    )
+    
+    # -------------------------------------------------------------------------
+    # 2. 激活值配置 (Activations): Per-Tensor Symmetric
+    # -------------------------------------------------------------------------
+    act_qconfig = FakeQuantize.with_args(
+        observer=MovingAverageMinMaxObserver,
+        quant_min=-128, 
+        quant_max=127,
+        dtype=torch.qint8,
+        qscheme=torch.per_tensor_symmetric,
+        reduce_range=False  # TensorRT 8.x+ 不需要 reduce_range
+    )
+    
+    return QConfig(activation=act_qconfig, weight=weight_qconfig)
 
 def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writepipes, barrier):
     traindir = args["traindir"]
@@ -456,6 +533,9 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             state_dict_to_check (dict): The dictionary containing model state,
                                          optimizer state, metrics, etc.
         """
+        if qat_int8:
+            logging.info("Skipping nan checking because the model is QAT for int8")
+            return False
         print("Starting NaN check in state_dict...")
         assert(isinstance(state_dict_to_check, dict))
         
@@ -490,7 +570,11 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
             if swa_models is not None and len(swa_models)>0:
                 for i in range(len(swa_models)):
-                    state_dict[f"swa_model_{i}"] = swa_models[i].state_dict()
+                    if swa_models[i] is not None:
+                        state_dict[f"swa_model_{i}"] = swa_models[i].state_dict()
+                    else:
+                        assert qat_int8, f"swa_model_{i} is None but qat_int8 is False"
+                        logging.warning(f"Skipping swa_model_{i} because it is None")
 
             if path is not None:
                 logging.info("Saving checkpoint: " + path)
@@ -634,11 +718,15 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             raw_model.initialize()
             
             if qat_int8:
-                logging.info("Preparing model for INT8 QAT...")
+                logging.info("Preparing model for INT8 QAT (TensorRT compatible)...")
                 # raw_model = QATModelWrapper(raw_model)
-                raw_model.qconfig = torch.ao.quantization.get_default_qat_qconfig('fbgemm')
+                raw_model.qconfig = get_tensorrt_qat_qconfig()
+
+                disable_qat_for_unsupported_modules(raw_model)
+
                 torch.ao.quantization.prepare_qat(raw_model, inplace=True)
-                logging.info("Model prepared for QAT.")
+                #fix_qat_zero_points(raw_model)
+                logging.info("Model prepared for QAT (inputs and heads excluded).")
 
             raw_model.to(device)
             #raw_model_compiled=torch.compile(raw_model,mode="max-autotune-no-cudagraphs")
@@ -707,7 +795,10 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     logging.info(f"Model norm normal baseline computed: {modelnorm_normal_baseline}")
             
             model_state_dict = load_model.load_model_state_dict(state_dict)
-            checkpoint_is_qat_like = any("zero_point" in k for k in model_state_dict.keys())
+            checkpoint_is_qat_like = is_qat_checkpoint(model_state_dict)
+            
+            if(qat_int8 and not checkpoint_is_qat_like):
+                logging.info("QAT_Int8 is enabled but checkpoint is not QAT format, converting it to QAT format")
 
             if not qat_int8 or not checkpoint_is_qat_like: #if qat and checkpoint is qat, then load it later, not here
                 raw_model.load_state_dict(model_state_dict)
@@ -715,11 +806,15 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
 
             if qat_int8:
-                logging.info("Preparing model for INT8 QAT...")
+                logging.info("Preparing model for INT8 QAT (TensorRT compatible)...")
                 # raw_model = QATModelWrapper(raw_model)
-                raw_model.qconfig = torch.ao.quantization.get_default_qat_qconfig('fbgemm')
+                raw_model.qconfig = get_tensorrt_qat_qconfig()
+
+                disable_qat_for_unsupported_modules(raw_model)
+
                 torch.ao.quantization.prepare_qat(raw_model, inplace=True)
-                logging.info("Model prepared for QAT.")
+                #fix_qat_zero_points(raw_model)
+                logging.info("Model prepared for QAT (inputs and heads excluded).")
 
             # Strip off any "module." from when the model was saved with DDP or other things
             
@@ -1596,6 +1691,10 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
                 for swa_idx in range(len(swa_models)):
                     swa_model=swa_models[swa_idx]
+                    if swa_model is None:
+                        assert qat_int8, f"swa_model_{swa_idx} is None but qat_int8 is False"
+                        logging.warning(f"Skipping validating swa_model_{swa_idx} because it is None")
+                        continue
                     
                     logging.info(f"Validating swa_scale={1/swa_model.avg_fn(0,1,0)}")
                     with torch.no_grad():

@@ -8,11 +8,12 @@ import datetime
 import numpy as np
 import torch
 import torch.onnx
+import torch.ao.quantization
 from typing import Dict, List, Optional, Tuple
 
 import modelconfigs
 from model_pytorch import Model
-from load_model import load_model
+#from load_model import load_model
 import data_processing_pytorch
 
 
@@ -60,6 +61,141 @@ Export PyTorch neural net weights to ONNX format for inference.
 # Command line arguments will be parsed in the main block
 
 
+# QAT related functions -----------------------------------------------------------
+
+def get_tensorrt_qat_qconfig():
+    """
+    QAT configuration optimized for TensorRT (compatible with PyTorch 2.x+)
+    """
+    from torch.ao.quantization import (
+        FakeQuantize, 
+        MovingAverageMinMaxObserver, 
+        PerChannelMinMaxObserver, 
+        QConfig
+    )
+    # 1. Weights: Per-Channel Symmetric
+    weight_qconfig = FakeQuantize.with_args(
+        observer=PerChannelMinMaxObserver,
+        quant_min=-128, 
+        quant_max=127,
+        dtype=torch.qint8,
+        qscheme=torch.per_channel_symmetric,
+        ch_axis=0
+    )
+    
+    # 2. Activations: Per-Tensor Symmetric
+    act_qconfig = FakeQuantize.with_args(
+        observer=MovingAverageMinMaxObserver,
+        quant_min=-128, 
+        quant_max=127,
+        dtype=torch.qint8,
+        qscheme=torch.per_tensor_symmetric,
+        reduce_range=False
+    )
+    
+    return QConfig(activation=act_qconfig, weight=weight_qconfig)
+
+def disable_qat_for_unsupported_modules(model):
+    # Disable QAT for input layers and heads/final trunk layers
+    modules_to_disable = [
+        "conv_spatial", "linear_global", "metadata_encoder",
+        "norm_trunkfinal", "act_trunkfinal", "policy_head", "value_head",
+        "norm_intermediate_trunkfinal", "act_intermediate_trunkfinal",
+        "intermediate_policy_head", "intermediate_value_head"
+    ]
+    for module_name in modules_to_disable:
+        module = getattr(model, module_name, None)
+        if module is not None:
+            module.qconfig = None
+
+def is_qat_checkpoint(state_dict):
+    # Check for the existence of common QAT-specific keys
+    qat_keys = [k for k in state_dict.keys() if "activation_post_process" in k or "fake_quant" in k]
+    if not qat_keys:
+        # Check inside 'model' key if it exists
+        if "model" in state_dict:
+            qat_keys = [k for k in state_dict["model"].keys() if "activation_post_process" in k or "fake_quant" in k]
+    
+    if not qat_keys:
+        return False
+    has_scale = any("scale" in k for k in qat_keys)
+    has_zp = any("zero_point" in k for k in qat_keys)
+    return has_scale and has_zp
+
+def load_model_for_export(checkpoint_file, use_swa, device, pos_len=19, verbose=False):
+    checkpoint = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
+    
+    if "config" in checkpoint:
+        model_config = checkpoint["config"]
+    else:
+        logging.info(f"No config in checkpoint")
+        assert False, "No config in checkpoint"
+
+    logging.info(f"Model config: {model_config}")
+    
+    def create_and_load_model(state_dict_key, is_swa=False):
+        m = Model(model_config, pos_len)
+        m.initialize()
+        
+        is_qat = is_qat_checkpoint(checkpoint)
+        if is_qat:
+            logging.info(f"Applying QAT configuration to {'SWA ' if is_swa else ''}model...")
+            m.qconfig = get_tensorrt_qat_qconfig()
+            disable_qat_for_unsupported_modules(m)
+            torch.ao.quantization.prepare_qat(m, inplace=True)
+        
+        # Strip "module." prefix and filter keys
+        state_dict = checkpoint[state_dict_key]
+        model_keys = m.state_dict().keys()
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            name = k
+            if name.startswith("module."):
+                name = name[7:]
+            
+            # Skip keys that are known to be problematic or don't exist in the target model
+            if name == "n_averaged":
+                continue
+            if "score_belief_offset_vector" in name or "score_belief_offset_bias_vector" in name or "score_belief_parity_vector" in name:
+                continue
+            
+            if name in model_keys:
+                new_state_dict[name] = v
+            else:
+                logging.debug(f"Skipping key {name} as it does not exist in the model")
+        
+        m.load_state_dict(new_state_dict, strict=True)
+        
+        if is_qat:
+            # For TensorRT QAT export, we keep the FakeQuantize nodes and DO NOT call convert.
+            # This allows torch.onnx.export to generate standard QDQ (QuantizeLinear/DequantizeLinear) nodes.
+            logging.info(f"Preparing QAT {'SWA ' if is_swa else ''}model for QDQ ONNX export (keeping FakeQuantize)...")
+            m.eval()
+            # Explicitly disable observers to avoid aten::copy in ONNX export
+            m.apply(torch.ao.quantization.disable_observer)
+            m.apply(torch.ao.quantization.enable_fake_quant)
+            
+        return m
+
+    model = create_and_load_model("model")
+    
+    swa_model = None
+    if use_swa:
+        swa_key = "swa_model_0" if "swa_model_0" in checkpoint else "swa_model"
+        if swa_key in checkpoint:
+            swa_model = create_and_load_model(swa_key, is_swa=True)
+        else:
+            logging.warning(f"SWA model requested but {swa_key} not found in checkpoint")
+
+    other_state_dict = {}
+    for key in ["metrics", "running_metrics", "train_state", "last_val_metrics"]:
+        if key in checkpoint:
+            other_state_dict[key] = checkpoint[key]
+            
+    is_qat = is_qat_checkpoint(checkpoint)
+    return model, swa_model, other_state_dict, is_qat
+
+
 class ONNXExportWrapper(torch.nn.Module):
     """
     Wrapper class to handle the model's forward pass for ONNX export.
@@ -73,18 +209,21 @@ class ONNXExportWrapper(torch.nn.Module):
         self.has_metadata_encoder = model.get_has_metadata_encoder()    
         self.disable_mask = disable_mask
     
-    def forward(self, input_spatial: torch.Tensor, input_global: torch.Tensor, 
-                input_meta: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, ...]:
+    def forward(self, *args) -> Tuple[torch.Tensor, ...]:
         """
         Forward pass that returns a flattened tuple of outputs for ONNX compatibility.
         """
-        # Call the original model
-        if self.has_metadata_encoder and input_meta is not None:
-            outputs = self.model(input_spatial, input_global, input_meta, disable_mask=disable_mask)
-        else:
-            outputs = self.model(input_spatial, input_global,disable_mask=disable_mask)
-        outputs=outputs[0]
+        input_spatial = args[0]
+        input_global = args[1]
         
+        # Call the original model
+        if self.has_metadata_encoder:
+            input_meta = args[2]
+            outputs = self.model(input_spatial, input_global, input_meta, disable_mask=self.disable_mask)
+        else:
+            outputs = self.model(input_spatial, input_global, disable_mask=self.disable_mask)
+        
+        outputs = outputs[0]
         pruned_outputs = tuple([outputs[i] for i in [0, 1, 2, 3, 4]])
         return pruned_outputs
 
@@ -254,7 +393,7 @@ def export_to_onnx(model: Model, save_name: str ,export_path: str, pos_len: int 
     model.eval()
     
     # Create wrapper for ONNX export
-    wrapper = ONNXExportWrapper(model,disable_mask)
+    wrapper = ONNXExportWrapper(model, disable_mask=disable_mask)
     wrapper.eval()
     
     # Create dummy inputs
@@ -270,9 +409,8 @@ def export_to_onnx(model: Model, save_name: str ,export_path: str, pos_len: int 
     
     # Add metadata input if the model supports it
     if wrapper.has_metadata_encoder:
-        # Assuming metadata has some standard size - this might need adjustment
-        # based on the actual metadata encoder configuration
-        input_meta = torch.randn(batch_size, 32, dtype=torch.float32)  # Placeholder size
+        num_meta_input_features = modelconfigs.get_num_meta_encoder_input_features(model.config)
+        input_meta = torch.randn(batch_size, num_meta_input_features, dtype=torch.float32)
         inputs.append(input_meta)
         input_names.append('input_meta')
     
@@ -366,7 +504,7 @@ def export_to_onnx(model: Model, save_name: str ,export_path: str, pos_len: int 
             "pos_len_y": str(pos_len),
             "has_mask": "true" if not disable_mask else "false",
             "is_simplified": "false",
-            "is_int8": "false",
+            "is_int8": "true" if (extra_meta_data and extra_meta_data.get("is_int8") == "true") else "false",
             "model_config": str(model.config)
         }
         if extra_meta_data is not None:
@@ -417,18 +555,22 @@ def verify_onnx_model(onnx_path: str, original_model: Model, pos_len: int = 19,
     ort_session = ort.InferenceSession(onnx_path)
     
     # Create test inputs
-    num_spatial_inputs = modelconfigs.get_num_bin_input_features(model.config)
+    num_spatial_inputs = modelconfigs.get_num_bin_input_features(original_model.config)
     input_spatial = torch.randn(batch_size, num_spatial_inputs, pos_len, pos_len, dtype=torch.float32)
     input_spatial[:,0,:,:]=1.0
-    num_global_inputs = modelconfigs.get_num_global_input_features(model.config)
+    num_global_inputs = modelconfigs.get_num_global_input_features(original_model.config)
     input_global = torch.randn(batch_size, num_global_inputs, dtype=torch.float32)
     
+    input_meta = None
+    if original_model.get_has_metadata_encoder():
+        num_meta_input_features = modelconfigs.get_num_meta_encoder_input_features(original_model.config)
+        input_meta = torch.randn(batch_size, num_meta_input_features, dtype=torch.float32)
+
     # Get PyTorch outputs
     original_model.eval()
     with torch.no_grad():
-        if original_model.get_has_metadata_encoder():
-            # For models with metadata encoder, we need to handle this case
-            pytorch_outputs = original_model(input_spatial, input_global)
+        if input_meta is not None:
+            pytorch_outputs = original_model(input_spatial, input_global, input_meta)
         else:
             pytorch_outputs = original_model(input_spatial, input_global)
     pytorch_outputs = pytorch_outputs[0]
@@ -439,6 +581,8 @@ def verify_onnx_model(onnx_path: str, original_model: Model, pos_len: int = 19,
         'input_spatial': input_spatial.numpy(),
         'input_global': input_global.numpy()
     }
+    if input_meta is not None:
+        onnx_inputs['input_meta'] = input_meta.numpy()
     
     # Get ONNX outputs
     onnx_outputs = ort_session.run(None, onnx_inputs)
@@ -554,9 +698,16 @@ if __name__ == "__main__":
     
     # Load model
     logging.info(f"Loading model from checkpoint: {checkpoint_file}")
-    model, swa_model, other_state_dict = load_model(
+    model, swa_model, other_state_dict, is_qat = load_model_for_export(
         checkpoint_file, use_swa, device="cpu", pos_len=pos_len, verbose=True
     )
+    
+    if is_qat:
+        logging.info("Model loaded and converted from QAT checkpoint.")
+        if extra_meta_data is None:
+            extra_meta_data = {}
+        extra_meta_data["is_qat"] = "true"
+        extra_meta_data["is_int8"] = "true"
     
     # Use SWA model if requested and available
     export_model = swa_model if (use_swa and swa_model is not None) else model
@@ -626,39 +777,42 @@ if __name__ == "__main__":
 
     # Quantize to INT8 if requested
     if int8:
-        if calib_data is None:
-            logging.error("Calibration data directory (-calib-data) is required for INT8 quantization.")
-            exit(1)
-        
-        onnx_int8_path = onnx_path.replace(".onnx", "_int8.onnx")
-        quantize_onnx(
-            onnx_path, 
-            onnx_int8_path, 
-            calib_data, 
-            export_model, 
-            pos_len, 
-            batch_size, 
-            disable_mask,
-            num_samples=calib_num,
-            method=calib_method
-        )
-        
-        # Verify the quantized model
-        logging.info("Verifying quantized INT8 model...")
-        int8_verification_passed = verify_onnx_model(onnx_int8_path, export_model, pos_len, batch_size)
-        if not int8_verification_passed:
-            logging.warning("INT8 model verification failed! (This is common for INT8, check accuracy manually)")
-        
-        # Use the INT8 model for subsequent steps
-        onnx_path = onnx_int8_path
-        
-        # Update metadata
-        import onnx
-        model_to_update = onnx.load(onnx_path)
-        for prop in model_to_update.metadata_props:
-            if prop.key == "is_int8":
-                prop.value = "true"
-        onnx.save(model_to_update, onnx_path)
+        if is_qat:
+            logging.info("Model is already QAT, skipping post-training quantization.")
+        else:
+            if calib_data is None:
+                logging.error("Calibration data directory (-calib-data) is required for INT8 quantization.")
+                exit(1)
+            
+            onnx_int8_path = onnx_path.replace(".onnx", "_int8.onnx")
+            quantize_onnx(
+                onnx_path, 
+                onnx_int8_path, 
+                calib_data, 
+                export_model, 
+                pos_len, 
+                batch_size, 
+                disable_mask,
+                num_samples=calib_num,
+                method=calib_method
+            )
+            
+            # Verify the quantized model
+            logging.info("Verifying quantized INT8 model...")
+            int8_verification_passed = verify_onnx_model(onnx_int8_path, export_model, pos_len, batch_size)
+            if not int8_verification_passed:
+                logging.warning("INT8 model verification failed! (This is common for INT8, check accuracy manually)")
+            
+            # Use the INT8 model for subsequent steps
+            onnx_path = onnx_int8_path
+            
+            # Update metadata
+            import onnx
+            model_to_update = onnx.load(onnx_path)
+            for prop in model_to_update.metadata_props:
+                if prop.key == "is_int8":
+                    prop.value = "true"
+            onnx.save(model_to_update, onnx_path)
     
     
     logging.info(f"Export completed successfully!")
