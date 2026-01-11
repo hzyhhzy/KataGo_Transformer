@@ -22,6 +22,7 @@ from collections import defaultdict
 from typing import Dict, List
 
 import torch
+import torch.ao.quantization
 import torch.nn
 import torch.optim
 import torch.distributed
@@ -86,6 +87,7 @@ if __name__ == "__main__":
 
     optional_args.add_argument('-multi-gpus', help='Use multiple gpus, comma-separated device ids', required=False)
     optional_args.add_argument('-use-fp16', help='Use fp16 training', required=False, action='store_true')
+    optional_args.add_argument('-qat-int8', help='Enable INT8 QAT', required=False, action='store_true')    
     optional_args.add_argument('-master-port', help='Localhost port', default=23456, type=int, required=False)
     optional_args.add_argument('-no-compile', help='Do not torch.compile', required=False, action='store_true')
 
@@ -157,6 +159,7 @@ import torch
 import torch.nn as nn
 from torch.nn.modules.batchnorm import _BatchNorm  # 覆盖所有 BatchNorm 类型
 
+
 def reset_nan_batchnorm(model, verbose=True):
     """
     Reset NaN/Inf in BatchNorm layers
@@ -198,6 +201,17 @@ def reset_nan_batchnorm(model, verbose=True):
         logging.info("No NaN/Inf in BatchNorm layers")
     
     return has_nan
+
+#def sync_swa_buffers_shape(swa_model, raw_model):
+    # swa_model is AveragedModel
+    # raw_model is the training model
+    
+#    if not hasattr(swa_model, "module"):
+#        assert(False)
+    # logging.info("Debug: Comparing SWA buffers with Raw buffers")
+    # Iterate over the underlying model's buffers
+#    for (name_swa, buf_swa), (name_raw, buf_raw) in zip(swa_model.module.named_buffers(), raw_model.named_buffers()):
+#        logging.info(f"Checking buffer {name_swa} {name_raw}: SWA shape {buf_swa.shape}, Raw shape {buf_raw.shape}")
 
 def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writepipes, barrier):
     traindir = args["traindir"]
@@ -243,6 +257,11 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     no_export = args["no_export"]
     no_repeat_files = args["no_repeat_files"]
     quit_if_no_data = args["quit_if_no_data"]
+    qat_int8 = args["qat_int8"]
+
+    if qat_int8 and use_fp16:
+        logging.warning("WARNING: QAT INT8 enabled. Disabling FP16/AMP to ensure quantization accuracy and stability.")
+        use_fp16 = False
 
     gnorm_stats_debug = args["gnorm_stats_debug"]
 
@@ -582,6 +601,11 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
         assert num_params == num_reg_dict_params, "Reg dict does not have entries for all params in model"
         return param_groups
 
+    def make_ema_avg(factor):
+        def ema_avg(avg_param, cur_param, num_averaged):
+            return avg_param + factor * (cur_param - avg_param)
+        return ema_avg
+
     def load():
         if not os.path.exists(get_checkpoint_path()):
             logging.info("No preexisting checkpoint found at: " + get_checkpoint_path())
@@ -600,10 +624,6 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
         else:
             path_to_load_from = get_checkpoint_path()
 
-        def make_ema_avg(factor):
-            def ema_avg(avg_param, cur_param, num_averaged):
-                return avg_param + factor * (cur_param - avg_param)
-            return ema_avg
             
         if path_to_load_from is None:
             logging.info("Initializing new model!")
@@ -613,6 +633,13 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             raw_model = Model(model_config,pos_len)
             raw_model.initialize()
             
+            if qat_int8:
+                logging.info("Preparing model for INT8 QAT...")
+                # raw_model = QATModelWrapper(raw_model)
+                raw_model.qconfig = torch.ao.quantization.get_default_qat_qconfig('fbgemm')
+                torch.ao.quantization.prepare_qat(raw_model, inplace=True)
+                logging.info("Model prepared for QAT.")
+
             raw_model.to(device)
             #raw_model_compiled=torch.compile(raw_model,mode="max-autotune-no-cudagraphs")
             if not no_compile:
@@ -635,6 +662,9 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     swa_scale=swa_scales[i]
                     new_factor = 1.0 / swa_scale
                     #ema_avg = lambda avg_param, cur_param, num_averaged: avg_param + new_factor * (cur_param - avg_param)
+                    if qat_int8:
+                        swa_models.append(None) # init it when accumulating swa for the first time
+                        continue
                     swa_model = AveragedModel(raw_model, avg_fn=make_ema_avg(new_factor))
                     swa_models.append(swa_model)
 
@@ -675,11 +705,38 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     modelnorm_normal_baseline = modelnorm_normal.detach().cpu().item()
                     train_state["modelnorm_normal_baseline"] = modelnorm_normal_baseline
                     logging.info(f"Model norm normal baseline computed: {modelnorm_normal_baseline}")
+            
+            model_state_dict = load_model.load_model_state_dict(state_dict)
+            checkpoint_is_qat_like = any("zero_point" in k for k in model_state_dict.keys())
+
+            if not qat_int8 or not checkpoint_is_qat_like: #if qat and checkpoint is qat, then load it later, not here
+                raw_model.load_state_dict(model_state_dict)
+
+
+
+            if qat_int8:
+                logging.info("Preparing model for INT8 QAT...")
+                # raw_model = QATModelWrapper(raw_model)
+                raw_model.qconfig = torch.ao.quantization.get_default_qat_qconfig('fbgemm')
+                torch.ao.quantization.prepare_qat(raw_model, inplace=True)
+                logging.info("Model prepared for QAT.")
 
             # Strip off any "module." from when the model was saved with DDP or other things
-            model_state_dict = load_model.load_model_state_dict(state_dict)
-            raw_model.load_state_dict(model_state_dict)
-            reset_nan_batchnorm(raw_model, verbose=True)
+            
+            if qat_int8 and checkpoint_is_qat_like:
+                logging.info("Loading QAT checkpoint (native) into QAT model")
+                import dummy_input
+                logging.info("Running dummy forward pass to determine QAT shapes...")
+                raw_model.eval()
+                dummy_binary, dummy_global, dummy_meta = dummy_input.generate_dummy_inputs(model_config, 1, pos_len, device="cpu")
+                with torch.no_grad():
+                    raw_model(dummy_binary, dummy_global, input_meta=dummy_meta)
+                raw_model.train()
+                raw_model.load_state_dict(model_state_dict)
+                
+            
+            if not qat_int8:
+                reset_nan_batchnorm(raw_model, verbose=True)
             
             raw_model.to(device)
             #raw_model_compiled=torch.compile(raw_model,mode="max-autotune-no-cudagraphs")
@@ -700,6 +757,10 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             swa_models = []
             if rank == 0 and len(swa_scales)>0:
                 for i in range(len(swa_scales)):
+                    if qat_int8 and not checkpoint_is_qat_like:
+                        logging.info(f"Swa model {i} in state_dict is not QAT like, not loading it")
+                        swa_models.append(None) # init it when accumulating swa for the first time
+                        continue
                     swa_scale=swa_scales[i]
                     new_factor = 1.0 / swa_scale
                     #ema_avg = lambda avg_param, cur_param, num_averaged: avg_param + new_factor * (cur_param - avg_param)
@@ -710,6 +771,9 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                         swa_model.load_state_dict(swa_model_state_dict)
                     else:
                         logging.info(f"Swa model {i} not found in state_dict")
+                        if qat_int8:
+                            swa_models.append(None) # init it when accumulating swa for the first time
+                            continue
                     swa_models.append(swa_model)
                     
                     
@@ -1432,7 +1496,12 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                         train_state["swa_sample_accum"] = 0
                         #logging.info("Accumulating SWA")
                         for i in range(len(swa_models)):
+                            #sync_swa_buffers_shape(swa_models[i],raw_model)
                             #logging.info(f"Accumulating swa_scale={1/swa_models[i].avg_fn(0,1,0)}")
+                            if swa_models[i] is None:
+                                assert(qat_int8)
+                                logging.info(f"Initializing qat swa_model[{i}] with swa_scale={1/swa_scales[i]}")
+                                swa_models[i] = AveragedModel(raw_model, avg_fn=make_ema_avg(1/swa_scales[i]))
                             swa_models[i].update_parameters(raw_model)
 
             logging.info("Finished training subepoch!")
