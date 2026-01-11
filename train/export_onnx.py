@@ -13,6 +13,18 @@ from typing import Dict, List, Optional, Tuple
 import modelconfigs
 from model_pytorch import Model
 from load_model import load_model
+import data_processing_pytorch
+
+
+try:
+    from onnxruntime.quantization import QuantType, quantize_static, CalibrationDataReader, CalibrationMethod, QuantFormat, quant_pre_process
+except ImportError:
+    QuantType = None
+    quantize_static = None
+    CalibrationDataReader = None
+    CalibrationMethod = None
+    QuantFormat = None
+    quant_pre_process = None
 
 #torch.backends.mha.set_fastpath_enabled(False) # transformer model will have bugs, so set false
 # 定义手动实现的 forward 函数
@@ -24,8 +36,9 @@ def manual_rms_norm_forward(self, x):
     # mean(-1) 计算均方值
     mean_square = (x_f32 * x_f32).mean(-1, keepdim=True)
     
+    eps_tensor = torch.tensor([self.eps,], dtype=x_f32.dtype, device=x_f32.device) # to make sure int8 not error
     # 3. 计算 rsqrt (1 / sqrt(x))
-    inv_rms = torch.rsqrt(mean_square + self.eps)
+    inv_rms = torch.rsqrt(mean_square + eps_tensor)
     
     # 4. 乘回原类型输入，并应用 gamma 参数
     # 注意：最终乘法建议在原精度下做，或者全在 FP32 做完再转回
@@ -76,10 +89,153 @@ class ONNXExportWrapper(torch.nn.Module):
         return pruned_outputs
 
 
+class ONNXCalibrationDataReader(CalibrationDataReader):
+    """
+    Calibration data reader for ONNX quantization.
+    Reads data from .npz files using the project's data processing logic.
+    """
+    def __init__(self, calib_data_dir: str, model: Model, pos_len: int, batch_size: int, require_exact_poslen: bool, num_samples: int = 128):
+        super().__init__()
+        self.calib_data_dir = calib_data_dir
+        self.model = model
+        self.pos_len = pos_len
+        self.batch_size = batch_size
+        self.require_exact_poslen = require_exact_poslen
+        self.num_samples = num_samples
+        self.consumed_samples = 0
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logging.info(f"Calibration data reader using device: {self.device}")
+        self.data_iter = self._create_iter()
+
+    def _create_iter(self):
+        import glob
+        npz_files = glob.glob(os.path.join(self.calib_data_dir, "**/*.npz"), recursive=True)
+        if not npz_files:
+            logging.warning(f"No .npz files found in {self.calib_data_dir} for calibration.")
+            return
+
+        # Shuffle files to get a representative sample
+        import random
+        random.shuffle(npz_files)
+
+        for batch in data_processing_pytorch.read_npz_training_data(
+            npz_files,
+            self.batch_size,
+            world_size=1,
+            rank=0,
+            pos_len=self.pos_len,
+            device=self.device,
+            symmetry_type="none",
+            include_meta=self.model.get_has_metadata_encoder(),
+            enable_history_matrices=False,
+            model_config=self.model.config
+        ):
+            if self.consumed_samples >= self.num_samples:
+                break
+
+            mask_layer= batch["binaryInputNCHW"][:,0,:,:].cpu().numpy()
+            assert mask_layer.shape == (self.batch_size, self.pos_len, self.pos_len), f"mask_layer shape {mask_layer.shape} != {(self.batch_size, self.pos_len, self.pos_len)}"
+            if self.require_exact_poslen:
+                assert mask_layer.all(axis=(1,2)).all(), f"int8 calibration data should be all {self.pos_len}x{self.pos_len} games if -disable-mask"
+            
+            # Move to CPU for ONNX Runtime input
+            inputs = {
+                'input_spatial': batch["binaryInputNCHW"].cpu().numpy(),
+                'input_global': batch["globalInputNC"].cpu().numpy()
+            }
+            if self.model.get_has_metadata_encoder():
+                inputs['input_meta'] = batch["metadataInputNC"].cpu().numpy()
+            
+            self.consumed_samples += self.batch_size
+            yield inputs
+
+    def get_next(self):
+        return next(self.data_iter, None)
+
+
+def quantize_onnx(model_path: str, output_path: str, calib_data_dir: str, 
+                  model: Model, pos_len: int, batch_size: int, 
+                  disable_mask: bool,
+                  num_samples: int = 128, method: str = "Entropy") -> None:
+    """
+    Quantize an ONNX model to INT8.
+    """
+    if quantize_static is None:
+        logging.error("onnxruntime-quantization not installed. Cannot perform INT8 quantization.")
+        return
+
+    # Pre-processing
+    actual_input_path = model_path
+    temp_preprocessed_path = None
+    if quant_pre_process is not None:
+        logging.info(f"Running pre-processing on {model_path}...")
+        temp_preprocessed_path = model_path.replace(".onnx", "_preprocessed.onnx")
+        try:
+            logging.info("Attempting pre-processing with symbolic shape inference...")
+            quant_pre_process(model_path, temp_preprocessed_path, skip_symbolic_shape=False)
+            actual_input_path = temp_preprocessed_path
+            logging.info(f"Pre-processing completed successfully.")
+        except Exception as e:
+            logging.warning(f"Pre-processing with symbolic shape inference failed: {e}")
+            logging.info("Retrying pre-processing without symbolic shape inference...")
+            try:
+                quant_pre_process(model_path, temp_preprocessed_path, skip_symbolic_shape=True)
+                actual_input_path = temp_preprocessed_path
+                logging.info(f"Pre-processing completed (skipped symbolic shape inference).")
+            except Exception as e2:
+                logging.error(f"Pre-processing failed again: {e2}. Proceeding with original model.")
+                temp_preprocessed_path = None
+    else:
+        logging.warning("quant_pre_process not available. Skipping pre-processing.")
+
+    logging.info(f"Quantizing model to INT8: {actual_input_path} -> {output_path}")
+    logging.info(f"Using calibration data from: {calib_data_dir} ({num_samples} samples)")
+
+    dr = ONNXCalibrationDataReader(calib_data_dir, model, pos_len, batch_size, disable_mask, num_samples)
+    
+    # Map method string to CalibrationMethod
+    calib_method = {
+        "MinMax": CalibrationMethod.MinMax,
+        "Entropy": CalibrationMethod.Entropy,
+        "Percentile": CalibrationMethod.Percentile,
+    }.get(method, CalibrationMethod.Entropy)
+
+    from onnxruntime.quantization import QuantFormat
+
+    kwargs = {
+        "model_input": actual_input_path,
+        "model_output": output_path,
+        "calibration_data_reader": dr,
+        "calibrate_method": calib_method,
+        "activation_type": QuantType.QInt8,  # 改为 QInt8 以实现对称量化，兼容 TensorRT
+        "weight_type": QuantType.QInt8,      # 权重保持 QInt8
+        "per_channel": False,                # 关闭 per_channel 以避免标量(如eps)量化时的 axis 错误 (TensorRT 报错 nbDims=0)
+        "reduce_range": False,
+        "quant_format": QuantFormat.QDQ,
+        "extra_options": {
+            "ActivationSymmetric": True, 
+            "WeightSymmetric": True,
+            "QuantizeBias": False
+        }
+    }
+
+    logging.info(f"Starting INT8 quantization (QDQ format for TensorRT)...")
+    quantize_static(**kwargs)
+    logging.info("INT8 quantization completed.")
+
+    # Clean up temporary pre-processed model
+    if temp_preprocessed_path and os.path.exists(temp_preprocessed_path):
+        try:
+            os.remove(temp_preprocessed_path)
+            logging.info(f"Cleaned up temporary pre-processed model: {temp_preprocessed_path}")
+        except Exception as e:
+            logging.warning(f"Failed to delete temporary pre-processed model: {e}")
+
+
 def export_to_onnx(model: Model, save_name: str ,export_path: str, pos_len: int = 19, 
                    batch_size: int = 1, opset_version: int = 20, disable_mask: bool = False,
                    verbose: bool = False, extra_meta_data: Dict[str, str] = None,
-                   auto_fp16: bool = False) -> None:
+                   auto_fp16: bool = False, fix_batchsize: bool = False) -> None:
     """
     Export PyTorch model to ONNX format.
     
@@ -91,6 +247,7 @@ def export_to_onnx(model: Model, save_name: str ,export_path: str, pos_len: int 
         opset_version: ONNX opset version
         verbose: Whether to enable verbose logging
         auto_fp16: Whether to automatically convert to mixed precision (FP16)
+        fix_batchsize: Whether to fix the batch size to the specified value
     """
     
     # Set model to evaluation mode
@@ -130,10 +287,14 @@ def export_to_onnx(model: Model, save_name: str ,export_path: str, pos_len: int 
     
     # Dynamic axes for variable batch size
     dynamic_axes = {}
-    for name in input_names:
-        dynamic_axes[name] = {0: 'batch_size'}
-    for name in output_names:
-        dynamic_axes[name] = {0: 'batch_size'}
+    if not fix_batchsize:
+        for name in input_names:
+            dynamic_axes[name] = {0: 'batch_size'}
+        for name in output_names:
+            dynamic_axes[name] = {0: 'batch_size'}
+    else:
+        dynamic_axes = None
+        logging.info(f"Fixed batch size enabled: {batch_size}")
     
     # Export to ONNX
     logging.info(f"Exporting model to ONNX format: {export_path}")
@@ -204,6 +365,8 @@ def export_to_onnx(model: Model, save_name: str ,export_path: str, pos_len: int 
             "pos_len_x": str(pos_len),
             "pos_len_y": str(pos_len),
             "has_mask": "true" if not disable_mask else "false",
+            "is_simplified": "false",
+            "is_int8": "false",
             "model_config": str(model.config)
         }
         if extra_meta_data is not None:
@@ -315,10 +478,15 @@ if __name__ == "__main__":
         parser.add_argument('-use-swa', help='Use SWA model if available', action='store_true', required=False)
         parser.add_argument('-pos-len', help='Spatial edge length (e.g. 19 for 19x19 Go)', type=int, default=19, required=False)
         parser.add_argument('-batch-size', help='Batch size for ONNX export', type=int, default=4, required=False)
+        parser.add_argument('-fix-batchsize', help='Fix the batch size to the value of -batch-size (no dynamic axes)', action='store_true', required=False)
         parser.add_argument('-opset-version', help='ONNX opset version', type=int, default=20, required=False)
         parser.add_argument('-simplify', help='Simplify ONNX model using onnx-simplifier', action='store_true', required=False)
         parser.add_argument('-disable-mask', help='Disable masks in CNN and attention', action='store_true', required=False)
         parser.add_argument('-auto-fp16', help='Convert to half precision (FP16) automatically', action='store_true', required=False)
+        parser.add_argument('-int8', help='Convert to INT8 quantization', action='store_true', required=False)
+        parser.add_argument('-calib-data', help='Directory with .npz files for INT8 calibration', required=False)
+        parser.add_argument('-calib-num', help='Number of samples for INT8 calibration', type=int, default=128, required=False)
+        parser.add_argument('-calib-method', help='Calibration method: MinMax, Entropy, Percentile', default='Entropy', required=False)
         parser.add_argument('-verbose', help='Verbose output', action='store_true', required=False)
         parser.add_argument('-author', help='Author name for metadata', required=False,default="unknown")
         parser.add_argument('-comment', help='Comment for metadata', required=False,default="")
@@ -333,10 +501,15 @@ if __name__ == "__main__":
         use_swa = args.use_swa
         pos_len = args.pos_len
         batch_size = args.batch_size
+        fix_batchsize = args.fix_batchsize
         opset_version = args.opset_version
         simplify = args.simplify
         disable_mask = args.disable_mask
         auto_fp16 = args.auto_fp16
+        int8 = args.int8
+        calib_data = args.calib_data
+        calib_num = args.calib_num
+        calib_method = args.calib_method
         verbose = args.verbose
         author = args.author
         comment = args.comment
@@ -352,9 +525,14 @@ if __name__ == "__main__":
         use_swa = True
         pos_len = 19
         batch_size = 128
+        fix_batchsize = False
         opset_version = 20
         simplify = False
         auto_fp16 = False
+        int8 = False
+        calib_data = None
+        calib_num = 128
+        calib_method = "Entropy"
         verbose = False
     
     # Create export directory
@@ -409,7 +587,8 @@ if __name__ == "__main__":
         disable_mask=disable_mask,
         verbose=verbose,
         extra_meta_data=extra_meta_data,
-        auto_fp16=auto_fp16
+        auto_fp16=auto_fp16,
+        fix_batchsize=fix_batchsize
     )
     
     # Verify the exported model
@@ -424,39 +603,66 @@ if __name__ == "__main__":
     if simplify:
         import onnxsim
         logging.info("Simplifying ONNX model...")
-        simplified_path = os.path.join(export_dir, f"{model_name}_simplified.onnx")
-        onnxsim.simplify(onnx_path, simplified_path)
-        logging.info(f"Simplified model saved to: {simplified_path}")
+        simplified_path = onnx_path.replace(".onnx", "_simplified.onnx")
+        try:
+            # 使用 onnxsim 进行简化
+            model_opt, check = onnxsim.simplify(onnx_path)
+            if check:
+                import onnx
+                onnx.save(model_opt, simplified_path)
+                onnx_path = simplified_path
+                logging.info(f"Simplified model saved to: {simplified_path}")
+                
+                # Update metadata
+                model_to_update = onnx.load(onnx_path)
+                for prop in model_to_update.metadata_props:
+                    if prop.key == "is_simplified":
+                        prop.value = "true"
+                onnx.save(model_to_update, onnx_path)
+            else:
+                logging.error("ONNX simplify check failed!")
+        except Exception as e:
+            logging.error(f"Simplifying failed: {e}")
+
+    # Quantize to INT8 if requested
+    if int8:
+        if calib_data is None:
+            logging.error("Calibration data directory (-calib-data) is required for INT8 quantization.")
+            exit(1)
+        
+        onnx_int8_path = onnx_path.replace(".onnx", "_int8.onnx")
+        quantize_onnx(
+            onnx_path, 
+            onnx_int8_path, 
+            calib_data, 
+            export_model, 
+            pos_len, 
+            batch_size, 
+            disable_mask,
+            num_samples=calib_num,
+            method=calib_method
+        )
+        
+        # Verify the quantized model
+        logging.info("Verifying quantized INT8 model...")
+        int8_verification_passed = verify_onnx_model(onnx_int8_path, export_model, pos_len, batch_size)
+        if not int8_verification_passed:
+            logging.warning("INT8 model verification failed! (This is common for INT8, check accuracy manually)")
+        
+        # Use the INT8 model for subsequent steps
+        onnx_path = onnx_int8_path
+        
+        # Update metadata
+        import onnx
+        model_to_update = onnx.load(onnx_path)
+        for prop in model_to_update.metadata_props:
+            if prop.key == "is_int8":
+                prop.value = "true"
+        onnx.save(model_to_update, onnx_path)
     
-    # Save metadata
-    metadata = {
-        "model_name": model_name,
-        "export_time": datetime.datetime.now().isoformat(),
-        "checkpoint_file": checkpoint_file,
-        "model_type": model_type,
-        "pos_len": pos_len,
-        "batch_size": batch_size,
-        "opset_version": opset_version,
-        "has_intermediate_head": export_model.get_has_intermediate_head(),
-        "has_metadata_encoder": export_model.get_has_metadata_encoder(),
-        "model_config": export_model.config
-    }
-    
-    # Add training state info if available
-    if "train_state" in other_state_dict:
-        train_state = other_state_dict["train_state"]
-        if "global_step_samples" in train_state:
-            metadata["global_step_samples"] = train_state["global_step_samples"]
-        if "total_num_data_rows" in train_state:
-            metadata["total_num_data_rows"] = train_state["total_num_data_rows"]
-    
-    metadata_path = os.path.join(export_dir, f"{model_name}_metadata.json")
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
     
     logging.info(f"Export completed successfully!")
     logging.info(f"ONNX model: {onnx_path}")
-    logging.info(f"Metadata: {metadata_path}")
     
     exit(0)
 

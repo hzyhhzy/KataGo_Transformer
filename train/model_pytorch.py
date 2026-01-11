@@ -393,6 +393,10 @@ class NormMask(torch.nn.Module):
 class KataGPool(torch.nn.Module):
     def __init__(self):
         super(KataGPool, self).__init__()
+        # Constants should be tensor to make tensorrt work on int8
+        self.register_buffer("t_14", torch.tensor([14.0,], dtype=torch.float32), persistent=False)
+        self.register_buffer("t_10", torch.tensor([10.0,], dtype=torch.float32), persistent=False)
+        self.register_buffer("t_1", torch.tensor([1.0,], dtype=torch.float32), persistent=False)
 
     def forward(self, x, mask, mask_sum_hw):
         """
@@ -404,15 +408,15 @@ class KataGPool(torch.nn.Module):
         Returns: NC11
         """
         if mask is not None:
-            mask_sum_hw_sqrt_offset = torch.sqrt(mask_sum_hw) - 14.0
+            mask_sum_hw_sqrt_offset = torch.sqrt(mask_sum_hw) - self.t_14
         
             x_fp32=x.to(torch.float32)
             layer_mean = torch.sum(x_fp32, dim=(2, 3), keepdim=True) / mask_sum_hw
             # All activation functions we use right now are always greater than -1.0, and map 0 -> 0.
             # So off-board areas will equal 0, and then this max is mask-safe if we assign -1.0 to off-board areas.
-            (layer_max,_argmax) = torch.max((x+(mask-1.0)).view(x.shape[0],x.shape[1],-1).to(torch.float32), dim=2)
+            (layer_max,_argmax) = torch.max((x+(mask-self.t_1)).view(x.shape[0],x.shape[1],-1).to(torch.float32), dim=2)
         else:
-            mask_sum_hw_sqrt_offset = (x.shape[2]*x.shape[3])**0.5 - 14.0
+            mask_sum_hw_sqrt_offset = (x.shape[2]*x.shape[3])**0.5 - self.t_14
             x_fp32=x.to(torch.float32)
             layer_mean = torch.mean(x_fp32, dim=(2, 3), keepdim=True) 
             # All activation functions we use right now are always greater than -1.0, and map 0 -> 0.
@@ -422,7 +426,7 @@ class KataGPool(torch.nn.Module):
         layer_max = layer_max.view(x.shape[0],x.shape[1],1,1)
 
         out_pool1 = layer_mean
-        out_pool2 = layer_mean * (mask_sum_hw_sqrt_offset / 10.0)
+        out_pool2 = layer_mean * (mask_sum_hw_sqrt_offset / self.t_10)
         out_pool3 = layer_max
 
         out = torch.cat((out_pool1, out_pool2, out_pool3), dim=1)
@@ -432,6 +436,11 @@ class KataGPool(torch.nn.Module):
 class KataValueHeadGPool(torch.nn.Module):
     def __init__(self):
         super(KataValueHeadGPool, self).__init__()
+        # Constants should be tensor to make tensorrt work on int8
+        self.register_buffer("t_14", torch.tensor([14.0,], dtype=torch.float32), persistent=False) 
+        self.register_buffer("t_10", torch.tensor([10.0,], dtype=torch.float32), persistent=False)
+        self.register_buffer("t_100", torch.tensor([100.0,], dtype=torch.float32), persistent=False)
+        self.register_buffer("t_0_1", torch.tensor([0.1,], dtype=torch.float32), persistent=False)
 
     def forward(self, x, mask, mask_sum_hw):
         """
@@ -443,18 +452,18 @@ class KataValueHeadGPool(torch.nn.Module):
         Returns: NC11
         """
         if mask is not None:
-            mask_sum_hw_sqrt_offset = torch.sqrt(mask_sum_hw) - 14.0
+            mask_sum_hw_sqrt_offset = torch.sqrt(mask_sum_hw) - self.t_14
         
             x_fp32=x.to(torch.float32)
             layer_mean = torch.sum(x_fp32, dim=(2, 3), keepdim=True) / mask_sum_hw
         else:
-            mask_sum_hw_sqrt_offset = (x.shape[2]*x.shape[3])**0.5 - 14.0
+            mask_sum_hw_sqrt_offset = (x.shape[2]*x.shape[3])**0.5 - self.t_14
             x_fp32=x.to(torch.float32)
             layer_mean = torch.mean(x_fp32, dim=(2, 3), keepdim=True) 
 
         out_pool1 = layer_mean
-        out_pool2 = layer_mean * (mask_sum_hw_sqrt_offset / 10.0)
-        out_pool3 = layer_mean * ((mask_sum_hw_sqrt_offset * mask_sum_hw_sqrt_offset) / 100.0 - 0.1)
+        out_pool2 = layer_mean * (mask_sum_hw_sqrt_offset / self.t_10)
+        out_pool3 = layer_mean * ((mask_sum_hw_sqrt_offset * mask_sum_hw_sqrt_offset) / self.t_100 - self.t_0_1)
 
         out = torch.cat((out_pool1, out_pool2, out_pool3), dim=1)
         return out
@@ -548,6 +557,10 @@ class KataConvAndAttentionPool(torch.nn.Module):
         self.actg = act(activation, inplace=True)
         self.conv_mix = torch.nn.Conv2d(c_gpool*2, c_out, kernel_size=1, padding="same", bias=False)
 
+        self.register_buffer("t_1", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("t_6000", torch.tensor(6000.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("t_0_1", torch.tensor(0.1, dtype=torch.float32), persistent=False)
+
     def initialize(self, scale):
         # Scaling so that variance on the r and g branches adds up to 1.0
         r_scale = 0.8
@@ -600,10 +613,10 @@ class KataConvAndAttentionPool(torch.nn.Module):
         outq = self.conv1q(out).view(n*self.c_apheads, self.c_gpool//self.c_apheads, h*w)
         attention_logits = torch.bmm(torch.transpose(outk,1,2), outq) # n*heads, src h*w, dst h*w
         attention_logits = attention_logits.view(n, self.c_apheads, h*w, h*w)
-        attention_logits = attention_logits - (1.0 - mask.view(n,1,h*w,1)) * 6000.0
+        attention_logits = attention_logits - (self.t_1 - mask.view(n,1,h*w,1)) * self.t_6000
         attention_logits = attention_logits.view(n * self.c_apheads, h*w, h*w)
         attention = torch.nn.functional.softmax(attention_logits, dim=1)
-        attention_scale = 0.1 / torch.sqrt(torch.sum(torch.square(attention), dim=1, keepdim=True)) # n*heads, 1, h*w
+        attention_scale = self.t_0_1 / torch.sqrt(torch.sum(torch.square(attention), dim=1, keepdim=True)) # n*heads, 1, h*w
 
         outg = self.normg(outg, mask=mask, mask_sum=mask_sum)
         outg = self.actg(outg).view(n*self.c_apheads, self.c_gpool//self.c_apheads, h*w)
@@ -1562,6 +1575,10 @@ class PolicyHead(torch.nn.Module):
         self.act2 = act(activation)
         self.conv2p = torch.nn.Conv2d(c_p1, self.num_policy_outputs, kernel_size=1, padding="same", bias=False)
 
+        # Constants should be tensor to make tensorrt work on int8
+        self.register_buffer("t_1", torch.tensor([1.0,], dtype=torch.float32), persistent=False)
+        self.register_buffer("t_5000", torch.tensor([5000.0,], dtype=torch.float32), persistent=False)
+
 
     def initialize(self):
         # Scaling so that variance on the p and g branches adds up to 1.0
@@ -1627,7 +1644,7 @@ class PolicyHead(torch.nn.Module):
 
         # mask out parts outside the board by making them a huge neg number, so that they're 0 after softmax
         if mask is not None:
-            outpolicy = outpolicy - (1.0 - mask) * 5000.0
+            outpolicy = outpolicy - (self.t_1 - mask) * self.t_5000
         # NC(HW) concat with NC1
         return torch.cat((outpolicy.view(outpolicy.shape[0],outpolicy.shape[1],-1), outpass.unsqueeze(-1)),dim=2)
 
