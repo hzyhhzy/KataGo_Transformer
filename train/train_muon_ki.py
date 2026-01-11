@@ -267,14 +267,27 @@ def get_tensorrt_qat_qconfig():
     # 1. 权重配置 (Weights): Per-Channel Symmetric
     # -------------------------------------------------------------------------
     # 使用 FakeQuantize 类直接构建
-    weight_qconfig = FakeQuantize.with_args(
-        observer=PerChannelMinMaxObserver,
-        quant_min=-128, 
-        quant_max=127,
-        dtype=torch.qint8,
-        qscheme=torch.per_channel_symmetric,
-        ch_axis=0  # 明确指定通道轴 (通常 Conv2d 的输出通道是第 0 维)
-    )
+
+    usePerChannel = False # slow when using TensorRT for inference
+
+    if usePerChannel:
+        weight_qconfig = FakeQuantize.with_args(
+            observer=PerChannelMinMaxObserver,
+            quant_min=-128, 
+            quant_max=127,
+            dtype=torch.qint8,
+            qscheme=torch.per_channel_symmetric,
+            ch_axis=0  # 明确指定通道轴 (通常 Conv2d 的输出通道是第 0 维)
+        )
+    else:
+        weight_qconfig = FakeQuantize.with_args(
+            observer=MovingAverageMinMaxObserver,
+            quant_min=-128, 
+            quant_max=127,
+            dtype=torch.qint8,
+            qscheme=torch.per_tensor_symmetric,
+            reduce_range=False  # TensorRT 8.x+ 不需要 reduce_range
+        )
     
     # -------------------------------------------------------------------------
     # 2. 激活值配置 (Activations): Per-Tensor Symmetric

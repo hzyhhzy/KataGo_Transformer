@@ -1957,7 +1957,7 @@ for name, base_config in list(config_of_name.items()):
     # Add parallel heads that uses the final trunk batchnorm.
     # The original normal heads disables the final trunk batchnorm
     # This only makes sense for configs that use some form of batchnorm.
-    if "norm" in config["norm_kind"]:
+    if "norm" in base_config["norm_kind"]:
         config = base_config.copy()
         config["has_intermediate_head"] = True
         if("intermediate_head_blocks" not in config):
