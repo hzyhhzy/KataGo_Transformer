@@ -272,9 +272,9 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     quit_if_no_data = args["quit_if_no_data"]
     qat_int8 = args["qat_int8"]
 
-    if qat_int8 and use_fp16:
-        logging.warning("WARNING: QAT INT8 enabled. Disabling FP16/AMP to ensure quantization accuracy and stability.")
-        use_fp16 = False
+    if qat_int8:
+        assert no_compile, "QAT INT8 enabled. Compilation is not supported. Remove this if it not report any error."
+        assert not use_fp16, "QAT INT8 enabled. FP16/AMP is not supported. Remove this if it not report any error."
 
     gnorm_stats_debug = args["gnorm_stats_debug"]
 
@@ -322,8 +322,9 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     assert (len(swa_scales)>0 ) 
     assert (lookahead_k is None) == (lookahead_alpha is None)
 
-    if qat_int8:
-        from qat_helper import get_tensorrt_qat_qconfig, is_qat_checkpoint, disable_qat_for_unsupported_modules
+    from qat_helper import get_tensorrt_qat_qconfig, is_qat_checkpoint, disable_qat_for_unsupported_modules
+    #if qat_int8:
+    #    from qat_helper import get_tensorrt_qat_qconfig, is_qat_checkpoint, disable_qat_for_unsupported_modules
     # SET UP LOGGING -------------------------------------------------------------
 
     logging.root.handlers = []

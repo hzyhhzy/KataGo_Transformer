@@ -13,6 +13,12 @@ import logging
 import modelconfigs
 from packaging.version import parse
 
+MAYBE_QAT = True # An extra QuantStub will be added to ensure the conv is quantized. If false, tensorrt will not detect the QDQ nodes and the model will run on fp16
+if MAYBE_QAT:
+    from torch.ao.quantization import QuantStub
+QUANT_ACTIVATION = False # If false, the NormMask will not be quantized. There is no extra QDQ before activation so the activation will not be quantized.
+assert not QUANT_ACTIVATION, "The model become completely random when QUANT_ACTIVATION because of unknown reason. And it will not accelerate the inference speed."
+
 MIN_VERSION = '2.7'
 current_version = torch.__version__
 ERROR_MSG = (
@@ -204,6 +210,12 @@ class NormMask(torch.nn.Module):
         )
         self.c_in = c_in
 
+        if MAYBE_QAT and QUANT_ACTIVATION:
+            if(self.use_gamma):
+                self.quant_after_gamma = QuantStub()
+            self.quant_after_beta = QuantStub()
+            self.quant_after_mask = QuantStub()
+
         self.scale = None
         self.gamma = None
         if self.norm_kind == "bnorm" or (self.norm_kind == "fixscaleonenorm" and self.is_last_batchnorm):
@@ -298,29 +310,26 @@ class NormMask(torch.nn.Module):
 
     def apply_gamma_beta_scale_mask(self, x, mask):
         #logging.info(f"{(x*x).mean()},{(x*x).max()}")
+        y = x
+        if self.gamma is not None:
+            y = y * (self.gamma + 1.0)
+            if MAYBE_QAT and QUANT_ACTIVATION:
+                y = self.quant_after_gamma(y)
         
+        if self.scale is not None:
+            y = y * self.scale
+            
+        y = y + self.beta
+        if MAYBE_QAT and QUANT_ACTIVATION:
+            y = self.quant_after_beta(y)
+            
         if mask is not None:
-            if self.scale is not None:
-                if self.gamma is not None:
-                    return (x * ((self.gamma + 1.0) * self.scale) + self.beta) * mask
-                else:
-                    return (x * self.scale + self.beta) * mask
-            else:
-                if self.gamma is not None:
-                    return (x * (self.gamma + 1.0) + self.beta) * mask
-                else:
-                    return (x + self.beta) * mask
-        else:
-            if self.scale is not None:
-                if self.gamma is not None:
-                    return (x * ((self.gamma + 1.0) * self.scale) + self.beta) 
-                else:
-                    return (x * self.scale + self.beta) 
-            else:
-                if self.gamma is not None:
-                    return (x * (self.gamma + 1.0) + self.beta) 
-                else:
-                    return (x + self.beta) 
+            y = y * mask
+        
+        if MAYBE_QAT and QUANT_ACTIVATION:
+            y = self.quant_after_mask(y) # always
+            
+        return y
             
 
 
@@ -720,6 +729,9 @@ class NormActConv(torch.nn.Module):
         self.conv1x1 = None
         if self.conv is not None and kernel_size > 1 and "use_repvgg_linear" in config and config["use_repvgg_linear"]:
             self.conv1x1 = torch.nn.Conv2d(c_in, c_out, kernel_size=1, padding="same", bias=False)
+        
+        if MAYBE_QAT:
+            self.quant_before_conv = QuantStub()
 
     def initialize(self, scale, norm_scale=None):
         self.norm.set_scale(norm_scale)
@@ -771,6 +783,8 @@ class NormActConv(torch.nn.Module):
         out = x
         out = self.norm(out, mask=mask, mask_sum=mask_sum)
         out = self.act(out)
+        if MAYBE_QAT:  # Automatic quant will not add QDQ nodes here, so manually add them to ensure the conv is quantized
+            out = self.quant_before_conv(out)
         # print("TENSOR AFTER NORMACT")
         # print(out)
         if self.convpool is not None:
