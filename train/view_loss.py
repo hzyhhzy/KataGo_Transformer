@@ -1,26 +1,34 @@
 baseDir="../data/train/"
-lossItems={"p0loss":(1.7,2.2),"vloss":(0.6,0.7),"loss":(50.5,52),"pacc1":(0.40,0.5),"gnorm_batch":(0,40000),"exgnorm":(0,0),"norm_normal_batch":(0,0),"norm_normal_attn_batch":(0,0),"norm_output_batch":(0,0),"norm_noreg_batch":(0,0),"norm_output_noreg_batch":(0,0),"pslr_batch":(1e-7,1e-2)}#name,ylim,  0 means default
+lossItems={"p0loss":(1.75,2.4),"vloss":(0.55,0.65),"loss":(50,51),"pacc1":(0.40,0.5),"gnorm_batch":(0,40000),"exgnorm":(0,0),"norm_normal_batch":(0,0),"norm_normal_attn_batch":(0,0),"norm_output_batch":(0,0),"norm_noreg_batch":(0,0),"norm_output_noreg_batch":(0,0),"pslr_batch":(1e-7,1e-2)}#name,ylim,  0 means default
 
 
-trainDirs=["ref_b30c128h4tfrs","b14c192h6tfrs_1_old","b14c192h6tfrs_1_fd1","b14c192h6tfrs_1_fd2","b14c192h6tfrs_1",]
+trainDirs=["b14c192h6tfrs_1","b14c192h6tfrs_soap1","b14c192h6tfrs_soap2","b14c192h6tfrs_soap3","b14c192h6tfrs_soap4",
+           "b14c192h6tfrs_soap5_adam", # Adam control group
+           "b14c192h6tfrs_soap5", #precondition_frequency=100, betas=(0.99, 0.99), normalize_grads=True
+           "b14c192h6tfrs_muon2", #control group
+           "b14c192h6tfrs_soap6", #precondition_frequency=10, betas=(0.95, 0.95), normalize_grads=False
+           "b14c192h6tfrs_soap7", #precondition_frequency=10, betas=(0.99, 0.99), normalize_grads=True
+           "b14c192h6tfrs_soap8", #precondition_frequency=10, betas=(0.99, 0.99), normalize_grads=False
+           "b14c192h6tfrs_soap9", #precondition_frequency=10, betas=(0.95, 0.95), normalize_grads=True
+          ]
 
 autoBias=False
 biases=None
 scales=None
 
 
-lossTypes=["train","val_swa0"]
+#lossTypes=["train","val_swa0","val_swa1"]
 #lossTypes=["train","val","val_swa0"]
-#lossTypes=["train"]
+lossTypes=["train"]
 #lossTypes=["val_swa0"]
 outputFile="../losstf.png"
 
 logPlot=True
-logPlotXmin=1e8
+logPlotXmin=1e7
 logPlotXmax=1e10
 #logPlotXmax=None
 #smooth_window=100
-smooth_window=0
+smooth_window=10
 smooth_window_val=0
 
 
