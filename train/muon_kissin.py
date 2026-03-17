@@ -136,6 +136,69 @@ class MuonWithAuxAdamKimi(torch.optim.Optimizer):
         
         return False
 
+    def _local_muon_state_for_checkpoint(self, optimizer_state_dict):
+        local_muon_state = {}
+        if not self.is_distributed:
+            return local_muon_state
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        for group in optimizer_state_dict["param_groups"]:
+            if not group.get("use_muon", False):
+                continue
+            for local_index, param_id in enumerate(group["params"]):
+                if local_index % world_size != rank:
+                    continue
+                if param_id not in optimizer_state_dict["state"]:
+                    continue
+                state = optimizer_state_dict["state"][param_id]
+                if "momentum_buffer" not in state:
+                    continue
+                local_muon_state[param_id] = {
+                    "momentum_buffer": state["momentum_buffer"].detach().cpu()
+                }
+        return local_muon_state
+
+    def state_dict_for_checkpoint(self):
+        optimizer_state_dict = super().state_dict()
+        if not self.is_distributed:
+            return optimizer_state_dict
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_muon_state = self._local_muon_state_for_checkpoint(optimizer_state_dict)
+        gathered_muon_state = [None for _ in range(world_size)] if rank == 0 else None
+        dist.gather_object(local_muon_state, gathered_muon_state, dst=0)
+        if rank != 0:
+            return None
+        for rank_state in gathered_muon_state:
+            if rank_state is None:
+                continue
+            for param_id, state in rank_state.items():
+                optimizer_state_dict["state"][param_id] = state
+        return optimizer_state_dict
+
+    def load_state_dict_for_checkpoint(self, state_dict):
+        if not self.is_distributed:
+            super().load_state_dict(state_dict)
+            return
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        muon_non_local_param_ids = set()
+        for group in state_dict["param_groups"]:
+            if not group.get("use_muon", False):
+                continue
+            for local_index, param_id in enumerate(group["params"]):
+                if local_index % world_size != rank:
+                    muon_non_local_param_ids.add(param_id)
+        filtered_state = dict(state_dict["state"])
+        for param_id in muon_non_local_param_ids:
+            if param_id in filtered_state:
+                del filtered_state[param_id]
+        filtered_state_dict = {
+            "state": filtered_state,
+            "param_groups": state_dict["param_groups"],
+        }
+        super().load_state_dict(filtered_state_dict)
+
 
     @torch.no_grad()
     def step(self):

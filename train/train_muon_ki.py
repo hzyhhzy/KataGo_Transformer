@@ -492,10 +492,14 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
         if gnorm_stats_debug:
             logging.warning("Skipping save since debugging gnorm stats")
             return
+    
+        # 必须所有 rank 都调用：内部使用了 dist.gather_object 这一 collective，
+        # 若只让 rank0 进入会导致其余 rank 与 rank0 通信不同步并卡住。
+        optimizer_state_dict = optimizer.state_dict_for_checkpoint()
         if rank == 0:
             state_dict = {}
             state_dict["model"] = raw_model.state_dict()
-            state_dict["optimizer"] = optimizer.state_dict()
+            state_dict["optimizer"] = optimizer_state_dict
             state_dict["metrics"] = metrics_obj.state_dict()
             state_dict["running_metrics"] = running_metrics
             
@@ -833,7 +837,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
             optimizer = MuonWithAuxAdamKimi(get_param_groups(raw_model,train_state,running_metrics),muon_momentum)
             if "optimizer" in state_dict:
-                optimizer.load_state_dict(state_dict["optimizer"])
+                optimizer.load_state_dict_for_checkpoint(state_dict["optimizer"])
             else:
                 logging.info("WARNING: Optimizer not found in state dict, using fresh optimizer")
 
