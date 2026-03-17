@@ -40,7 +40,15 @@ from metrics_pytorch import Metrics
 import load_model
 import data_processing_pytorch
 from metrics_logging import accumulate_metrics, log_metrics, clear_metric_nonfinite
-from muon_kissin import MuonWithAuxAdamKimi
+#from soap import SOAP
+from soap_opt0225 import SOAP
+
+SOAP_merge_dims=True 
+SOAP_precondition_frequency=10 # default was 10 but slow
+SOAP_betas=(0.99, 0.99) # default was 0.95, but for KataGo, batchsize is much smaller(~100)
+SOAP_max_precond_dim=10000 # reduce it if you train small nets, or it will wrongly merge the dims
+SOAP_normalize_grads=True # soap.py said that this will help if SOAP_precondition_frequency>=100
+
 torch.set_float32_matmul_precision('high')
 # HANDLE COMMAND AND ARGS -------------------------------------------------------------------
 
@@ -75,12 +83,11 @@ if __name__ == "__main__":
 
     
     optional_args.add_argument('-model-kind', help='String name for what model config to use', required=False)
-    optional_args.add_argument('-lr-base', help='LR base', type=float, default=1e-5, required=False)
+    optional_args.add_argument('-lr-base', help='LR base', type=float, default=3e-6, required=False)
     optional_args.add_argument('-lr-scale', help='LR multiplier on the hardcoded schedule', type=float, required=False)
     optional_args.add_argument('-lr-scale-auto-type', help='LR auto scaling type',type=str, required=False, default="")
     optional_args.add_argument('-wd-scale', help='Weight decay scale', type=float, default=20.0, required=False)
     
-    optional_args.add_argument('-muon-momentum', type=float, help='momentum of Muon optimizer', default=0.95, required=False)
     
     optional_args.add_argument('-gnorm-clip-scale', help='Multiplier on gradient clipping threshold', type=float, required=False)
     optional_args.add_argument('-sub-epochs', help='Reload training data up to this many times per epoch', type=int, default=1, required=False)
@@ -241,7 +248,6 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     lr_base = args["lr_base"]
     lr_scale = args["lr_scale"]
     wd_scale = args["wd_scale"]
-    muon_momentum = args["muon_momentum"]
     lr_scale_auto_type = args["lr_scale_auto_type"]
     gnorm_clip_scale = args["gnorm_clip_scale"]
     sub_epochs = args["sub_epochs"]
@@ -708,7 +714,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 train_state["modelnorm_normal_baseline"] = modelnorm_normal_baseline
                 logging.info(f"Model norm normal baseline computed: {modelnorm_normal_baseline}")
 
-            optimizer = MuonWithAuxAdamKimi(get_param_groups(raw_model,train_state,running_metrics),muon_momentum)
+            optimizer = SOAP(get_param_groups(raw_model,train_state,running_metrics),merge_dims=SOAP_merge_dims,precondition_frequency=SOAP_precondition_frequency,betas=SOAP_betas,max_precond_dim=SOAP_max_precond_dim,normalize_grads=SOAP_normalize_grads)
 
             return (model_config, ddp_model, raw_model, swa_models, optimizer, metrics_obj, running_metrics, train_state, last_val_metrics)
         else:
@@ -831,7 +837,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             else:
                 logging.info("WARNING: Running metrics not found in state dict, using fresh last val metrics")
 
-            optimizer = MuonWithAuxAdamKimi(get_param_groups(raw_model,train_state,running_metrics),muon_momentum)
+            optimizer = SOAP(get_param_groups(raw_model,train_state,running_metrics),merge_dims=SOAP_merge_dims,precondition_frequency=SOAP_precondition_frequency,betas=SOAP_betas,max_precond_dim=SOAP_max_precond_dim,normalize_grads=SOAP_normalize_grads)
             if "optimizer" in state_dict:
                 optimizer.load_state_dict(state_dict["optimizer"])
             else:
@@ -984,9 +990,6 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             else:
                 new_lr_this_group = per_sample_lr * warmup_scale * group_scale 
 
-            #new_lr_this_group*=0.125
-            if("muon_lr_multiplier" in param_group):
-                param_group["muon_lr_multiplier"] = 8.0
             
             if param_group["lr"] != new_lr_this_group:
                 param_group["lr"] = new_lr_this_group
