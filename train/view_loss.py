@@ -9,7 +9,10 @@ trainDirs=["b14c192h6tfrs_1","b14c192h6tfrs_soap1","b14c192h6tfrs_soap2","b14c19
            "b14c192h6tfrs_soap6", #precondition_frequency=10, betas=(0.95, 0.95), normalize_grads=False
            "b14c192h6tfrs_soap7", #precondition_frequency=10, betas=(0.99, 0.99), normalize_grads=True
            "b14c192h6tfrs_soap8", #precondition_frequency=10, betas=(0.99, 0.99), normalize_grads=False
-           "b14c192h6tfrs_soap9", #precondition_frequency=10, betas=(0.95, 0.95), normalize_grads=True
+           "b14c192h6tfrs_soap9", #precondition_frequency=10, betas=(0.95, 0.95), normalize_grads=True  betas maybe 0.99?
+           "b14c192h6tfrp_1", #repeat=4 precondition_frequency=10, betas=(0.99, 0.99), normalize_grads=True
+           "b14c192h6tfrs_soap10", #precondition_frequency=10, betas=(0.95, 0.95), normalize_grads=True 
+           "b14c192h6tfrs_muon3", #param_group["muon_lr_multiplier"] = 1.0
           ]
 
 autoBias=False

@@ -986,7 +986,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
             #new_lr_this_group*=0.125
             if("muon_lr_multiplier" in param_group):
-                param_group["muon_lr_multiplier"] = 8.0
+                param_group["muon_lr_multiplier"] = 1.0
             
             if param_group["lr"] != new_lr_this_group:
                 param_group["lr"] = new_lr_this_group

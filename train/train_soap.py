@@ -45,7 +45,7 @@ from soap_opt0225 import SOAP
 
 SOAP_merge_dims=True 
 SOAP_precondition_frequency=10 # default was 10 but slow
-SOAP_betas=(0.99, 0.99) # default was 0.95, but for KataGo, batchsize is much smaller(~100)
+SOAP_betas=(0.95, 0.95) # default was 0.95, but for KataGo, batchsize is much smaller(~100)
 SOAP_max_precond_dim=10000 # reduce it if you train small nets, or it will wrongly merge the dims
 SOAP_normalize_grads=True # soap.py said that this will help if SOAP_precondition_frequency>=100
 

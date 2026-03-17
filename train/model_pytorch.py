@@ -1225,7 +1225,187 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         
         x = x.permute(0, 2, 1).view(batch_size, channels, height, width)
         return x
+
+class TransformerRepeatBlock(torch.nn.Module):
+    def __init__(
+        self,
+        name: str,
+        c_main: int,
+        config: Dict,
+        activation: str,
+        pos_len: int,
+        use_swiglu: bool,
+        use_rope: bool = True
+    ):
+        super(TransformerRepeatBlock, self).__init__()
+        self.name = name
+        self.repeat_num = config.get("transformer_repeat_num", 4)
+        assert c_main % self.repeat_num == 0, "c_main must be divisible by repeat_num"
+        c_main = c_main // self.repeat_num
+        self.norm_kind = config.get("norm_kind", "layer")
+        self.ffn_dim = config.get("transformer_ffn_channels", c_main * 3)
+        self.use_swiglu = use_swiglu  
+        self.use_rope = use_rope
+        # --- GQA Config ---
+        self.num_heads = config.get("transformer_heads", 4)             # Query Heads
+        self.num_kv_heads = config.get("transformer_kv_heads", self.num_heads) # KV Heads (Key/Value)
         
+        # Compute how many query heads each KV head serves (group size)
+        self.n_rep = self.num_heads // self.num_kv_heads
+        
+        self.head_dim = c_main // self.num_heads
+        
+        assert self.head_dim * self.num_heads == c_main, "Embed dim mismatch"
+        assert self.head_dim % 4 == 0, "Head dim mismatch for 2D RoPE"
+        assert self.num_heads % self.num_kv_heads == 0, \
+            f"Query heads ({self.num_heads}) must be divisible by KV heads ({self.num_kv_heads})"
+
+        # Keep full-sized Q projection
+        self.q_proj = torch.nn.Linear(c_main, c_main,bias=False)
+        # Reduce K/V projection dimensions (GQA)
+        self.k_proj = torch.nn.Linear(c_main, self.num_kv_heads * self.head_dim,bias=False)
+        self.v_proj = torch.nn.Linear(c_main, self.num_kv_heads * self.head_dim,bias=False)
+        
+        self.out_proj = torch.nn.Linear(c_main, c_main,bias=False)
+
+        # Cache cos and sin
+        # Assume precompute_freqs_cos_sin_2d_fixed is defined externally
+        if self.use_rope:
+            self.rope_theta = config.get("rope_theta", 100.0) # KV Heads (Key/Value)
+            assert self.rope_theta > pos_len * 2.0, f"theta={self.rope_theta} of RoPE may be too small for pos_len={pos_len}"
+            cos_cached, sin_cached = precompute_freqs_cos_sin_2d(self.head_dim, pos_len, self.rope_theta)
+            self.register_buffer("cos_cached", cos_cached, persistent=False)
+            self.register_buffer("sin_cached", sin_cached, persistent=False)
+        else:
+            self.cos_cached = None
+            self.sin_cached = None
+
+        self.ffn_linear1 = torch.nn.Linear(c_main, self.ffn_dim, bias=False)
+        if self.use_swiglu:
+            self.ffn_linear_gate = torch.nn.Linear(c_main, self.ffn_dim, bias=False)
+            self.ffn_act = torch.nn.SiLU(inplace=False)  # Only QAT-int8 training requires inplace=False, but for normal training it will not be harmful after compilation
+        else:
+            self.ffn_act = act(activation, inplace=False) # Only QAT-int8 training requires inplace=False, but for normal training it will not be harmful after compilation
+            
+        self.ffn_linear2 = torch.nn.Linear(self.ffn_dim, c_main, bias=False)
+        
+        self.norm1 = torch.nn.RMSNorm(c_main, eps=1e-6)
+        self.norm2 = torch.nn.RMSNorm(c_main, eps=1e-6)
+        #self.norm1 = torch.nn.LayerNorm(c_main, eps=1e-6)
+        #self.norm2 = torch.nn.LayerNorm(c_main, eps=1e-6)
+
+    def add_reg_dict(self, reg_dict: Dict[str, List]):
+        for name, param in self.named_parameters():
+            #print(name)
+            if "norm" in name or "cached" in name:
+                reg_dict["noreg"].append(param)
+                continue
+            if "weight" in name:
+                if any(x in name for x in ["q_proj", "k_proj", "v_proj", "out_proj"]):
+                    reg_dict["normal_attn"].append(param)
+                else:
+                    reg_dict["normal"].append(param)
+            else:
+                reg_dict["noreg"].append(param)
+
+    def initialize(self, fixup_scale):
+        pass
+        
+    def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[Dict] = None):
+        batch_size, channels, height, width = x.shape
+        seq_len = height * width * self.repeat_num
+        c_main = channels // self.repeat_num
+
+        x_in = x.view(batch_size, c_main, -1).permute(0, 2, 1)
+
+        
+        x_norm = self.norm1(x_in)
+        
+        # 1. Linear Projections
+        q = self.q_proj(x_norm)
+        k = self.k_proj(x_norm)
+        v = self.v_proj(x_norm)
+        
+        
+        # 2. Reshape for RoPE
+        # Q: (B, S, Num_Heads, D)
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        # K, V: (B, S, Num_KV_Heads, D)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        
+        # 3. Apply RoPE (Broadcasting works here automatically)
+        if self.use_rope:
+            q = q.view(batch_size * self.repeat_num, height * width, self.num_heads, self.head_dim)
+            k = k.view(batch_size * self.repeat_num, height * width, self.num_kv_heads, self.head_dim)
+            q, k = apply_rotary_emb(q, k, self.cos_cached, self.sin_cached)
+            q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+            k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        
+        # 4. Permute to (B, H, S, D)
+        q = q.permute(0, 2, 1, 3) 
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        #Use scaled_dot_product_attention, will expand K,V
+        # --- [Core change] GQA adaptation for SDPA ---
+        # Make K/V heads logically match Q to satisfy SDPA shape checks.
+        # Goal: (B, H_kv, S, D) -> (B, H_q, S, D)
+        # Where H_q = H_kv * n_rep
+        
+        if self.n_rep > 1:
+            # 1. Add a dimension (B, H_kv, 1, S, D)
+            # 2. expand broadcast (B, H_kv, n_rep, S, D) 
+            # 3. reshape and merge (B, H_q, S, D) 
+            k = k.unsqueeze(2).expand(batch_size, self.num_kv_heads, self.n_rep, seq_len, self.head_dim)
+            k = k.reshape(batch_size, self.num_heads, seq_len, self.head_dim)
+            
+            v = v.unsqueeze(2).expand(batch_size, self.num_kv_heads, self.n_rep, seq_len, self.head_dim)
+            v = v.reshape(batch_size, self.num_heads, seq_len, self.head_dim)
+        
+        # 2. Handle mask (as above)
+        if mask is not None:
+            mask_flat = mask.view(batch_size, 1, 1, height * width)
+            attn_mask = torch.zeros_like(mask_flat, dtype=q.dtype)
+            attn_mask.masked_fill_(mask_flat == 0, float('-inf'))
+            attn_mask = attn_mask.repeat(1, 1, 1, self.repeat_num)
+        else:
+            attn_mask = None
+        
+        # 3. Use SDPA
+        # Now q, k, v all have shape (B, H_q, S, D); CUDA kernels optimize access
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=0.0
+        )
+        
+        # (B, H, S, D) -> (B, S, H, D)
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous()
+        
+        # Flatten head dimension -> (B, S, C)
+        attn_output = attn_output.view(batch_size, seq_len, c_main)
+        
+        # 7. Output Projection & FFN
+        attn_output = self.out_proj(attn_output)
+        x = x_in + attn_output
+        xn = self.norm2(x)
+        
+        if self.use_swiglu:
+            # SwiGLU: (Act(Linear1(x)) * LinearGate(x)) -> Linear2
+            x1 = self.ffn_linear1(xn)
+            x1 = self.ffn_act(x1)
+            x_gate = self.ffn_linear_gate(xn)
+            x1 = x1 * x_gate
+        else:
+            # Standard: Act(Linear1(x)) -> Linear2
+            x1 = self.ffn_linear1(xn)
+            x1 = self.ffn_act(x1)
+        x1 = self.ffn_linear2(x1)
+        x = x + x1
+        
+        x = x.permute(0, 2, 1).view(batch_size, channels, height, width)
+        return x 
 class BottleneckResBlock(torch.nn.Module):
     def __init__(
         self,
@@ -2110,6 +2290,16 @@ class Model(torch.nn.Module):
                 ))
             elif block_kind == "transformerropesg":
                 self.blocks.append(TransformerRoPEGQABlock(
+                    name=block_name,
+                    c_main=self.c_trunk,
+                    config=self.config,
+                    activation=self.activation,
+                    pos_len=pos_len,
+                    use_swiglu=True,
+                    use_rope=True
+                ))
+            elif block_kind == "transformerrepeat":
+                self.blocks.append(TransformerRepeatBlock(
                     name=block_name,
                     c_main=self.c_trunk,
                     config=self.config,

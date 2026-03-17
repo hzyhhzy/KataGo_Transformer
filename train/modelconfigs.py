@@ -1876,6 +1876,45 @@ sandbox = {
 }
 
 
+
+b14c192h6tfrp = {
+    "version":15,
+    "norm_kind":"fixup",
+    "bnorm_epsilon": 1e-4,
+    "bnorm_running_avg_momentum": 0.001,
+    "initial_conv_1x1": False,
+    "transformer_repeat_num": 4,
+    "trunk_num_channels":192*4,
+    "mid_num_channels":192*4,
+    "gpool_num_channels":32*4,
+    "transformer_ffn_channels":512,
+    "transformer_heads":6,
+    "transformer_kv_heads":6,
+    "use_attention_pool":False,
+    "num_attention_pool_heads":4,
+    "block_kind": [
+        ["rconv1","transformerrepeat"],
+        ["rconv2","transformerrepeat"],
+        ["rconv3","transformerrepeat"],
+        ["rconv4","transformerrepeat"],
+        ["rconv5","transformerrepeat"],
+        ["rconv6","transformerrepeat"],
+        ["rconv7","transformerrepeat"],
+        ["rconv8","transformerrepeat"],
+        ["rconv9","transformerrepeat"],
+        ["rconv10","transformerrepeat"],
+        ["rconv11","transformerrepeat"],
+        ["rconv12","transformerrepeat"],
+        ["rconv13","transformerrepeat"],
+        ["rconv14","transformerrepeat"],
+    ],
+    "p1_num_channels":32,
+    "g1_num_channels":32,
+    "v1_num_channels":32,
+    "sbv2_num_channels":80,
+    "num_scorebeliefs":8,
+    "v2_size":96,
+}
 base_config_of_name = {
     # Micro-sized model configs
     "b1c6nbt": b1c6nbt,
@@ -1955,6 +1994,11 @@ base_config_of_name = {
     "b80c256h8tfrs":b80c256h8tfrs, 
     
     "b40c512h16tfrs":b40c512h16tfrs, 
+
+
+
+    
+    "b14c192h6tfrp":b14c192h6tfrp, 
     "sandbox": sandbox,
 }
 
