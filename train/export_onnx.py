@@ -174,69 +174,69 @@ class ONNXExportWrapper(torch.nn.Module):
         pruned_outputs = tuple([outputs[i] for i in [0, 1, 2, 3, 4]])
         return pruned_outputs
 
+if CalibrationDataReader is not None:
+    class ONNXCalibrationDataReader(CalibrationDataReader):
+        """
+        Calibration data reader for ONNX quantization.
+        Reads data from .npz files using the project's data processing logic.
+        """
+        def __init__(self, calib_data_dir: str, model: Model, pos_len: int, batch_size: int, require_exact_poslen: bool, num_samples: int = 128):
+            super().__init__()
+            self.calib_data_dir = calib_data_dir
+            self.model = model
+            self.pos_len = pos_len
+            self.batch_size = batch_size
+            self.require_exact_poslen = require_exact_poslen
+            self.num_samples = num_samples
+            self.consumed_samples = 0
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            logging.info(f"Calibration data reader using device: {self.device}")
+            self.data_iter = self._create_iter()
 
-class ONNXCalibrationDataReader(CalibrationDataReader):
-    """
-    Calibration data reader for ONNX quantization.
-    Reads data from .npz files using the project's data processing logic.
-    """
-    def __init__(self, calib_data_dir: str, model: Model, pos_len: int, batch_size: int, require_exact_poslen: bool, num_samples: int = 128):
-        super().__init__()
-        self.calib_data_dir = calib_data_dir
-        self.model = model
-        self.pos_len = pos_len
-        self.batch_size = batch_size
-        self.require_exact_poslen = require_exact_poslen
-        self.num_samples = num_samples
-        self.consumed_samples = 0
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logging.info(f"Calibration data reader using device: {self.device}")
-        self.data_iter = self._create_iter()
+        def _create_iter(self):
+            import glob
+            npz_files = glob.glob(os.path.join(self.calib_data_dir, "**/*.npz"), recursive=True)
+            if not npz_files:
+                logging.warning(f"No .npz files found in {self.calib_data_dir} for calibration.")
+                return
 
-    def _create_iter(self):
-        import glob
-        npz_files = glob.glob(os.path.join(self.calib_data_dir, "**/*.npz"), recursive=True)
-        if not npz_files:
-            logging.warning(f"No .npz files found in {self.calib_data_dir} for calibration.")
-            return
+            # Shuffle files to get a representative sample
+            import random
+            random.shuffle(npz_files)
 
-        # Shuffle files to get a representative sample
-        import random
-        random.shuffle(npz_files)
+            for batch in data_processing_pytorch.read_npz_training_data(
+                npz_files,
+                self.batch_size,
+                world_size=1,
+                rank=0,
+                pos_len=self.pos_len,
+                device=self.device,
+                symmetry_type="none",
+                include_meta=self.model.get_has_metadata_encoder(),
+                enable_history_matrices=False,
+                model_config=self.model.config
+            ):
+                if self.consumed_samples >= self.num_samples:
+                    break
 
-        for batch in data_processing_pytorch.read_npz_training_data(
-            npz_files,
-            self.batch_size,
-            world_size=1,
-            rank=0,
-            pos_len=self.pos_len,
-            device=self.device,
-            symmetry_type="none",
-            include_meta=self.model.get_has_metadata_encoder(),
-            enable_history_matrices=False,
-            model_config=self.model.config
-        ):
-            if self.consumed_samples >= self.num_samples:
-                break
+                mask_layer= batch["binaryInputNCHW"][:,0,:,:].cpu().numpy()
+                assert mask_layer.shape == (self.batch_size, self.pos_len, self.pos_len), f"mask_layer shape {mask_layer.shape} != {(self.batch_size, self.pos_len, self.pos_len)}"
+                if self.require_exact_poslen:
+                    assert mask_layer.all(axis=(1,2)).all(), f"int8 calibration data should be all {self.pos_len}x{self.pos_len} games if -disable-mask"
+                
+                # Move to CPU for ONNX Runtime input
+                inputs = {
+                    'input_spatial': batch["binaryInputNCHW"].cpu().numpy(),
+                    'input_global': batch["globalInputNC"].cpu().numpy()
+                }
+                if self.model.get_has_metadata_encoder():
+                    inputs['input_meta'] = batch["metadataInputNC"].cpu().numpy()
+                
+                self.consumed_samples += self.batch_size
+                yield inputs
 
-            mask_layer= batch["binaryInputNCHW"][:,0,:,:].cpu().numpy()
-            assert mask_layer.shape == (self.batch_size, self.pos_len, self.pos_len), f"mask_layer shape {mask_layer.shape} != {(self.batch_size, self.pos_len, self.pos_len)}"
-            if self.require_exact_poslen:
-                assert mask_layer.all(axis=(1,2)).all(), f"int8 calibration data should be all {self.pos_len}x{self.pos_len} games if -disable-mask"
-            
-            # Move to CPU for ONNX Runtime input
-            inputs = {
-                'input_spatial': batch["binaryInputNCHW"].cpu().numpy(),
-                'input_global': batch["globalInputNC"].cpu().numpy()
-            }
-            if self.model.get_has_metadata_encoder():
-                inputs['input_meta'] = batch["metadataInputNC"].cpu().numpy()
-            
-            self.consumed_samples += self.batch_size
-            yield inputs
-
-    def get_next(self):
-        return next(self.data_iter, None)
+        def get_next(self):
+            return next(self.data_iter, None)
 
 
 def quantize_onnx(model_path: str, output_path: str, calib_data_dir: str, 
@@ -338,7 +338,7 @@ def quantize_onnx(model_path: str, output_path: str, calib_data_dir: str,
             logging.warning(f"Failed to delete temporary pre-processed model: {e}")
 
 
-def export_to_onnx(model: Model, save_name: str ,export_path: str, pos_len: int = 19, 
+def export_to_onnx(model: Model, full_name: str ,export_path: str, pos_len: int = 19, 
                    batch_size: int = 1, opset_version: int = 20, disable_mask: bool = False,
                    verbose: bool = False, extra_meta_data: Dict[str, str] = None,
                    auto_fp16: bool = False, fix_batchsize: bool = False,
@@ -476,7 +476,7 @@ def export_to_onnx(model: Model, save_name: str ,export_path: str, pos_len: int 
         
         # Add metadata_props
         meta = {
-            "name": save_name,
+            "name": full_name,
             "modelVersion": str(model.config["version"]),
             # Add other useful info if available
             "exported_at": datetime.datetime.now().isoformat(),
@@ -640,6 +640,7 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser(description=description)
         parser.add_argument('-checkpoint', help='Checkpoint file to export', required=True)
         parser.add_argument('-export-dir', help='Directory to export ONNX model to', required=True)
+        parser.add_argument('-filename-prefix', help='Filename for the exported ONNX model (optional)', required=False)
         parser.add_argument('-model-name', help='Name for the exported model', required=True)
         parser.add_argument('-use-swa', help='Use SWA model if available', action='store_true', required=False)
         parser.add_argument('-pos-len', help='Spatial edge length (e.g. 19 for 19x19 Go)', type=int, default=19, required=False)
@@ -658,6 +659,7 @@ if __name__ == "__main__":
         parser.add_argument('-author', help='Author name for metadata', required=False,default="unknown")
         parser.add_argument('-comment', help='Comment for metadata', required=False,default="")
         parser.add_argument('-dynamo', help='Use TorchDynamo for ONNX export', action='store_true', required=False)
+        parser.add_argument('-skip-verification', help='Skip ONNX model verification', action='store_true', required=False)
         
         args = parser.parse_args()
 
@@ -665,6 +667,7 @@ if __name__ == "__main__":
 
         checkpoint_file = args.checkpoint
         export_dir = args.export_dir
+        filename_prefix = args.filename_prefix
         model_name = args.model_name
         use_swa = args.use_swa
         pos_len = args.pos_len
@@ -683,6 +686,7 @@ if __name__ == "__main__":
         author = args.author
         comment = args.comment
         dynamo = args.dynamo
+        skip_verification = args.skip_verification
         extra_meta_data = {}
         if author is not None:
             extra_meta_data["author"] = author
@@ -691,6 +695,7 @@ if __name__ == "__main__":
     else:
         checkpoint_file = "../data/train/go_b24c128tf1b_muon1_fd1/checkpoint.ckpt"
         export_dir = "../onnx_exports"
+        filename_prefix = None
         model_name = "go_b24c128tf1b_muon1_fd1"
         use_swa = True
         pos_len = 19
@@ -706,6 +711,7 @@ if __name__ == "__main__":
         convert_qat_to_float = False
         verbose = False
         dynamo = False
+        skip_verification = False
     
     # Create export directory
     os.makedirs(export_dir, exist_ok=True)
@@ -765,21 +771,25 @@ if __name__ == "__main__":
     logging.info(f"Exporting {model_type} model")
     logging.info(f"Model config: {export_model.config}")
     
+    model_full_name = f"{model_name}"
     # Export to ONNX
-    save_name = f"{model_name}"
-    # Add training state info if available
-    if "train_state" in other_state_dict:
-        train_state = other_state_dict["train_state"]
-        if "global_step_samples" in train_state:
-            save_name += f"-s{train_state['global_step_samples']}"
-        if "total_num_data_rows" in train_state:
-            save_name += f"-d{train_state['total_num_data_rows']}"
-    onnx_filename = f"{save_name}.onnx"
+    if filename_prefix is not None: # for selfplay
+        onnx_filename = f"{filename_prefix}.onnx"
+    else: # manual export
+        # Add training state info if available
+        if "train_state" in other_state_dict:
+            train_state = other_state_dict["train_state"]
+            if "global_step_samples" in train_state:
+                model_full_name += f"-s{train_state['global_step_samples']}"
+            if "total_num_data_rows" in train_state:
+                model_full_name += f"-d{train_state['total_num_data_rows']}"
+        onnx_filename = f"{model_full_name}.onnx"
+    
     onnx_path = os.path.join(export_dir, onnx_filename)
     
     export_to_onnx(
         export_model, 
-        save_name,
+        model_full_name,
         onnx_path, 
         pos_len=pos_len, 
         batch_size=batch_size, 
@@ -793,12 +803,15 @@ if __name__ == "__main__":
     )
     
     # Verify the exported model
-    logging.info("Verifying exported ONNX model...")
-    verification_passed = verify_onnx_model(onnx_path, export_model, pos_len, batch_size, calib_data_dir=calib_data)
-    
-    if not verification_passed:
-        logging.error("ONNX model verification failed!")
-        exit(1)
+    if not skip_verification:
+        logging.info("Verifying exported ONNX model...")
+        verification_passed = verify_onnx_model(onnx_path, export_model, pos_len, batch_size, calib_data_dir=calib_data)
+        
+        if not verification_passed:
+            logging.error("ONNX model verification failed!")
+            exit(1)
+    else:
+        logging.info("Skipping ONNX model verification as requested.")
     
     # Simplify model if requested
     if simplify:
@@ -849,10 +862,13 @@ if __name__ == "__main__":
             )
             
             # Verify the quantized model
-            logging.info("Verifying quantized INT8 model...")
-            int8_verification_passed = verify_onnx_model(onnx_int8_path, export_model, pos_len, batch_size, calib_data_dir=calib_data)
-            if not int8_verification_passed:
-                logging.warning("INT8 model verification failed! (This is common for INT8, check accuracy manually)")
+            if not skip_verification:
+                logging.info("Verifying quantized INT8 model...")
+                int8_verification_passed = verify_onnx_model(onnx_int8_path, export_model, pos_len, batch_size, calib_data_dir=calib_data)
+                if not int8_verification_passed:
+                    logging.warning("INT8 model verification failed! (This is common for INT8, check accuracy manually)")
+            else:
+                logging.info("Skipping quantized INT8 model verification as requested.")
             
             # Use the INT8 model for subsequent steps
             onnx_path = onnx_int8_path
