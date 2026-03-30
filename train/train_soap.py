@@ -86,7 +86,7 @@ if __name__ == "__main__":
     optional_args.add_argument('-lr-base', help='LR base', type=float, default=3e-6, required=False)
     optional_args.add_argument('-lr-scale', help='LR multiplier on the hardcoded schedule', type=float, required=False)
     optional_args.add_argument('-lr-scale-auto-type', help='LR auto scaling type',type=str, required=False, default="")
-    optional_args.add_argument('-wd-scale', help='Weight decay scale', type=float, default=20.0, required=False)
+    optional_args.add_argument('-wd-scale', help='Weight decay scale', type=float, default=1.0, required=False)
     
     
     optional_args.add_argument('-gnorm-clip-scale', help='Multiplier on gradient clipping threshold', type=float, required=False)

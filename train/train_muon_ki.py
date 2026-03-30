@@ -75,10 +75,10 @@ if __name__ == "__main__":
 
     
     optional_args.add_argument('-model-kind', help='String name for what model config to use', required=False)
-    optional_args.add_argument('-lr-base', help='LR base', type=float, default=1e-5, required=False)
+    optional_args.add_argument('-lr-base', help='LR base', type=float, default=6e-6, required=False)
     optional_args.add_argument('-lr-scale', help='LR multiplier on the hardcoded schedule', type=float, required=False)
     optional_args.add_argument('-lr-scale-auto-type', help='LR auto scaling type',type=str, required=False, default="")
-    optional_args.add_argument('-wd-scale', help='Weight decay scale', type=float, default=20.0, required=False)
+    optional_args.add_argument('-wd-scale', help='Weight decay scale', type=float, default=1.0, required=False)
     
     optional_args.add_argument('-muon-momentum', type=float, help='momentum of Muon optimizer', default=0.95, required=False)
     
