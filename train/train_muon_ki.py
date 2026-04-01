@@ -488,18 +488,20 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
             
     NUM_SHORTTERM_CHECKPOINTS_TO_KEEP = 4
-    def save(raw_model, swa_models, optimizer, metrics_obj, running_metrics, train_state, last_val_metrics, path=None):
+    def save(raw_model, swa_models, optimizer, metrics_obj, running_metrics, train_state, last_val_metrics, path=None, skip_optimizer=False):
         if gnorm_stats_debug:
             logging.warning("Skipping save since debugging gnorm stats")
             return
-    
-        # 必须所有 rank 都调用：内部使用了 dist.gather_object 这一 collective，
+        # 若skip_optimizer==False，必须所有 rank 都调用：内部使用了 dist.gather_object 这一 collective，
         # 若只让 rank0 进入会导致其余 rank 与 rank0 通信不同步并卡住。
-        optimizer_state_dict = optimizer.state_dict_for_checkpoint()
+        optimizer_state_dict = None
+        if not skip_optimizer:
+            optimizer_state_dict = optimizer.state_dict_for_checkpoint()
         if rank == 0:
             state_dict = {}
             state_dict["model"] = raw_model.state_dict()
-            state_dict["optimizer"] = optimizer_state_dict
+            if not skip_optimizer:
+                state_dict["optimizer"] = optimizer_state_dict
             state_dict["metrics"] = metrics_obj.state_dict()
             state_dict["running_metrics"] = running_metrics
             
@@ -1727,7 +1729,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 else:
                     os.mkdir(savepathtmp)
                     logging.info("SAVING MODEL FOR EXPORT TO: " + savepath)
-                    save(raw_model, swa_models, optimizer, metrics_obj, running_metrics, train_state, last_val_metrics, path=os.path.join(savepathtmp,"model.ckpt"))
+                    save(raw_model, swa_models, optimizer, metrics_obj, running_metrics, train_state, last_val_metrics, path=os.path.join(savepathtmp,"model.ckpt"), skip_optimizer=True)
                     time.sleep(2)
                     os.rename(savepathtmp,savepath)
 
@@ -1742,7 +1744,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             if now - last_longterm_checkpoint_save_time >= datetime.timedelta(hours=12):
                 last_longterm_checkpoint_save_time = now
                 dated_name = datetime.datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-                save(raw_model, swa_models, optimizer, metrics_obj, running_metrics, train_state, last_val_metrics, path=os.path.join(longterm_checkpoints_dir,f"{dated_name}.ckpt"))
+                save(raw_model, swa_models, optimizer, metrics_obj, running_metrics, train_state, last_val_metrics, path=os.path.join(longterm_checkpoints_dir,f"{dated_name}.ckpt"), skip_optimizer=True)
 
     train_metrics_out.close()
     val_metrics_out.close()
