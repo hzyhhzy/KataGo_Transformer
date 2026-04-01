@@ -570,7 +570,7 @@ class Metrics:
             global_weight,
         ).sum()
 
-        if raw_model.config["version"] or (raw_model.config["version"] >= 101 and raw_model.config["version"] <= 199):
+        if raw_model.config["version"] <= 11 or (raw_model.config["version"] >= 101 and raw_model.config["version"] <= 199):
             target_weight_longoptimistic_policy = torch.zeros_like(global_weight)
             loss_longoptimistic_policy = torch.zeros_like(loss_policy_player)
         elif disable_optimistic_policy:
