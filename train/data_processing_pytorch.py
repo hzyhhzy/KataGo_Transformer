@@ -18,14 +18,21 @@ def read_npz_training_data(
     device,
     symmetry_type: str,
     include_meta: bool,
-    enable_history_matrices: bool,
+    history_matrices_type: str,
     model_config: modelconfigs.ModelConfig,
 ):
     rand = np.random.default_rng(seed=list(os.urandom(12)))
     num_bin_features = modelconfigs.get_num_bin_input_features(model_config)
     num_global_features = modelconfigs.get_num_global_input_features(model_config)
+    history_matrices_type = (history_matrices_type or "").strip().lower()
+    enable_history_matrices = history_matrices_type == "go"
+    is_gomoku_history = history_matrices_type == "gomoku"
+    assert history_matrices_type in ("", "none", "go", "gomoku"), f"Unknown history_matrices_type {history_matrices_type}"
     if enable_history_matrices:
         (h_base,h_builder) = build_history_matrices(model_config, device)
+    if is_gomoku_history:
+        assert num_bin_features == 22, f"gomoku history requires 22 spatial channels, got {num_bin_features}"
+        assert num_global_features == 39, f"gomoku history requires 39 global channels, got {num_global_features}"
 
     include_qvalues = model_config["version"] >= 16 and model_config["version"] < 100
 
@@ -97,6 +104,10 @@ def read_npz_training_data(
                     (batch_binaryInputNCHW, batch_globalInputNC) = apply_history_matrices(
                         model_config, batch_binaryInputNCHW, batch_globalInputNC, batch_globalTargetsNC, h_base, h_builder
                     )
+                if is_gomoku_history:
+                    zero_mask = (torch.rand((batch_binaryInputNCHW.shape[0],), device=batch_binaryInputNCHW.device) < 0.3).to(batch_binaryInputNCHW.dtype)
+                    batch_binaryInputNCHW[:, 6, :, :] *= (1.0 - zero_mask).view(-1, 1, 1)
+                    batch_globalInputNC[:, 2] *= (1.0 - zero_mask)
 
 
                 

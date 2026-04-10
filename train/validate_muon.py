@@ -89,7 +89,7 @@ def main():
     parser.add_argument('-model-kind', help='String name for what model config to use (if not in checkpoint)', required=False)
     parser.add_argument('-use-swa', help='Use SWA model if available', action='store_true')
     parser.add_argument('-swa-index', help='Index of SWA model to use (default 0)', type=int, default=0)
-    parser.add_argument('-enable-history-matrices', help='Enable history matrices transformation', action='store_true')
+    parser.add_argument('-history-matrices-type', help='History matrices mode: "go", "gomoku", "none", or empty', type=str, default="")
     parser.add_argument('-symmetry-type', help='Data symmetry type', type=str, default="none")
     parser.add_argument('-max-batches', help='Max batches to validate', type=int, default=None)
     parser.add_argument('-no-compile', help='Do not torch.compile', action='store_true')
@@ -115,7 +115,7 @@ def main():
     model_kind = args.model_kind
     use_swa = args.use_swa
     swa_index = args.swa_index
-    enable_history_matrices = args.enable_history_matrices
+    history_matrices_type = args.history_matrices_type
     symmetry_type = args.symmetry_type
     max_batches = args.max_batches
     no_compile = args.no_compile
@@ -211,7 +211,7 @@ def main():
         device=device,
         symmetry_type=symmetry_type,
         include_meta=True,
-        enable_history_matrices=enable_history_matrices,
+        history_matrices_type=history_matrices_type,
         model_config=model_config
     )
     

@@ -70,7 +70,7 @@ time python -u ./train_soap.py \
      -model-kind "$MODELKIND" \
      -swa-period-samples 500000 \
      -max-val-samples 20000 \
-     -enable-history-matrices \
+     -history-matrices-type "go" \
      $EXTRAFLAG \
      "$@" \
      2>&1 | tee -a "$BASEDIR"/train/"$TRAININGNAME"/stdout.txt

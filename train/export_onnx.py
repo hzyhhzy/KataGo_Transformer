@@ -213,7 +213,7 @@ if CalibrationDataReader is not None:
                 device=self.device,
                 symmetry_type="none",
                 include_meta=self.model.get_has_metadata_encoder(),
-                enable_history_matrices=False,
+                history_matrices_type="none",
                 model_config=self.model.config
             ):
                 if self.consumed_samples >= self.num_samples:

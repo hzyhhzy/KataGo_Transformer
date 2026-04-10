@@ -65,7 +65,7 @@ if __name__ == "__main__":
     required_args.add_argument('-pos-len', help='Spatial edge length of expected training data, e.g. 19 for 19x19 Go', type=int, required=True)
     required_args.add_argument('-batch-size', help='Per-GPU batch size to use for training', type=int, required=True)
     optional_args.add_argument('-samples-per-epoch', help='Number of data samples to consider as one epoch', type=int, required=False)
-    optional_args.add_argument('-enable-history-matrices', help='Enable history matrices transformation in training data. Set True if for Go, and False if for other games', required=False, action='store_true')
+    optional_args.add_argument('-history-matrices-type', help='History matrices mode: "go", "gomoku", "none", or empty', type=str, default="", required=False)
     optional_args.add_argument('-symmetry-type', help='Data symmetry type. "none" to disable, "xyt" for Go/Gomoku, "x+y" for Hex, "x" for chess, "t" for tiaoqi', type=str, default="xyt", required=False)
 
     
@@ -170,7 +170,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     lookahead_k = args["lookahead_k"]
     lookahead_alpha = args["lookahead_alpha"]
     lookahead_print = args["lookahead_print"]
-    enable_history_matrices = args["enable_history_matrices"]
+    history_matrices_type = args["history_matrices_type"]
 
     use_fp16 = args["use_fp16"]
     master_port = args["master_port"]
@@ -1218,7 +1218,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 device=device,
                 symmetry_type=symmetry_type,
                 include_meta=raw_model.get_has_metadata_encoder(),
-                enable_history_matrices=enable_history_matrices,
+                history_matrices_type=history_matrices_type,
                 model_config=model_config
             ):
                 optimizer.zero_grad(set_to_none=True)
@@ -1430,7 +1430,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                         device=device,
                         symmetry_type=symmetry_type,
                         include_meta=raw_model.get_has_metadata_encoder(),
-                        enable_history_matrices=enable_history_matrices,
+                        history_matrices_type=history_matrices_type,
                         model_config=model_config
                     ):
                         model_outputs = ddp_model(
@@ -1491,7 +1491,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                             device=device,
                             symmetry_type=symmetry_type,
                             include_meta=raw_model.get_has_metadata_encoder(),
-                            enable_history_matrices=enable_history_matrices,
+                            history_matrices_type=history_matrices_type,
                             model_config=model_config
                         ):
                             model_outputs = swa_model(
