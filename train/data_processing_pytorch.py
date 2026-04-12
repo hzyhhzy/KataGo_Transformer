@@ -107,7 +107,7 @@ def read_npz_training_data(
                 if is_gomoku_history:
                     zero_mask = (torch.rand((batch_binaryInputNCHW.shape[0],), device=batch_binaryInputNCHW.device) < 0.3).to(batch_binaryInputNCHW.dtype)
                     batch_binaryInputNCHW[:, 6, :, :] *= (1.0 - zero_mask).view(-1, 1, 1)
-                    batch_globalInputNC[:, 2] *= (1.0 - zero_mask)
+                    batch_globalInputNC[:, 1] *= (1.0 - zero_mask)
 
 
                 
