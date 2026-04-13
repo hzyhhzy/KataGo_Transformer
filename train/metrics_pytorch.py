@@ -1,7 +1,7 @@
 from typing import Any, Dict, List
 import math
 
-from model_pytorch import EXTRA_SCORE_DISTR_RADIUS, Model, compute_gain, ExtraOutputs, MetadataEncoder
+from model_pytorch import Model, compute_gain, ExtraOutputs, MetadataEncoder
 
 import torch
 import torch.nn
@@ -30,11 +30,6 @@ class Metrics:
         self.policy_len = raw_model.pos_len * raw_model.pos_len + 1
         self.value_len = 3
         self.num_td_values = 3
-        self.num_futurepos_values = 2
-        self.num_seki_logits = 4
-        self.scorebelief_len = 2 * (self.pos_len*self.pos_len + EXTRA_SCORE_DISTR_RADIUS)
-
-        self.score_belief_offset_vector = raw_model.value_head.score_belief_offset_vector
         self.moving_unowned_proportion_sum = 0.0
         self.moving_unowned_proportion_weight = 0.0
 
@@ -88,98 +83,12 @@ class Metrics:
         loss = torch.sum(huber_loss(pred, target, delta = 12.0), dim=1)
         return 0.0004 * global_weight * weight * loss
 
-
-    def loss_ownership_samplewise(self, pred_pretanh, target, weight, mask, mask_sum_hw, global_weight):
-        # This uses a formulation where each batch element cares about its average loss.
-        # In particular this means that ownership loss predictions on small boards "count more" per spot.
-        # Not unlike the way that policy and value loss are also equal-weighted by batch element.
-        assert pred_pretanh.shape == (self.n, 1, self.pos_len, self.pos_len)
-        assert target.shape == (self.n, self.pos_len, self.pos_len)
-        assert mask.shape == (self.n, self.pos_len, self.pos_len)
-        assert mask_sum_hw.shape == (self.n,)
-        pred_logits = torch.cat((pred_pretanh, -pred_pretanh), dim=1).view(self.n,2,self.pos_area)
-        target_probs = torch.stack(((1.0 + target) / 2.0, (1.0 - target) / 2.0), dim=1).view(self.n,2,self.pos_area)
-        loss = torch.sum(cross_entropy(pred_logits, target_probs, dim=1) * mask.view(self.n,self.pos_area), dim=1) / mask_sum_hw
-        return 1.5 * global_weight * weight * loss
-
-
-    def loss_scoring_samplewise(self, pred_scoring, target, weight, mask, mask_sum_hw, global_weight):
-        assert pred_scoring.shape == (self.n, 1, self.pos_len, self.pos_len)
-        assert target.shape == (self.n, self.pos_len, self.pos_len)
-        assert mask.shape == (self.n, self.pos_len, self.pos_len)
-        assert mask_sum_hw.shape == (self.n,)
-
-        loss = torch.sum(torch.square(pred_scoring.squeeze(1) - target) * mask, dim=(1,2)) / mask_sum_hw
-        # Simple huberlike transform to reduce crazy values
-        loss = 4.0 * (torch.sqrt(loss * 0.5 + 1.0) - 1.0)
-        return global_weight * weight * loss
-
-
-    def loss_futurepos_samplewise(self, pred_pretanh, target, weight, mask, mask_sum_hw, global_weight):
-        # The futurepos targets extrapolate a fixed number of steps into the future independent
-        # of board size. So unlike the ownership above, generally a fixed number of spots are going to be
-        # "wrong" independent of board size, so we should just equal-weight the prediction per spot.
-        # However, on larger boards often the entropy of where the future moves will be should be greater
-        # and also in the event of capture, there may be large captures that don't occur on small boards,
-        # causing some scaling with board size. So, I dunno, let's compromise and scale by sqrt(boardarea).
-        # Also, the further out targets should be weighted a little less due to them being higher entropy
-        # due to simply being farther in the future, so multiply by [1,0.25].
-        assert pred_pretanh.shape == (self.n, self.num_futurepos_values, self.pos_len, self.pos_len)
-        assert target.shape == (self.n, self.num_futurepos_values, self.pos_len, self.pos_len)
-        assert mask.shape == (self.n, self.pos_len, self.pos_len)
-        assert mask_sum_hw.shape == (self.n,)
-        loss = torch.square(torch.tanh(pred_pretanh) - target) * mask.unsqueeze(1)
-        loss = loss * constant_like([1.0,0.25], loss).view(1,2,1,1)
-        loss = torch.sum(loss, dim=(1, 2, 3)) / torch.sqrt(mask_sum_hw)
-        return 0.25 * global_weight * weight * loss
-
-
-    def loss_seki_samplewise(self, pred_logits, target, target_ownership, weight, mask, mask_sum_hw, global_weight, is_training, skip_moving_update):
-        assert self.num_seki_logits == 4
-        assert pred_logits.shape == (self.n, self.num_seki_logits, self.pos_len, self.pos_len)
-        assert target.shape == (self.n, self.pos_len, self.pos_len)
-        assert target_ownership.shape == (self.n, self.pos_len, self.pos_len)
-        assert mask.shape == (self.n, self.pos_len, self.pos_len)
-        assert mask_sum_hw.shape == (self.n,)
-
-        owned_target = torch.square(target_ownership)
-        unowned_target = 1.0 - owned_target
-        unowned_proportion = torch.sum(unowned_target * mask, dim=(1, 2)) / (1.0 + mask_sum_hw)
-        unowned_proportion = torch.mean(unowned_proportion * weight)
-        if is_training:
-            if not skip_moving_update:
-                self.moving_unowned_proportion_sum *= 0.998
-                self.moving_unowned_proportion_weight *= 0.998
-                self.moving_unowned_proportion_sum += unowned_proportion.item()
-                self.moving_unowned_proportion_weight += 1.0
-            moving_unowned_proportion = self.moving_unowned_proportion_sum / self.moving_unowned_proportion_weight
-            seki_weight_scale = 8.0 * 0.005 / (0.005 + moving_unowned_proportion)
-        else:
-            seki_weight_scale = 7.0
-
-        # Loss for predicting the exact sign of seki points
-        sign_pred = pred_logits[:, 0:3, :, :]
-        sign_target = torch.stack(
-            (
-                1.0 - torch.square(target),
-                torch.nn.functional.relu(target),
-                torch.nn.functional.relu(-target),
-            ),
-            dim=1,
-        )
-        loss_sign = torch.sum(cross_entropy(sign_pred, sign_target, dim=1) * mask, dim=(1, 2))
-
-        # Loss for generally predicting points that nobody will own
-        neutral_pred = torch.stack(
-            (pred_logits[:, 3, :, :], torch.zeros_like(target_ownership)), dim=1
-        )
-        neutral_target = torch.stack((unowned_target, owned_target), dim=1)
-        loss_neutral = torch.sum(cross_entropy(neutral_pred, neutral_target, dim=1) * mask, dim=(1, 2))
-
-        loss = loss_sign + 0.5 * loss_neutral
-        loss = loss / mask_sum_hw
-        return (global_weight * seki_weight_scale * weight * loss, seki_weight_scale)
-
+    def loss_zero_mse_samplewise(self, pred, weight, global_weight, scale):
+        assert pred.shape == (self.n,)
+        assert weight.shape == (self.n,)
+        assert global_weight.shape == (self.n,)
+        loss = torch.square(pred)
+        return scale * global_weight * weight * loss
 
     def loss_scoremean_samplewise(self, pred, target, weight, global_weight):
         # Huber will incentivize this to not actually converge to the mean,
@@ -190,37 +99,6 @@ class Metrics:
         assert target.shape == (self.n,)
         loss = huber_loss(pred, target, delta = 12.0)
         return 0.0015 * global_weight * weight * loss
-
-
-    def loss_scorebelief_cdf_samplewise(self, pred_logits, target_probs, weight, global_weight):
-        #print(pred_logits.shape,(self.n,self.scorebelief_len))
-        assert pred_logits.shape == (self.n,self.scorebelief_len)
-        assert target_probs.shape == (self.n,self.scorebelief_len)
-        pred_cdf = torch.cumsum(torch.nn.functional.softmax(pred_logits, dim=1), dim=1)
-        target_cdf = torch.cumsum(target_probs, dim=1)
-        loss = torch.sum(torch.square(pred_cdf-target_cdf),axis=1)
-        return 0.020 * global_weight * weight * loss
-
-    def loss_scorebelief_pdf_samplewise(self, pred_logits, target_probs, weight, global_weight):
-        assert pred_logits.shape == (self.n,self.scorebelief_len)
-        assert target_probs.shape == (self.n,self.scorebelief_len)
-        loss = cross_entropy(pred_logits, target_probs, dim=1)
-        return 0.020 * global_weight * weight * loss
-
-    def loss_scorestdev_samplewise(self, pred, scorebelief_logits, global_weight):
-        assert pred.shape == (self.n,)
-        assert scorebelief_logits.shape == (self.n,self.scorebelief_len)
-        assert self.score_belief_offset_vector.shape == (self.scorebelief_len,)
-        scorebelief_probs = torch.nn.functional.softmax(scorebelief_logits, dim=1)
-        expected_score_from_belief = torch.sum(scorebelief_probs * self.score_belief_offset_vector.view(1,-1),dim=1,keepdim=True)
-        stdev_of_belief = torch.sqrt(0.001 + torch.sum(
-            scorebelief_probs * torch.square(
-                self.score_belief_offset_vector.view(1,-1) - expected_score_from_belief
-            ),
-            dim=1
-        ))
-        loss = huber_loss(pred, stdev_of_belief, delta = 10.0)
-        return 0.001 * global_weight * loss
 
     def loss_lead_samplewise(self, pred, target, weight, global_weight):
         # Huber will incentivize this to not actually converge to the mean,
@@ -383,10 +261,10 @@ class Metrics:
         meta_kata_only_soft_policy,
         value_loss_scale,
         td_value_loss_scales,
-        seki_loss_scale,
         variance_time_loss_scale,
         main_loss_scale,
         intermediate_loss_scale,
+        seki_loss_scale=None,
     ):
         results = self.metrics_dict_batchwise_single_heads_output(
             raw_model,
@@ -446,36 +324,27 @@ class Metrics:
         meta_kata_only_soft_policy,
         value_loss_scale,
         td_value_loss_scales,
-        seki_loss_scale,
         variance_time_loss_scale,
         is_intermediate,
+        seki_loss_scale=None,
     ):
         (
             policy_logits,
             value_logits,
             td_value_logits,
             pred_td_score,
-            ownership_pretanh,
-            pred_scoring,
-            futurepos_pretanh,
-            seki_logits,
             pred_scoremean,
             pred_scorestdev,
             pred_lead,
             pred_variance_time,
             pred_shortterm_value_error,
             pred_shortterm_score_error,
-            scorebelief_logits,
         ) = model_output_postprocessed
-        #print(scorebelief_logits.shape)
 
         input_binary_nchw = batch["binaryInputNCHW"]
         input_global_nc = batch["globalInputNC"]
         target_policy_ncmove = batch["policyTargetsNCMove"]
         target_global_nc = batch["globalTargetsNC"]
-        score_distribution_ns = batch["scoreDistrN"]
-        target_value_nchw = batch["valueTargetsNCHW"]
-
         mask = input_binary_nchw[:, 0, :, :].contiguous()
         mask_sum_hw = torch.sum(mask,dim=(1,2))
 
@@ -512,17 +381,8 @@ class Metrics:
         global_weight = target_global_nc[:, 25]
         target_weight_ownership = target_global_nc[:, 27]
         target_weight_lead = target_global_nc[:, 29]
-        target_weight_futurepos = target_global_nc[:, 33]
-        target_weight_scoring = target_global_nc[:, 34]
         target_weight_value = 1.0 - target_global_nc[:, 35]
         target_weight_td_value = 1.0 - target_global_nc[:, 24]
-
-        target_score_distribution = score_distribution_ns / 100.0
-
-        target_ownership = target_value_nchw[:, 0, :, :]
-        target_seki = target_value_nchw[:, 1, :, :]
-        target_futurepos = target_value_nchw[:, 2:4, :, :]
-        target_scoring = target_value_nchw[:, 4, :, :] / 120.0
 
         if raw_model.config["version"] <= 11 or (raw_model.config["version"] >= 101 and raw_model.config["version"] <= 199):
             assert raw_model.policy_head.num_policy_outputs == 4
@@ -673,66 +533,17 @@ class Metrics:
         loss_td_score = self.loss_td_score_samplewise(
             pred_td_score, target_td_score, target_weight_ownership, global_weight
         ).sum()
-
-        loss_ownership = self.loss_ownership_samplewise(
-            ownership_pretanh,
-            target_ownership,
-            target_weight_ownership,
-            mask,
-            mask_sum_hw,
-            global_weight,
-        ).sum()
-        loss_scoring = self.loss_scoring_samplewise(
-            pred_scoring,
-            target_scoring,
-            target_weight_scoring,
-            mask,
-            mask_sum_hw,
-            global_weight,
-        ).sum()
-        loss_futurepos = self.loss_futurepos_samplewise(
-            futurepos_pretanh,
-            target_futurepos,
-            target_weight_futurepos,
-            mask,
-            mask_sum_hw,
-            global_weight,
-        ).sum()
-        (loss_seki,seki_weight_scale) = self.loss_seki_samplewise(
-            seki_logits,
-            target_seki,
-            target_ownership,
-            target_weight_ownership,
-            mask,
-            mask_sum_hw,
-            global_weight,
-            is_training,
-            skip_moving_update=is_intermediate,
-        )
-        loss_seki = loss_seki.sum()
-        seki_weight_scale = seki_weight_scale.sum() if not isinstance(seki_weight_scale,float) else seki_weight_scale
         loss_scoremean = self.loss_scoremean_samplewise(
             pred_scoremean,
             target_scoremean,
             target_weight_ownership,
             global_weight,
         ).sum()
-        loss_scorebelief_cdf = self.loss_scorebelief_cdf_samplewise(
-            scorebelief_logits,
-            target_score_distribution,
-            target_weight_ownership,
-            global_weight,
-        ).sum()
-        loss_scorebelief_pdf = self.loss_scorebelief_pdf_samplewise(
-            scorebelief_logits,
-            target_score_distribution,
-            target_weight_ownership,
-            global_weight,
-        ).sum()
-        loss_scorestdev = self.loss_scorestdev_samplewise(
+        loss_scorestdev_zero = self.loss_zero_mse_samplewise(
             pred_scorestdev,
-            scorebelief_logits,
+            target_weight_ownership,
             global_weight,
+            scale=0.001,
         ).sum()
         loss_lead = self.loss_lead_samplewise(
             pred_lead,
@@ -773,14 +584,8 @@ class Metrics:
             + loss_td_value2 * td_value_loss_scales[1]
             + loss_td_value3 * td_value_loss_scales[2]
             + loss_td_score
-            + loss_ownership
-            + loss_scoring * 0.5
-            + loss_futurepos
-            + loss_seki * seki_loss_scale
             + loss_scoremean
-            + loss_scorebelief_cdf
-            + loss_scorebelief_pdf
-            + loss_scorestdev
+            + loss_scorestdev_zero
             + loss_lead
             + loss_variance_time * variance_time_loss_scale
             + loss_shortterm_value_error
@@ -809,14 +614,8 @@ class Metrics:
             "tdvloss2_sum": loss_td_value2,
             "tdvloss3_sum": loss_td_value3,
             "tdsloss_sum": loss_td_score,
-            "oloss_sum": loss_ownership,
-            "sloss_sum": loss_scoring,
-            "fploss_sum": loss_futurepos,
-            "skloss_sum": loss_seki,
             "smloss_sum": loss_scoremean,
-            "sbcdfloss_sum": loss_scorebelief_cdf,
-            "sbpdfloss_sum": loss_scorebelief_pdf,
-            "sdregloss_sum": loss_scorestdev,
+            "sdregloss_sum": loss_scorestdev_zero,
             "leadloss_sum": loss_lead,
             "vtimeloss_sum": loss_variance_time,
             "evstloss_sum": loss_shortterm_value_error,
@@ -849,7 +648,6 @@ class Metrics:
                 "nsamp": nsamples * self.world_size,
                 "ptentr_sum": policy_target_entropy,
                 "ptsoftentr_sum": soft_policy_target_entropy,
-                "sekiweightscale_sum": seki_weight_scale * weight,
                 "norm_normal_batch": modelnorm_normal,
                 "norm_normal_gamma_batch": modelnorm_normal_gamma,
                 "norm_normal_attn_batch": modelnorm_normal_attn,

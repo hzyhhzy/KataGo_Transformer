@@ -416,8 +416,6 @@ def main(args):
         write_matmul(name+".linear_miscvaluehead", w)
         write_matbias(name+".bias_miscvaluehead", b)
 
-        write_conv(name+".conv_ownership",valuehead.conv_ownership)
-
     def write_model(model):
         write_trunk("model",model)
         write_policy_head("model.policy_head",model.policy_head)

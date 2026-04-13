@@ -34,24 +34,22 @@ def read_npz_training_data(
         assert num_bin_features == 22, f"gomoku history requires 22 spatial channels, got {num_bin_features}"
         assert num_global_features == 39, f"gomoku history requires 39 global channels, got {num_global_features}"
 
-    include_qvalues = model_config["version"] >= 16 and model_config["version"] < 100
-
     def load_npz_file(npz_file):
         with np.load(npz_file) as npz:
             binaryInputNCHWPacked = npz["binaryInputNCHWPacked"]
             globalInputNC = npz["globalInputNC"]
             policyTargetsNCMove = npz["policyTargetsNCMove"].astype(np.float32)
             globalTargetsNC = npz["globalTargetsNC"]
-            scoreDistrN = npz["scoreDistrN"].astype(np.float32)
-            valueTargetsNCHW = npz["valueTargetsNCHW"].astype(np.float32)
             if include_meta:
-                metadataInputNC = npz["metadataInputNC"].astype(np.float32)
+                metadataInputNC = np.zeros(
+                    (
+                        binaryInputNCHWPacked.shape[0],
+                        modelconfigs.get_num_meta_encoder_input_features(model_config),
+                    ),
+                    dtype=np.float32,
+                )
             else:
                 metadataInputNC = None
-            if include_qvalues:
-                qValueTargetsNCMove = npz["qValueTargetsNCMove"].astype(np.float32)
-            else:
-                qValueTargetsNCMove = None
         del npz
 
         binaryInputNCHW = np.unpackbits(binaryInputNCHWPacked,axis=2)
@@ -64,7 +62,7 @@ def read_npz_training_data(
 
         assert binaryInputNCHW.shape[1] == num_bin_features
         assert globalInputNC.shape[1] == num_global_features
-        return (npz_file, binaryInputNCHW, globalInputNC, policyTargetsNCMove, globalTargetsNC, scoreDistrN, valueTargetsNCHW, metadataInputNC, qValueTargetsNCMove)
+        return (npz_file, binaryInputNCHW, globalInputNC, policyTargetsNCMove, globalTargetsNC, metadataInputNC)
 
     if not npz_files:
         return
@@ -73,7 +71,7 @@ def read_npz_training_data(
         future = executor.submit(load_npz_file, npz_files[0])
 
         for next_file in (npz_files[1:] + [None]):
-            (npz_file, binaryInputNCHW, globalInputNC, policyTargetsNCMove, globalTargetsNC, scoreDistrN, valueTargetsNCHW, metadataInputNC, qValueTargetsNCMove) = future.result()
+            (npz_file, binaryInputNCHW, globalInputNC, policyTargetsNCMove, globalTargetsNC, metadataInputNC) = future.result()
 
             num_samples = binaryInputNCHW.shape[0]
             # Just discard stuff that doesn't divide evenly
@@ -93,12 +91,8 @@ def read_npz_training_data(
                 batch_globalInputNC = torch.from_numpy(globalInputNC[start:end]).to(device)
                 batch_policyTargetsNCMove = torch.from_numpy(policyTargetsNCMove[start:end]).to(device)
                 batch_globalTargetsNC = torch.from_numpy(globalTargetsNC[start:end]).to(device)
-                batch_scoreDistrN = torch.from_numpy(scoreDistrN[start:end]).to(device)
-                batch_valueTargetsNCHW = torch.from_numpy(valueTargetsNCHW[start:end]).to(device)
                 if include_meta:
                     batch_metadataInputNC = torch.from_numpy(metadataInputNC[start:end]).to(device)
-                if include_qvalues:
-                    batch_qValueTargetsNCMove = torch.from_numpy(qValueTargetsNCMove[start:end]).to(device)
 
                 if enable_history_matrices:
                     (batch_binaryInputNCHW, batch_globalInputNC) = apply_history_matrices(
@@ -131,28 +125,18 @@ def read_npz_training_data(
                                
                     batch_binaryInputNCHW = apply_symmetry(batch_binaryInputNCHW, symm)
                     batch_policyTargetsNCMove = apply_symmetry_policy(batch_policyTargetsNCMove, symm, pos_len)
-                    batch_valueTargetsNCHW = apply_symmetry(batch_valueTargetsNCHW, symm)
-                    if include_qvalues:
-                        batch_qValueTargetsNCMove = apply_symmetry_policy(batch_qValueTargetsNCMove, symm, pos_len)
 
                 batch_binaryInputNCHW = batch_binaryInputNCHW.contiguous()
                 batch_policyTargetsNCMove = batch_policyTargetsNCMove.contiguous()
-                batch_valueTargetsNCHW = batch_valueTargetsNCHW.contiguous()
-                if include_qvalues:
-                    batch_qValueTargetsNCMove = batch_qValueTargetsNCMove.contiguous()
 
                 batch = dict(
                     binaryInputNCHW = batch_binaryInputNCHW,
                     globalInputNC = batch_globalInputNC,
                     policyTargetsNCMove = batch_policyTargetsNCMove,
                     globalTargetsNC = batch_globalTargetsNC,
-                    scoreDistrN = batch_scoreDistrN,
-                    valueTargetsNCHW = batch_valueTargetsNCHW,
                 )
                 if include_meta:
                     batch["metadataInputNC"] = batch_metadataInputNC
-                if include_qvalues:
-                    batch["qValueTargetsNCMove"] = batch_qValueTargetsNCMove
 
                 yield batch
 

@@ -171,7 +171,7 @@ class ONNXExportWrapper(torch.nn.Module):
             outputs = self.model(input_spatial, input_global, disable_mask=self.disable_mask)
         
         outputs = outputs[0]
-        pruned_outputs = tuple([outputs[i] for i in [0, 1, 2, 3, 4]])
+        pruned_outputs = tuple([outputs[i] for i in [0, 1, 2, 3]])
         return pruned_outputs
 
 if CalibrationDataReader is not None:
@@ -389,7 +389,6 @@ def export_to_onnx(model: Model, full_name: str ,export_path: str, pos_len: int 
     #]
     output_names = [
         'out_policy', 'out_value', 'out_miscvalue', 'out_moremiscvalue', 
-        'out_ownership'
     ]
     
     # Dynamic axes for variable batch size

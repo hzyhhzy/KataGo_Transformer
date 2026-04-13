@@ -1697,38 +1697,6 @@ class ValueHead(torch.nn.Module):
         self.linear_valuehead = torch.nn.Linear(c_v2, 3, bias=True)
         self.linear_miscvaluehead = torch.nn.Linear(c_v2, 10, bias=True)
         self.linear_moremiscvaluehead = torch.nn.Linear(c_v2, 8, bias=True)
-        self.conv_ownership = torch.nn.Conv2d(c_v1, 1, kernel_size=1, padding="same", bias=False)
-        self.conv_scoring = torch.nn.Conv2d(c_v1, 1, kernel_size=1, padding="same", bias=False)
-        self.conv_futurepos = torch.nn.Conv2d(c_in, 2, kernel_size=1, padding="same", bias=False)
-        self.conv_seki = torch.nn.Conv2d(c_in, 4, kernel_size=1, padding="same", bias=False)
-
-        self.pos_len = pos_len
-        self.scorebelief_mid = self.pos_len*self.pos_len + EXTRA_SCORE_DISTR_RADIUS
-        self.scorebelief_len = self.scorebelief_mid * 2
-        self.num_scorebeliefs = num_scorebeliefs
-        self.c_sv2 = c_sv2
-
-        self.linear_s2 = torch.nn.Linear(3 * c_v1, c_sv2, bias=True)
-        self.linear_s2off = torch.nn.Linear(1, c_sv2, bias=False)
-        self.linear_s2par = torch.nn.Linear(1, c_sv2, bias=False)
-        self.linear_s3 = torch.nn.Linear(c_sv2, num_scorebeliefs, bias=True)
-        self.linear_smix = torch.nn.Linear(3 * c_v1, num_scorebeliefs, bias=True)
-
-        self.register_buffer("score_belief_offset_vector", torch.tensor(
-            data=[(float(i-self.scorebelief_mid)+0.5) for i in range(self.scorebelief_len)],
-            dtype=torch.float32,
-            requires_grad=False,
-        ), persistent=False)
-        self.register_buffer("score_belief_offset_bias_vector", torch.tensor(
-            data=[0.05 * (float(i-self.scorebelief_mid)+0.5) for i in range(self.scorebelief_len)],
-            dtype=torch.float32,
-            requires_grad=False,
-        ), persistent=False)
-        self.register_buffer("score_belief_parity_vector", torch.tensor(
-            [0.5-float((i-self.scorebelief_mid) % 2) for i in range(self.scorebelief_len)],
-            dtype=torch.float32,
-            requires_grad=False,
-        ), persistent=False)
 
 
     def initialize(self):
@@ -1746,23 +1714,6 @@ class ValueHead(torch.nn.Module):
         init_weights(self.linear_moremiscvaluehead.weight, "identity", scale=1.0)
         init_weights(self.linear_moremiscvaluehead.bias, "identity", scale=bias_scale, fan_tensor=self.linear_moremiscvaluehead.weight)
 
-        aux_spatial_output_scale = 0.2
-        init_weights(self.conv_ownership.weight, "identity", scale=aux_spatial_output_scale)
-        init_weights(self.conv_scoring.weight, "identity", scale=aux_spatial_output_scale)
-        init_weights(self.conv_futurepos.weight, "identity", scale=aux_spatial_output_scale)
-        init_weights(self.conv_seki.weight, "identity", scale=aux_spatial_output_scale)
-
-        init_weights(self.linear_s2.weight, self.activation, scale=1.0)
-        init_weights(self.linear_s2.bias, self.activation, scale=1.0, fan_tensor=self.linear_s2.weight)
-        init_weights(self.linear_s2off.weight, self.activation, scale=1.0, fan_tensor=self.linear_s2.weight)
-        init_weights(self.linear_s2par.weight, self.activation, scale=1.0, fan_tensor=self.linear_s2.weight)
-
-        scorebelief_output_scale = 0.5
-        init_weights(self.linear_s3.weight, "identity", scale=scorebelief_output_scale)
-        init_weights(self.linear_s3.bias, "identity", scale=scorebelief_output_scale*bias_scale, fan_tensor=self.linear_s3.weight)
-        init_weights(self.linear_smix.weight, "identity", scale=1.0)
-        init_weights(self.linear_smix.bias, "identity", scale=bias_scale, fan_tensor=self.linear_smix.weight)
-
     def add_reg_dict(self, reg_dict:Dict[str,List]):
         reg_dict["output"].append(self.conv1.weight)
         reg_dict["output"].append(self.linear2.weight)
@@ -1773,18 +1724,6 @@ class ValueHead(torch.nn.Module):
         reg_dict["output_noreg"].append(self.linear_miscvaluehead.bias)
         reg_dict["output"].append(self.linear_moremiscvaluehead.weight)
         reg_dict["output_noreg"].append(self.linear_moremiscvaluehead.bias)
-        reg_dict["output"].append(self.conv_ownership.weight)
-        reg_dict["output"].append(self.conv_scoring.weight)
-        reg_dict["output"].append(self.conv_futurepos.weight)
-        reg_dict["output"].append(self.conv_seki.weight)
-        reg_dict["output"].append(self.linear_s2.weight)
-        reg_dict["output_noreg"].append(self.linear_s2.bias)
-        reg_dict["output"].append(self.linear_s2off.weight)
-        reg_dict["output"].append(self.linear_s2par.weight)
-        reg_dict["output"].append(self.linear_s3.weight)
-        reg_dict["output_noreg"].append(self.linear_s3.bias)
-        reg_dict["output"].append(self.linear_smix.weight)
-        reg_dict["output_noreg"].append(self.linear_smix.bias)
         self.bias1.add_reg_dict(reg_dict)
 
     def set_brenorm_params(self, renorm_avg_momentum: float, rmax: float, dmax: float):
@@ -1808,47 +1747,10 @@ class ValueHead(torch.nn.Module):
         out_value = self.linear_valuehead(outv2)
         out_miscvalue = self.linear_miscvaluehead(outv2)
         out_moremiscvalue = self.linear_moremiscvaluehead(outv2)
-        out_ownership = self.conv_ownership(outv1)
-        out_scoring = self.conv_scoring(outv1)
-        out_futurepos = self.conv_futurepos(x)
-        out_seki = self.conv_seki(x)
-        if mask is not None:
-            out_ownership = out_ownership * mask
-            out_scoring = out_scoring * mask
-            out_futurepos = out_futurepos * mask
-            out_seki = out_seki * mask
-            
-
-        # Score belief head
-        batch_size = x.shape[0]
-        outsv2 = (
-            self.linear_s2(outpooled).view(batch_size,1,self.c_sv2) +
-            self.linear_s2off(self.score_belief_offset_bias_vector.view(1,self.scorebelief_len,1)) +
-            self.linear_s2par((self.score_belief_parity_vector.view(1,self.scorebelief_len) * input_global[:,-1:]).view(batch_size,self.scorebelief_len,1))
-        ) # N,scorebelief_len,c_sv2
-
-        outsv2 = self.act2(outsv2)
-        outsv3 = self.linear_s3(outsv2) # N, scorebelief_len, num_scorebeliefs
-
-        outsmix = self.linear_smix(outpooled) # N, num_scorebeliefs
-        outsmix_logweights = torch.nn.functional.log_softmax(outsmix, dim=1)
-        #print("outsmix_logweights",outsmix_logweights.shape)
-        # For each of num_scorebeliefs, compute softmax to make it into probability distribution
-        out_scorebelief_logprobs = torch.nn.functional.log_softmax(outsv3, dim=1)
-        # Take the mixture distribution weighted by outsmix_weights
-        #print(out_scorebelief_logprobs.shape)
-        out_scorebelief_logprobs = torch.logsumexp(out_scorebelief_logprobs + outsmix_logweights.view(-1, 1, self.num_scorebeliefs), dim=2)
-
-        #print(out_scorebelief_logprobs.shape)
         return (
             out_value,
             out_miscvalue,
             out_moremiscvalue,
-            out_ownership,
-            out_scoring,
-            out_futurepos,
-            out_seki,
-            out_scorebelief_logprobs,
         )
 
 class MetadataEncoder(torch.nn.Module):
@@ -2313,13 +2215,7 @@ class Model(torch.nn.Module):
                     iout_value,
                     iout_miscvalue,
                     iout_moremiscvalue,
-                    iout_ownership,
-                    iout_scoring,
-                    iout_futurepos,
-                    iout_seki,
-                    iout_scorebelief_logprobs,
                 ) = self.intermediate_value_head(iout, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, input_global=input_global, extra_outputs=extra_outputs)
-                #print(iout_scorebelief_logprobs.shape)
                 #torch._dynamo.graph_break() # torch.compile sometimes HAVE BUGS
 
             for block in self.blocks[self.intermediate_head_blocks:]:
@@ -2355,16 +2251,7 @@ class Model(torch.nn.Module):
                 out_value,
                 out_miscvalue,
                 out_moremiscvalue,
-                out_ownership,
-                out_scoring,
-                out_futurepos,
-                out_seki,
-                out_scorebelief_logprobs,
             ) = self.value_head(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, input_global=input_global, extra_outputs=extra_outputs)
-            #print(iout_scoring.shape)
-            #print(out_scoring.shape)
-            #print(iout_scorebelief_logprobs.shape)
-            #print(out_scorebelief_logprobs.shape)
         
             if self.has_intermediate_head:
                 return (
@@ -2373,22 +2260,12 @@ class Model(torch.nn.Module):
                         out_value,
                         out_miscvalue,
                         out_moremiscvalue,
-                        out_ownership,
-                        out_scoring,
-                        out_futurepos,
-                        out_seki,
-                        out_scorebelief_logprobs,
                     ),
                     (
                         iout_policy,
                         iout_value,
                         iout_miscvalue,
                         iout_moremiscvalue,
-                        iout_ownership,
-                        iout_scoring,
-                        iout_futurepos,
-                        iout_seki,
-                        iout_scorebelief_logprobs,
                     ),
                 )
             else:
@@ -2397,11 +2274,6 @@ class Model(torch.nn.Module):
                     out_value,
                     out_miscvalue,
                     out_moremiscvalue,
-                    out_ownership,
-                    out_scoring,
-                    out_futurepos,
-                    out_seki,
-                    out_scorebelief_logprobs,
                 ),)
 
     def float32ify_output(self, outputs_byheads):
@@ -2413,22 +2285,12 @@ class Model(torch.nn.Module):
             out_value,
             out_miscvalue,
             out_moremiscvalue,
-            out_ownership,
-            out_scoring,
-            out_futurepos,
-            out_seki,
-            out_scorebelief_logprobs,
         ) = outputs
         return (
             out_policy.to(torch.float32),
             out_value.to(torch.float32),
             out_miscvalue.to(torch.float32),
             out_moremiscvalue.to(torch.float32),
-            out_ownership.to(torch.float32),
-            out_scoring.to(torch.float32),
-            out_futurepos.to(torch.float32),
-            out_seki.to(torch.float32),
-            out_scorebelief_logprobs.to(torch.float32),
         )
 
     def postprocess_output(self, outputs_byheads):
@@ -2440,21 +2302,12 @@ class Model(torch.nn.Module):
             out_value,
             out_miscvalue,
             out_moremiscvalue,
-            out_ownership,
-            out_scoring,
-            out_futurepos,
-            out_seki,
-            out_scorebelief_logprobs,
         ) = outputs
 
         policy_logits = out_policy
         value_logits = out_value
         td_value_logits = torch.stack((out_miscvalue[:,4:7], out_miscvalue[:,7:10], out_moremiscvalue[:,2:5]), dim=1)
         pred_td_score = out_moremiscvalue[:,5:8] * self.td_score_multiplier
-        ownership_pretanh = out_ownership
-        pred_scoring = out_scoring
-        futurepos_pretanh = out_futurepos
-        seki_logits = out_seki
         pred_scoremean = out_miscvalue[:, 0] * self.scoremean_multiplier
         pred_scorestdev = SoftPlusWithGradientFloorFunction.apply(out_miscvalue[:, 1], 0.05, False) * self.scorestdev_multiplier
         pred_lead = out_miscvalue[:, 2] * self.lead_multiplier
@@ -2465,23 +2318,15 @@ class Model(torch.nn.Module):
         else:
             pred_shortterm_value_error = SoftPlusWithGradientFloorFunction.apply(out_moremiscvalue[:,0], 0.05, True) * self.shortterm_value_error_multiplier
             pred_shortterm_score_error = SoftPlusWithGradientFloorFunction.apply(out_moremiscvalue[:,1], 0.05, True) * self.shortterm_score_error_multiplier
-        scorebelief_logits = out_scorebelief_logprobs
-
-        #print(out_scorebelief_logprobs.shape)
         return (
             policy_logits,      # N, num_policy_outputs, move
             value_logits,       # N, {win,loss,noresult}
             td_value_logits,    # N, {long, mid, short} {win,loss,noresult}
             pred_td_score,      # N, {long, mid, short}
-            ownership_pretanh,  # N, 1, y, x
-            pred_scoring,       # N, 1, y, x
-            futurepos_pretanh,  # N, 2, y, x
-            seki_logits,        # N, 4, y, x
             pred_scoremean,     # N
             pred_scorestdev,    # N
             pred_lead,          # N
             pred_variance_time, # N
             pred_shortterm_value_error, # N
             pred_shortterm_score_error, # N
-            scorebelief_logits, # N, 2 * (self.pos_len*self.pos_len + EXTRA_SCORE_DISTR_RADIUS)
         )
