@@ -26,8 +26,8 @@ class Metrics:
         self.n = batch_size
         self.world_size = world_size
         self.pos_len = raw_model.pos_len
-        self.pos_area = raw_model.pos_len * raw_model.pos_len
-        self.policy_len = raw_model.pos_len * raw_model.pos_len + 1
+        self.pos_area = raw_model.pos_len * raw_model.pos_len * raw_model.pos_len
+        self.policy_len = self.pos_area + 1
         self.value_len = 3
         self.num_td_values = 3
         self.moving_unowned_proportion_sum = 0.0
@@ -341,18 +341,17 @@ class Metrics:
             pred_shortterm_score_error,
         ) = model_output_postprocessed
 
-        input_binary_nchw = batch["binaryInputNCHW"]
+        input_binary_ncl = batch["binaryInputNCL"]
         input_global_nc = batch["globalInputNC"]
         target_policy_ncmove = batch["policyTargetsNCMove"]
         target_global_nc = batch["globalTargetsNC"]
-        mask = input_binary_nchw[:, 0, :, :].contiguous()
-        mask_sum_hw = torch.sum(mask,dim=(1,2))
+        mask = input_binary_ncl[:, 0, :].contiguous()
+        mask_sum_hw = torch.sum(mask, dim=1)
 
-        n = input_binary_nchw.shape[0]
-        h = input_binary_nchw.shape[2]
-        w = input_binary_nchw.shape[3]
+        n = input_binary_ncl.shape[0]
+        l = input_binary_ncl.shape[2]
 
-        policymask = torch.cat((mask.view(n,h*w),mask.new_ones((n,1))),dim=1)
+        policymask = torch.cat((mask.view(n, l), mask.new_ones((n, 1))), dim=1)
 
         target_policy_player = target_policy_ncmove[:, 0, :]
         target_policy_player = target_policy_player / torch.sum(target_policy_player, dim=1, keepdim=True)

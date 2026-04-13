@@ -97,6 +97,19 @@ def init_weights(tensor, activation, scale, fan_tensor=None):
     else:
         torch.nn.init.trunc_normal_(tensor, mean=0.0, std=std, a=-2.0*std, b=2.0*std)
 
+
+def ncl_to_ncdhw(x: torch.Tensor, pos_len: int) -> torch.Tensor:
+    assert x.dim() == 3, f"Expected NCL tensor, got shape {tuple(x.shape)}"
+    n, c, l = x.shape
+    expected_l = pos_len * pos_len * pos_len
+    assert l == expected_l, f"Expected L={expected_l} for pos_len={pos_len}, got {l}"
+    return x.contiguous().view(n, c, pos_len, pos_len, pos_len)
+
+
+def ncdhw_to_ncl(x: torch.Tensor) -> torch.Tensor:
+    assert x.dim() == 5, f"Expected NCDHW tensor, got shape {tuple(x.shape)}"
+    return x.contiguous().view(x.shape[0], x.shape[1], -1)
+
 class SoftPlusWithGradientFloorFunction(torch.autograd.Function):
     """
     Same as softplus, except on backward pass, we never let the gradient decrease below grad_floor.
@@ -132,7 +145,7 @@ class BiasMask(torch.nn.Module):
     ):
         super(BiasMask, self).__init__()
         self.c_in = c_in
-        self.beta = torch.nn.Parameter(torch.zeros(1, c_in, 1, 1))
+        self.beta = torch.nn.Parameter(torch.zeros(1, c_in, 1))
         self.is_after_batchnorm = is_after_batchnorm
         self.scale = None
 
@@ -158,11 +171,11 @@ class BiasMask(torch.nn.Module):
     def forward(self, x, mask, mask_sum: float):
         """
         Parameters:
-        x: NCHW
-        mask: N1HW
+        x: NCL
+        mask: N1L
         mask_sum: scalar
 
-        Returns: NCHW
+        Returns: NCL
         """
         if mask is not None:
             if self.scale is not None:
@@ -221,8 +234,8 @@ class NormMask(torch.nn.Module):
         if self.norm_kind == "bnorm" or (self.norm_kind == "fixscaleonenorm" and self.is_last_batchnorm):
             self.is_using_batchnorm = True
             if self.use_gamma:
-                self.gamma = torch.nn.Parameter(torch.zeros(1, c_in, 1, 1))
-            self.beta = torch.nn.Parameter(torch.zeros(1, c_in, 1, 1))
+                self.gamma = torch.nn.Parameter(torch.zeros(1, c_in, 1))
+            self.beta = torch.nn.Parameter(torch.zeros(1, c_in, 1))
             self.register_buffer(
                 "running_mean", torch.zeros(c_in, dtype=torch.float)
             )
@@ -232,8 +245,8 @@ class NormMask(torch.nn.Module):
         elif self.norm_kind == "brenorm" or self.norm_kind == "fixbrenorm":
             self.is_using_batchnorm = True
             if self.use_gamma:
-                self.gamma = torch.nn.Parameter(torch.zeros(1, c_in, 1, 1))
-            self.beta = torch.nn.Parameter(torch.zeros(1, c_in, 1, 1))
+                self.gamma = torch.nn.Parameter(torch.zeros(1, c_in, 1))
+            self.beta = torch.nn.Parameter(torch.zeros(1, c_in, 1))
             self.register_buffer(
                 "running_mean", torch.zeros(c_in, dtype=torch.float)
             )
@@ -258,9 +271,9 @@ class NormMask(torch.nn.Module):
 
         elif self.norm_kind == "fixup" or self.norm_kind == "fixscale" or (self.norm_kind == "fixscaleonenorm" and not self.is_last_batchnorm):
             self.is_using_batchnorm = False
-            self.beta = torch.nn.Parameter(torch.zeros(1, c_in, 1, 1))
+            self.beta = torch.nn.Parameter(torch.zeros(1, c_in, 1))
             if self.use_gamma:
-                self.gamma = torch.nn.Parameter(torch.zeros(1, c_in, 1, 1))
+                self.gamma = torch.nn.Parameter(torch.zeros(1, c_in, 1))
         else:
             assert False, f"Unimplemented norm_kind: {self.norm_kind}"
 
@@ -295,13 +308,13 @@ class NormMask(torch.nn.Module):
         # This is the mean, computed only over exactly the areas of the mask, weighting each spot equally,
         # even across different elements in the batch that might have different board sizes.
         if mask is not None:
-            mean = torch.sum(x * mask, dim=(0,2,3),keepdim=True) / mask_sum
+            mean = torch.sum(x * mask, dim=(0, 2), keepdim=True) / mask_sum
             zeromean_x = x - mean
-            var = torch.sum(torch.square(zeromean_x * mask),dim=(0,2,3),keepdim=True) / mask_sum
+            var = torch.sum(torch.square(zeromean_x * mask), dim=(0, 2), keepdim=True) / mask_sum
         else:
-            mean = torch.mean(x, dim=(0,2,3),keepdim=True) 
+            mean = torch.mean(x, dim=(0, 2), keepdim=True)
             zeromean_x = x - mean
-            var = torch.mean(torch.square(zeromean_x),dim=(0,2,3),keepdim=True) 
+            var = torch.mean(torch.square(zeromean_x), dim=(0, 2), keepdim=True)
         # Similarly, the variance computed exactly only over those spots
         std = torch.sqrt(var + self.epsilon)
         #if(self.is_last_batchnorm):
@@ -336,11 +349,11 @@ class NormMask(torch.nn.Module):
     def forward(self, x, mask, mask_sum: float):
         """
         Parameters:
-        x: NCHW
-        mask: N1HW
+        x: NCL
+        mask: N1L
         mask_sum: scalar
 
-        Returns: NCHW
+        Returns: NCL
         """
 
         if self.norm_kind == "bnorm" or (self.norm_kind == "fixscaleonenorm" and self.is_last_batchnorm):
@@ -356,7 +369,7 @@ class NormMask(torch.nn.Module):
 
                 return self.apply_gamma_beta_scale_mask(zeromean_x / std, mask)
             else:
-                return self.apply_gamma_beta_scale_mask((x - self.running_mean.view(1,self.c_in,1,1)) / self.running_std.view(1,self.c_in,1,1), mask)
+                return self.apply_gamma_beta_scale_mask((x - self.running_mean.view(1, self.c_in, 1)) / self.running_std.view(1, self.c_in, 1), mask)
 
         elif self.norm_kind == "brenorm" or self.norm_kind == "fixbrenorm":
             assert x.shape[1] == self.c_in
@@ -394,12 +407,12 @@ class NormMask(torch.nn.Module):
                     #if(self.is_last_batchnorm):
                     #    return self.apply_gamma_beta_scale_mask((zeromean_x + mean.detach().view(1,self.c_in,1,1) - self.renorm_running_mean.view(1,self.c_in,1,1))/ self.renorm_running_std.detach().view(1,self.c_in,1,1) + 0*self.renorm_running_mean.detach().view(1,self.c_in,1,1), mask)
                     #else:
-                    return self.apply_gamma_beta_scale_mask(zeromean_x / std * r.detach().view(1,self.c_in,1,1) + d.detach().view(1,self.c_in,1,1), mask)
+                    return self.apply_gamma_beta_scale_mask(zeromean_x / std * r.detach().view(1, self.c_in, 1) + d.detach().view(1, self.c_in, 1), mask)
                 else:
                     return self.apply_gamma_beta_scale_mask(zeromean_x / std, mask)
 
             else:
-                return self.apply_gamma_beta_scale_mask((x - self.running_mean.view(1,self.c_in,1,1)) / self.running_std.view(1,self.c_in,1,1), mask)
+                return self.apply_gamma_beta_scale_mask((x - self.running_mean.view(1, self.c_in, 1)) / self.running_std.view(1, self.c_in, 1), mask)
 
         elif self.norm_kind == "fixup" or self.norm_kind == "fixscale" or (self.norm_kind == "fixscaleonenorm" and not self.is_last_batchnorm):
             return self.apply_gamma_beta_scale_mask(x, mask)
@@ -418,29 +431,29 @@ class KataGPool(torch.nn.Module):
     def forward(self, x, mask, mask_sum_hw):
         """
         Parameters:
-        x: NCHW
-        mask: N1HW
-        mask_sum_hw: N111
+        x: NCL
+        mask: N1L
+        mask_sum_hw: N11
 
-        Returns: NC11
+        Returns: NC1
         """
         if mask is not None:
             mask_sum_hw_sqrt_offset = torch.sqrt(mask_sum_hw) - self.t_14
         
-            x_fp32=x.to(torch.float32)
-            layer_mean = torch.sum(x_fp32, dim=(2, 3), keepdim=True) / mask_sum_hw
+            x_fp32 = x.to(torch.float32)
+            layer_mean = torch.sum(x_fp32, dim=2, keepdim=True) / mask_sum_hw
             # All activation functions we use right now are always greater than -1.0, and map 0 -> 0.
             # So off-board areas will equal 0, and then this max is mask-safe if we assign -1.0 to off-board areas.
-            (layer_max,_argmax) = torch.max((x+(mask-self.t_1)).view(x.shape[0],x.shape[1],-1).to(torch.float32), dim=2)
+            (layer_max, _argmax) = torch.max((x + (mask - self.t_1)).to(torch.float32), dim=2)
         else:
-            mask_sum_hw_sqrt_offset = (x.shape[2]*x.shape[3])**0.5 - self.t_14
-            x_fp32=x.to(torch.float32)
-            layer_mean = torch.mean(x_fp32, dim=(2, 3), keepdim=True) 
+            mask_sum_hw_sqrt_offset = (x.shape[2] ** 0.5) - self.t_14
+            x_fp32 = x.to(torch.float32)
+            layer_mean = torch.mean(x_fp32, dim=2, keepdim=True)
             # All activation functions we use right now are always greater than -1.0, and map 0 -> 0.
             # So off-board areas will equal 0, and then this max is mask-safe if we assign -1.0 to off-board areas.
-            (layer_max,_argmax) = torch.max(x.view(x.shape[0],x.shape[1],-1).to(torch.float32), dim=2)
+            (layer_max, _argmax) = torch.max(x.to(torch.float32), dim=2)
             
-        layer_max = layer_max.view(x.shape[0],x.shape[1],1,1)
+        layer_max = layer_max.view(x.shape[0], x.shape[1], 1)
 
         out_pool1 = layer_mean
         out_pool2 = layer_mean * (mask_sum_hw_sqrt_offset / self.t_10)
@@ -462,21 +475,21 @@ class KataValueHeadGPool(torch.nn.Module):
     def forward(self, x, mask, mask_sum_hw):
         """
         Parameters:
-        x: NCHW
-        mask: N1HW
-        mask_sum_hw: N111
+        x: NCL
+        mask: N1L
+        mask_sum_hw: N11
 
-        Returns: NC11
+        Returns: NC1
         """
         if mask is not None:
             mask_sum_hw_sqrt_offset = torch.sqrt(mask_sum_hw) - self.t_14
         
-            x_fp32=x.to(torch.float32)
-            layer_mean = torch.sum(x_fp32, dim=(2, 3), keepdim=True) / mask_sum_hw
+            x_fp32 = x.to(torch.float32)
+            layer_mean = torch.sum(x_fp32, dim=2, keepdim=True) / mask_sum_hw
         else:
-            mask_sum_hw_sqrt_offset = (x.shape[2]*x.shape[3])**0.5 - self.t_14
-            x_fp32=x.to(torch.float32)
-            layer_mean = torch.mean(x_fp32, dim=(2, 3), keepdim=True) 
+            mask_sum_hw_sqrt_offset = (x.shape[2] ** 0.5) - self.t_14
+            x_fp32 = x.to(torch.float32)
+            layer_mean = torch.mean(x_fp32, dim=2, keepdim=True)
 
         out_pool1 = layer_mean
         out_pool2 = layer_mean * (mask_sum_hw_sqrt_offset / self.t_10)
@@ -486,13 +499,14 @@ class KataValueHeadGPool(torch.nn.Module):
         return out
 
 class KataConvAndGPool(torch.nn.Module):
-    def __init__(self, name, c_in, c_out, c_gpool, config, activation):
+    def __init__(self, name, c_in, c_out, c_gpool, config, activation, pos_len):
         super(KataConvAndGPool, self).__init__()
         self.name = name
         self.norm_kind = config["norm_kind"]
         self.activation = activation
-        self.conv1r = torch.nn.Conv2d(c_in, c_out, kernel_size=3, padding="same", bias=False)
-        self.conv1g = torch.nn.Conv2d(c_in, c_gpool, kernel_size=3, padding="same", bias=False)
+        self.pos_len = pos_len
+        self.conv1r = torch.nn.Conv3d(c_in, c_out, kernel_size=3, padding="same", bias=False)
+        self.conv1g = torch.nn.Conv3d(c_in, c_gpool, kernel_size=3, padding="same", bias=False)
         self.normg = NormMask(
             c_gpool,
             config=config,
@@ -531,38 +545,40 @@ class KataConvAndGPool(torch.nn.Module):
     def forward(self, x, mask, mask_sum_hw, mask_sum:float, extra_outputs: Optional[ExtraOutputs]):
         """
         Parameters:
-        x: NCHW
-        mask: N1HW
-        mask_sum_hw: N111
+        x: NCL
+        mask: N1L
+        mask_sum_hw: N11
         mask_sum: scalar
 
-        Returns: NCHW
+        Returns: NCL
         """
         out = x
-        outr = self.conv1r(out)
-        outg = self.conv1g(out)
+        out_3d = ncl_to_ncdhw(out, self.pos_len)
+        outr = ncdhw_to_ncl(self.conv1r(out_3d))
+        outg = ncdhw_to_ncl(self.conv1g(out_3d))
 
         outg = self.normg(outg, mask=mask, mask_sum=mask_sum)
         outg = self.actg(outg)
-        outg = self.gpool(outg, mask=mask, mask_sum_hw=mask_sum_hw).squeeze(-1).squeeze(-1)
-        outg = self.linear_g(outg).unsqueeze(-1).unsqueeze(-1)
+        outg = self.gpool(outg, mask=mask, mask_sum_hw=mask_sum_hw).squeeze(-1)
+        outg = self.linear_g(outg).unsqueeze(-1)
 
         out = outr + outg
         return out
 
 
 class KataConvAndAttentionPool(torch.nn.Module):
-    def __init__(self, name, c_in, c_out, c_gpool, config, activation):
+    def __init__(self, name, c_in, c_out, c_gpool, config, activation, pos_len):
         super(KataConvAndAttentionPool, self).__init__()
         self.name = name
         self.norm_kind = config["norm_kind"]
         self.c_gpool = c_gpool
         self.c_apheads = config["num_attention_pool_heads"]
         self.activation = activation
-        self.conv1r = torch.nn.Conv2d(c_in, c_out, kernel_size=3, padding="same", bias=False)
-        self.conv1g = torch.nn.Conv2d(c_in, c_gpool, kernel_size=3, padding="same", bias=False)
-        self.conv1k = torch.nn.Conv2d(c_in, c_gpool, kernel_size=1, padding="same", bias=False)
-        self.conv1q = torch.nn.Conv2d(c_in, c_gpool, kernel_size=1, padding="same", bias=False)
+        self.pos_len = pos_len
+        self.conv1r = torch.nn.Conv3d(c_in, c_out, kernel_size=3, padding="same", bias=False)
+        self.conv1g = torch.nn.Conv3d(c_in, c_gpool, kernel_size=3, padding="same", bias=False)
+        self.conv1k = torch.nn.Conv3d(c_in, c_gpool, kernel_size=1, padding="same", bias=False)
+        self.conv1q = torch.nn.Conv3d(c_in, c_gpool, kernel_size=1, padding="same", bias=False)
 
         assert c_gpool % self.c_apheads == 0, "Gpool channels must be divisible by num_attention_pool_heads"
 
@@ -572,7 +588,7 @@ class KataConvAndAttentionPool(torch.nn.Module):
             fixup_use_gamma=False,
         )
         self.actg = act(activation, inplace=True)
-        self.conv_mix = torch.nn.Conv2d(c_gpool*2, c_out, kernel_size=1, padding="same", bias=False)
+        self.conv_mix = torch.nn.Conv3d(c_gpool*2, c_out, kernel_size=1, padding="same", bias=False)
 
         self.register_buffer("t_1", torch.tensor(1.0, dtype=torch.float32), persistent=False)
         self.register_buffer("t_6000", torch.tensor(6000.0, dtype=torch.float32), persistent=False)
@@ -612,39 +628,39 @@ class KataConvAndAttentionPool(torch.nn.Module):
     def forward(self, x, mask, mask_sum_hw, mask_sum:float, extra_outputs: Optional[ExtraOutputs]):
         """
         Parameters:
-        x: NCHW
-        mask: N1HW
-        mask_sum_hw: N111
+        x: NCL
+        mask: N1L
+        mask_sum_hw: N11
         mask_sum: scalar
 
-        Returns: NCHW
+        Returns: NCL
         """
         n = x.shape[0]
-        h = x.shape[2]
-        w = x.shape[3]
+        seq_len = x.shape[2]
 
         out = x
-        outr = self.conv1r(out)
-        outg = self.conv1g(out)
-        outk = self.conv1k(out).view(n*self.c_apheads, self.c_gpool//self.c_apheads, h*w)
-        outq = self.conv1q(out).view(n*self.c_apheads, self.c_gpool//self.c_apheads, h*w)
-        attention_logits = torch.bmm(torch.transpose(outk,1,2), outq) # n*heads, src h*w, dst h*w
-        attention_logits = attention_logits.view(n, self.c_apheads, h*w, h*w)
-        attention_logits = attention_logits - (self.t_1 - mask.view(n,1,h*w,1)) * self.t_6000
-        attention_logits = attention_logits.view(n * self.c_apheads, h*w, h*w)
+        out_3d = ncl_to_ncdhw(out, self.pos_len)
+        outr = ncdhw_to_ncl(self.conv1r(out_3d))
+        outg = ncdhw_to_ncl(self.conv1g(out_3d))
+        outk = ncdhw_to_ncl(self.conv1k(out_3d)).view(n * self.c_apheads, self.c_gpool // self.c_apheads, seq_len)
+        outq = ncdhw_to_ncl(self.conv1q(out_3d)).view(n * self.c_apheads, self.c_gpool // self.c_apheads, seq_len)
+        attention_logits = torch.bmm(torch.transpose(outk, 1, 2), outq)
+        attention_logits = attention_logits.view(n, self.c_apheads, seq_len, seq_len)
+        attention_logits = attention_logits - (self.t_1 - mask.view(n, 1, seq_len, 1)) * self.t_6000
+        attention_logits = attention_logits.view(n * self.c_apheads, seq_len, seq_len)
         attention = torch.nn.functional.softmax(attention_logits, dim=1)
-        attention_scale = self.t_0_1 / torch.sqrt(torch.sum(torch.square(attention), dim=1, keepdim=True)) # n*heads, 1, h*w
+        attention_scale = self.t_0_1 / torch.sqrt(torch.sum(torch.square(attention), dim=1, keepdim=True))
 
         outg = self.normg(outg, mask=mask, mask_sum=mask_sum)
-        outg = self.actg(outg).view(n*self.c_apheads, self.c_gpool//self.c_apheads, h*w)
+        outg = self.actg(outg).view(n * self.c_apheads, self.c_gpool // self.c_apheads, seq_len)
 
         out_pool1 = torch.bmm(outg, attention)
         out_pool2 = out_pool1 * attention_scale
-        out_pool1 = out_pool1.view(n, self.c_gpool, h*w)
-        out_pool2 = out_pool2.view(n, self.c_gpool, h*w)
+        out_pool1 = out_pool1.view(n, self.c_gpool, seq_len)
+        out_pool2 = out_pool2.view(n, self.c_gpool, seq_len)
 
-        outg = torch.cat((out_pool1, out_pool2), dim=1).view(n, 2 * self.c_gpool, h, w) * mask
-        outg = self.conv_mix(outg)
+        outg = torch.cat((out_pool1, out_pool2), dim=1) * mask
+        outg = ncdhw_to_ncl(self.conv_mix(ncl_to_ncdhw(outg, self.pos_len)))
         out = outr + outg
         return out
 
@@ -700,12 +716,14 @@ class NormActConv(torch.nn.Module):
         activation: str,
         kernel_size: int,
         fixup_use_gamma: bool,
+        pos_len: int,
     ):
         super(NormActConv, self).__init__()
         self.name = name
         self.c_in = c_in
         self.c_out = c_out
         self.c_gpool = c_gpool
+        self.pos_len = pos_len
         self.norm = NormMask(
             c_in,
             config=config,
@@ -717,18 +735,18 @@ class NormActConv(torch.nn.Module):
 
         if c_gpool is not None:
             if config["use_attention_pool"]:
-                self.convpool = KataConvAndAttentionPool(name=name+".convpool",c_in=c_in, c_out=c_out, c_gpool=c_gpool, config=config, activation=activation)
+                self.convpool = KataConvAndAttentionPool(name=name+".convpool", c_in=c_in, c_out=c_out, c_gpool=c_gpool, config=config, activation=activation, pos_len=pos_len)
                 self.conv = None
             else:
-                self.convpool = KataConvAndGPool(name=name+".convpool",c_in=c_in, c_out=c_out, c_gpool=c_gpool, config=config, activation=activation)
+                self.convpool = KataConvAndGPool(name=name+".convpool", c_in=c_in, c_out=c_out, c_gpool=c_gpool, config=config, activation=activation, pos_len=pos_len)
                 self.conv = None
         else:
-            self.conv = torch.nn.Conv2d(c_in, c_out, kernel_size=kernel_size, padding="same", bias=False)
+            self.conv = torch.nn.Conv3d(c_in, c_out, kernel_size=kernel_size, padding="same", bias=False)
             self.convpool = None
 
         self.conv1x1 = None
         if self.conv is not None and kernel_size > 1 and "use_repvgg_linear" in config and config["use_repvgg_linear"]:
-            self.conv1x1 = torch.nn.Conv2d(c_in, c_out, kernel_size=1, padding="same", bias=False)
+            self.conv1x1 = torch.nn.Conv3d(c_in, c_out, kernel_size=1, padding="same", bias=False)
         
         if MAYBE_QAT:
             self.quant_before_conv = QuantStub()
@@ -746,7 +764,7 @@ class NormActConv(torch.nn.Module):
                     init_weights(self.conv.weight, self.activation, scale=scale*0.8)
                     center_bonus = self.conv.weight.new_zeros((self.conv.weight.shape[0],self.conv.weight.shape[1]),requires_grad=False)
                     init_weights(center_bonus, self.activation, scale=scale*0.6)
-                    self.conv.weight[:,:,1,1] += center_bonus
+                    self.conv.weight[:, :, 1, 1, 1] += center_bonus
                 else:
                     init_weights(self.conv.weight, self.activation, scale=scale)
 
@@ -773,12 +791,12 @@ class NormActConv(torch.nn.Module):
     def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[ExtraOutputs]):
         """
         Parameters:
-        x: NCHW
-        mask: N1HW
-        mask_sum_hw: N111
+        x: NCL
+        mask: N1L
+        mask_sum_hw: N11
         mask_sum: scalar
 
-        Returns: NCHW
+        Returns: NCL
         """
         out = x
         out = self.norm(out, mask=mask, mask_sum=mask_sum)
@@ -790,10 +808,11 @@ class NormActConv(torch.nn.Module):
         if self.convpool is not None:
             out = self.convpool(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
         else:
+            out_3d = ncl_to_ncdhw(out, self.pos_len)
             if self.conv1x1 is not None:
-                out = self.conv(out) + self.conv1x1(out)
+                out = ncdhw_to_ncl(self.conv(out_3d) + self.conv1x1(out_3d))
             else:
-                out = self.conv(out)
+                out = ncdhw_to_ncl(self.conv(out_3d))
         if extra_outputs is not None:
             extra_outputs.report(self.name+".out", out)
         return out
@@ -808,6 +827,7 @@ class ResBlock(torch.nn.Module):
         c_gpool: Optional[int],
         config: modelconfigs.ModelConfig,
         activation: str,
+        pos_len: int,
     ):
         super(ResBlock, self).__init__()
         self.name = name
@@ -821,6 +841,7 @@ class ResBlock(torch.nn.Module):
             activation=activation,
             kernel_size=3,
             fixup_use_gamma=False,
+            pos_len=pos_len,
         )
         self.normactconv2 = NormActConv(
             name=name+".normactconv2",
@@ -831,6 +852,7 @@ class ResBlock(torch.nn.Module):
             activation=activation,
             kernel_size=3,
             fixup_use_gamma=True,
+            pos_len=pos_len,
         )
 
     def initialize(self, fixup_scale):
@@ -859,12 +881,12 @@ class ResBlock(torch.nn.Module):
     def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[ExtraOutputs]):
         """
         Parameters:
-        x: NCHW
-        mask: N1HW
-        mask_sum_hw: N111
+        x: NCL
+        mask: N1L
+        mask_sum_hw: N11
         mask_sum: scalar
 
-        Returns: NCHW
+        Returns: NCL
         """
         out = x
         out = self.normactconv1(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
@@ -887,6 +909,7 @@ class TransformerBlock(torch.nn.Module):
         self.name = name
         self.norm_kind = config["norm_kind"]
         self.ffn_dim = config["transformer_ffn_channels"] if "transformer_ffn_channels" in config else c_main*2
+        self.trunk_use_nlc = config.get("trunkUseNLC", False)
         
 
 
@@ -955,14 +978,15 @@ class TransformerBlock(torch.nn.Module):
             
                 
     def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[ExtraOutputs]):
-        # Convert NCHW to NLC since transformer expects sequence input
-        batch_size, channels, height, width = x.shape
-        x = x.view(batch_size, channels, -1).permute(0, 2, 1)  # (H*W, N, C)
+        if self.trunk_use_nlc:
+            batch_size, seq_len, channels = x.shape
+        else:
+            batch_size, channels, seq_len = x.shape
+            x = x.transpose(1, 2)
         
         x1 = self.norm1(x)
         
-        # Convert mask from N1HW to N(H*W)
-        mask1 = mask.view(batch_size, -1)  # (N, H*W)
+        mask1 = mask.view(batch_size, seq_len)
         # Self-attention
         attn_output, _ = self.attention(
             x1, x1, x1,
@@ -977,47 +1001,33 @@ class TransformerBlock(torch.nn.Module):
         x1 = self.ffn_linear2(x1)
         x = x + x1
         
-        # Convert NLC back to NCHW
-        x = x.permute(0, 2, 1).view(batch_size, channels, height, width)
+        if not self.trunk_use_nlc:
+            x = x.transpose(1, 2)
 
         return x
 
-# --- 2D RoPE core utility functions ---
+# --- 3D RoPE core utility functions ---
     
-def precompute_freqs_cos_sin_2d(dim: int, pos_len: int, theta: float = 100.0):
+def precompute_freqs_cos_sin_3d(dim: int, pos_len: int, theta: float = 100.0):
     """
-    Precompute cos and sin tables of 2D frequencies (real-valued, optimized for interleaved layout)
-    Returns shape: (pos_len * pos_len, dim)
+    Precompute cos and sin tables of 3D frequencies.
+    Returns shape: (pos_len * pos_len * pos_len, dim)
     """
-    assert dim % 4 == 0
-    dim_half = dim // 2
-    
-    # 1. Compute base frequencies (H and W share the same scale)
-    # Shape: (dim/4,)
-    freqs = 1.0 / (theta ** (torch.arange(0, dim_half, 2).float() / dim_half))
-    
-    # 2. Generate grid (meshgrid)
+    assert dim % 6 == 0
+    dim_third = dim // 3
+    freqs = 1.0 / (theta ** (torch.arange(0, dim_third, 2).float() / dim_third))
+
     t = torch.arange(pos_len, dtype=torch.float32)
-    # indexing='ij' corresponds to meshgrid(y, x); grid_h varies by rows, grid_w by columns
-    grid_h, grid_w = torch.meshgrid(t, t, indexing='ij') 
-    
-    # 3. Compute angles -> (H, W, dim/4)
-    # Use broadcasting: (H, W, 1) * (dim/4,)
-    emb_h = grid_h.unsqueeze(-1) * freqs 
-    emb_w = grid_w.unsqueeze(-1) * freqs 
-    
-    # 4. Concatenate -> (H, W, dim/2)
-    emb = torch.cat([emb_h, emb_w], dim=-1)
-    
-    # 5. Flatten -> (Seq_len, dim/2)
-    emb = emb.flatten(0, 1)
-    
-    # 6. [Core optimization] Repeat in advance to match interleaved layout
-    # We want cos and sin to be shape (Seq, Dim)
-    # For input [x0, x1, x2, x3...], cos should be [c0, c0, c1, c1...]
-    emb = emb.repeat_interleave(2, dim=-1) # (Seq, Dim)
-    
-    # 7. Return cos, sin
+    grid_h, grid_w, grid_z = torch.meshgrid(t, t, t, indexing='ij')
+
+    emb_h = grid_h.unsqueeze(-1) * freqs
+    emb_w = grid_w.unsqueeze(-1) * freqs
+    emb_z = grid_z.unsqueeze(-1) * freqs
+
+    emb = torch.cat([emb_h, emb_w, emb_z], dim=-1)
+    emb = emb.flatten(0, 2)
+    emb = emb.repeat_interleave(2, dim=-1)
+
     return emb.cos(), emb.sin()
 
 # --- 2. Rewrite: real-valued version of Apply function ---
@@ -1026,7 +1036,7 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, cos: torch.Tensor, sin:
     """
     Efficient real-valued rotation application
     xq, xk: (Batch, Seq, Heads, Dim)
-    cos, sin: (Seq, Dim)  <-- Note: inputs are full Dim
+    cos, sin: (Seq, Dim)
     """
     def rotate_every_two(x):
         # 1. Split last dimension (..., Dim) -> (..., Dim/2, 2)
@@ -1073,6 +1083,7 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         self.ffn_dim = config.get("transformer_ffn_channels", c_main * 2)
         self.use_swiglu = use_swiglu  
         self.use_rope = use_rope
+        self.trunk_use_nlc = config.get("trunkUseNLC", False)
         # --- GQA Config ---
         self.num_heads = config.get("transformer_heads", 4)             # Query Heads
         self.num_kv_heads = config.get("transformer_kv_heads", self.num_heads) # KV Heads (Key/Value)
@@ -1083,7 +1094,7 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         self.head_dim = c_main // self.num_heads
         
         assert self.head_dim * self.num_heads == c_main, "Embed dim mismatch"
-        assert self.head_dim % 4 == 0, "Head dim mismatch for 2D RoPE"
+        assert self.head_dim % 6 == 0, "Head dim mismatch for 3D RoPE"
         assert self.num_heads % self.num_kv_heads == 0, \
             f"Query heads ({self.num_heads}) must be divisible by KV heads ({self.num_kv_heads})"
 
@@ -1100,7 +1111,7 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         if self.use_rope:
             self.rope_theta = config.get("rope_theta", 100.0) # KV Heads (Key/Value)
             assert self.rope_theta > pos_len * 2.0, f"theta={self.rope_theta} of RoPE may be too small for pos_len={pos_len}"
-            cos_cached, sin_cached = precompute_freqs_cos_sin_2d(self.head_dim, pos_len, self.rope_theta)
+            cos_cached, sin_cached = precompute_freqs_cos_sin_3d(self.head_dim, pos_len, self.rope_theta)
             self.register_buffer("cos_cached", cos_cached, persistent=False)
             self.register_buffer("sin_cached", sin_cached, persistent=False)
         else:
@@ -1139,8 +1150,12 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         pass
         
     def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[Dict] = None):
-        batch_size, channels, height, width = x.shape
-        x_in = x.view(batch_size, channels, -1).permute(0, 2, 1)
+        if self.trunk_use_nlc:
+            batch_size, seq_len, channels = x.shape
+            x_in = x
+        else:
+            batch_size, channels, seq_len = x.shape
+            x_in = x.transpose(1, 2)
         
         x_norm = self.norm1(x_in)
         
@@ -1149,12 +1164,7 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         k = self.k_proj(x_norm)
         v = self.v_proj(x_norm)
         
-        seq_len = height * width
-        
-        # 2. Reshape for RoPE
-        # Q: (B, S, Num_Heads, D)
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        # K, V: (B, S, Num_KV_Heads, D)
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         
@@ -1223,7 +1233,8 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         x1 = self.ffn_linear2(x1)
         x = x + x1
         
-        x = x.permute(0, 2, 1).view(batch_size, channels, height, width)
+        if not self.trunk_use_nlc:
+            x = x.transpose(1, 2)
         return x
         
 class BottleneckResBlock(torch.nn.Module):
@@ -1236,6 +1247,7 @@ class BottleneckResBlock(torch.nn.Module):
         c_gpool: Optional[int],
         config: modelconfigs.ModelConfig,
         activation: str,
+        pos_len: int,
     ):
         super(BottleneckResBlock, self).__init__()
         self.name = name
@@ -1252,6 +1264,7 @@ class BottleneckResBlock(torch.nn.Module):
             activation=activation,
             kernel_size=1,
             fixup_use_gamma=False,
+            pos_len=pos_len,
         )
 
         self.normactconvstack = torch.nn.ModuleList()
@@ -1264,6 +1277,7 @@ class BottleneckResBlock(torch.nn.Module):
             activation=activation,
             kernel_size=3,
             fixup_use_gamma=False,
+            pos_len=pos_len,
         ))
         for i in range(self.internal_length-1):
             self.normactconvstack.append(NormActConv(
@@ -1275,6 +1289,7 @@ class BottleneckResBlock(torch.nn.Module):
                 activation=activation,
                 kernel_size=3,
                 fixup_use_gamma=False,
+                pos_len=pos_len,
             ))
 
         self.normactconvq = NormActConv(
@@ -1286,6 +1301,7 @@ class BottleneckResBlock(torch.nn.Module):
             activation=activation,
             kernel_size=1,
             fixup_use_gamma=True,
+            pos_len=pos_len,
         )
 
     def initialize(self, fixup_scale):
@@ -1326,12 +1342,12 @@ class BottleneckResBlock(torch.nn.Module):
     def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[ExtraOutputs]):
         """
         Parameters:
-        x: NCHW
-        mask: N1HW
-        mask_sum_hw: N111
+        x: NCL
+        mask: N1L
+        mask_sum_hw: N11
         mask_sum: scalar
 
-        Returns: NCHW
+        Returns: NCL
         """
         out = x
         out = self.normactconvp(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
@@ -1354,6 +1370,7 @@ class NestedBottleneckResBlock(torch.nn.Module):
         c_gpool: Optional[int],
         config: modelconfigs.ModelConfig,
         activation: str,
+        pos_len: int,
     ):
         super(NestedBottleneckResBlock, self).__init__()
         self.name = name
@@ -1370,6 +1387,7 @@ class NestedBottleneckResBlock(torch.nn.Module):
             activation=activation,
             kernel_size=1,
             fixup_use_gamma=False,
+            pos_len=pos_len,
         )
 
         self.blockstack = torch.nn.ModuleList()
@@ -1381,6 +1399,7 @@ class NestedBottleneckResBlock(torch.nn.Module):
                 c_gpool=(c_gpool if i == 0 else None),
                 config=config,
                 activation=activation,
+                pos_len=pos_len,
             ))
 
         self.normactconvq = NormActConv(
@@ -1392,6 +1411,7 @@ class NestedBottleneckResBlock(torch.nn.Module):
             activation=activation,
             kernel_size=1,
             fixup_use_gamma=True,
+            pos_len=pos_len,
         )
 
     def initialize(self, fixup_scale):
@@ -1432,12 +1452,12 @@ class NestedBottleneckResBlock(torch.nn.Module):
     def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[ExtraOutputs]):
         """
         Parameters:
-        x: NCHW
-        mask: N1HW
-        mask_sum_hw: N111
+        x: NCL
+        mask: N1L
+        mask_sum_hw: N11
         mask_sum: scalar
 
-        Returns: NCHW
+        Returns: NCL
         """
         out = x
         out = self.normactconvp(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
@@ -1463,6 +1483,7 @@ class NestedNestedBottleneckResBlock(torch.nn.Module):
         c_gpool: Optional[int],
         config: modelconfigs.ModelConfig,
         activation: str,
+        pos_len: int,
     ):
         super(NestedNestedBottleneckResBlock, self).__init__()
         self.name = name
@@ -1479,6 +1500,7 @@ class NestedNestedBottleneckResBlock(torch.nn.Module):
             activation=activation,
             kernel_size=1,
             fixup_use_gamma=False,
+            pos_len=pos_len,
         )
 
         self.blockstack = torch.nn.ModuleList()
@@ -1491,6 +1513,7 @@ class NestedNestedBottleneckResBlock(torch.nn.Module):
                 c_gpool=(c_gpool if i == 0 else None),
                 config=config,
                 activation=activation,
+                pos_len=pos_len,
             ))
 
         self.normactconvq = NormActConv(
@@ -1502,6 +1525,7 @@ class NestedNestedBottleneckResBlock(torch.nn.Module):
             activation=activation,
             kernel_size=1,
             fixup_use_gamma=True,
+            pos_len=pos_len,
         )
 
     def initialize(self, fixup_scale):
@@ -1542,12 +1566,12 @@ class NestedNestedBottleneckResBlock(torch.nn.Module):
     def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[ExtraOutputs]):
         """
         Parameters:
-        x: NCHW
-        mask: N1HW
-        mask_sum_hw: N111
+        x: NCL
+        mask: N1L
+        mask_sum_hw: N11
         mask_sum: scalar
 
-        Returns: NCHW
+        Returns: NCL
         """
         out = x
         out = self.normactconvp(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
@@ -1561,10 +1585,11 @@ class NestedNestedBottleneckResBlock(torch.nn.Module):
 
 
 class PolicyHead(torch.nn.Module):
-    def __init__(self, c_in, c_p1, c_g1, config, activation):
+    def __init__(self, c_in, c_p1, c_g1, config, activation, pos_len):
         super(PolicyHead, self).__init__()
         self.config = config
         self.activation = activation
+        self.pos_len = pos_len
 
         if config["version"] <= 11 or (config["version"] >= 101 and config["version"] <= 199):
             self.num_policy_outputs = 4
@@ -1577,8 +1602,8 @@ class PolicyHead(torch.nn.Module):
         # Output 4: long-term-optimistic policy prediction
         # Output 5: short-term-optimistic policy prediction
 
-        self.conv1p = torch.nn.Conv2d(c_in, c_p1, kernel_size=1, padding="same", bias=False)
-        self.conv1g = torch.nn.Conv2d(c_in, c_g1, kernel_size=1, padding="same", bias=False)
+        self.conv1p = torch.nn.Conv3d(c_in, c_p1, kernel_size=1, padding="same", bias=False)
+        self.conv1g = torch.nn.Conv3d(c_in, c_g1, kernel_size=1, padding="same", bias=False)
 
         self.biasg = BiasMask(
             c_g1,
@@ -1602,7 +1627,7 @@ class PolicyHead(torch.nn.Module):
             is_after_batchnorm=True,
         )
         self.act2 = act(activation)
-        self.conv2p = torch.nn.Conv2d(c_p1, self.num_policy_outputs, kernel_size=1, padding="same", bias=False)
+        self.conv2p = torch.nn.Conv3d(c_p1, self.num_policy_outputs, kernel_size=1, padding="same", bias=False)
 
         # Constants should be tensor to make tensorrt work on int8
         self.register_buffer("t_1", torch.tensor([1.0,], dtype=torch.float32), persistent=False)
@@ -1649,12 +1674,13 @@ class PolicyHead(torch.nn.Module):
         pass
 
     def forward(self, x, mask, mask_sum_hw, mask_sum:float, extra_outputs: Optional[ExtraOutputs]):
-        outp = self.conv1p(x)
-        outg = self.conv1g(x)
+        x_3d = ncl_to_ncdhw(x, self.pos_len)
+        outp = ncdhw_to_ncl(self.conv1p(x_3d))
+        outg = ncdhw_to_ncl(self.conv1g(x_3d))
 
         outg = self.biasg(outg, mask=mask, mask_sum=mask_sum)
         outg = self.actg(outg)
-        outg = self.gpool(outg, mask=mask, mask_sum_hw=mask_sum_hw).squeeze(-1).squeeze(-1) # NC
+        outg = self.gpool(outg, mask=mask, mask_sum_hw=mask_sum_hw).squeeze(-1)
 
         if self.config["version"] <= 14 or (self.config["version"] >= 101 and self.config["version"] <= 199):
             outpass = self.linear_pass(outg) # NC
@@ -1663,12 +1689,12 @@ class PolicyHead(torch.nn.Module):
             outpass = self.act_pass(outpass) # NC
             outpass = self.linear_pass2(outpass) # NC
 
-        outg = self.linear_g(outg).unsqueeze(-1).unsqueeze(-1) # NCHW
+        outg = self.linear_g(outg).unsqueeze(-1)
 
         outp = outp + outg
         outp = self.bias2(outp, mask=mask, mask_sum=mask_sum)
         outp = self.act2(outp)
-        outp = self.conv2p(outp)
+        outp = ncdhw_to_ncl(self.conv2p(ncl_to_ncdhw(outp, self.pos_len)))
         outpolicy = outp
 
         # mask out parts outside the board by making them a huge neg number, so that they're 0 after softmax
@@ -1682,7 +1708,8 @@ class ValueHead(torch.nn.Module):
     def __init__(self, c_in, c_v1, c_v2, c_sv2, num_scorebeliefs, config, activation, pos_len):
         super(ValueHead, self).__init__()
         self.activation = activation
-        self.conv1 = torch.nn.Conv2d(c_in, c_v1, kernel_size=1, padding="same", bias=False)
+        self.pos_len = pos_len
+        self.conv1 = torch.nn.Conv3d(c_in, c_v1, kernel_size=1, padding="same", bias=False)
         self.bias1 = BiasMask(
             c_v1,
             config=config,
@@ -1734,11 +1761,11 @@ class ValueHead(torch.nn.Module):
 
     def forward(self, x, mask, mask_sum_hw, mask_sum:float, input_global, extra_outputs: Optional[ExtraOutputs]):
         outv1 = x
-        outv1 = self.conv1(outv1)
+        outv1 = ncdhw_to_ncl(self.conv1(ncl_to_ncdhw(outv1, self.pos_len)))
         outv1 = self.bias1(outv1, mask=mask, mask_sum=mask_sum)
         outv1 = self.act1(outv1)
 
-        outpooled = self.gpool(outv1, mask=mask, mask_sum_hw=mask_sum_hw).squeeze(-1).squeeze(-1)
+        outpooled = self.gpool(outv1, mask=mask, mask_sum_hw=mask_sum_hw).squeeze(-1)
 
         outv2 = self.linear2(outpooled)
         outv2 = self.act2(outv2)
@@ -1827,6 +1854,8 @@ class Model(torch.nn.Module):
         self.num_scorebeliefs = config["num_scorebeliefs"]
         self.num_total_blocks = len(self.block_kind)
         self.pos_len = pos_len
+        self.pos_volume = pos_len * pos_len * pos_len
+        self.trunk_use_nlc = config.get("trunkUseNLC", False)
 
         if config["version"] <= 12 or (config["version"] >= 101 and config["version"] <= 199):
             self.td_score_multiplier = 20.0
@@ -1857,9 +1886,9 @@ class Model(torch.nn.Module):
         self.activation = "relu" if "activation" not in config else config["activation"]
 
         if config["initial_conv_1x1"]:
-            self.conv_spatial = torch.nn.Conv2d(modelconfigs.get_num_bin_input_features(config), self.c_trunk, kernel_size=1, padding="same", bias=False)
+            self.conv_spatial = torch.nn.Conv3d(modelconfigs.get_num_bin_input_features(config), self.c_trunk, kernel_size=1, padding="same", bias=False)
         else:
-            self.conv_spatial = torch.nn.Conv2d(modelconfigs.get_num_bin_input_features(config), self.c_trunk, kernel_size=3, padding="same", bias=False)
+            self.conv_spatial = torch.nn.Conv3d(modelconfigs.get_num_bin_input_features(config), self.c_trunk, kernel_size=3, padding="same", bias=False)
         self.linear_global = torch.nn.Linear(modelconfigs.get_num_global_input_features(config), self.c_trunk, bias=False)
 
         if "metadata_encoder" in config and config["metadata_encoder"] is not None:
@@ -1867,7 +1896,7 @@ class Model(torch.nn.Module):
         else:
             self.metadata_encoder = None
 
-        self.bin_input_shape = [modelconfigs.get_num_bin_input_features(config), pos_len, pos_len]
+        self.bin_input_shape = [modelconfigs.get_num_bin_input_features(config), self.pos_volume]
         self.global_input_shape = [modelconfigs.get_num_global_input_features(config)]
 
         self.blocks = torch.nn.ModuleList()
@@ -1880,6 +1909,7 @@ class Model(torch.nn.Module):
                 block_kind = block_kind[:-5]
 
             if block_kind == "regular":
+                assert not self.trunk_use_nlc, "trunkUseNLC only supports pure transformer trunks"
                 self.blocks.append(ResBlock(
                     name=block_name,
                     c_main=self.c_trunk,
@@ -1887,8 +1917,10 @@ class Model(torch.nn.Module):
                     c_gpool=(self.c_gpool if use_gpool_this_block else None),
                     config=self.config,
                     activation=self.activation,
+                    pos_len=self.pos_len,
                 ))
             elif block_kind == "regularrc": #reservior computing
+                assert not self.trunk_use_nlc, "trunkUseNLC only supports pure transformer trunks"
                 block=ResBlock(
                     name=block_name,
                     c_main=self.c_trunk,
@@ -1896,12 +1928,14 @@ class Model(torch.nn.Module):
                     c_gpool=(self.c_gpool if use_gpool_this_block else None),
                     config=self.config,
                     activation=self.activation,
+                    pos_len=self.pos_len,
                 )
                 #make the block not trainable
                 for param in block.parameters():
                     param.requires_grad = False
                 self.blocks.append(block)
             elif block_kind == "bottle1" or block_kind == "bottle":
+                assert not self.trunk_use_nlc, "trunkUseNLC only supports pure transformer trunks"
                 self.blocks.append(BottleneckResBlock(
                     name=block_name,
                     internal_length=1,
@@ -1910,8 +1944,10 @@ class Model(torch.nn.Module):
                     c_gpool=(self.c_gpool if use_gpool_this_block else None),
                     config=self.config,
                     activation=self.activation,
+                    pos_len=self.pos_len,
                 ))
             elif block_kind == "bottle2":
+                assert not self.trunk_use_nlc, "trunkUseNLC only supports pure transformer trunks"
                 self.blocks.append(BottleneckResBlock(
                     name=block_name,
                     internal_length=2,
@@ -1920,8 +1956,10 @@ class Model(torch.nn.Module):
                     c_gpool=(self.c_gpool if use_gpool_this_block else None),
                     config=self.config,
                     activation=self.activation,
+                    pos_len=self.pos_len,
                 ))
             elif block_kind == "bottle3":
+                assert not self.trunk_use_nlc, "trunkUseNLC only supports pure transformer trunks"
                 self.blocks.append(BottleneckResBlock(
                     name=block_name,
                     internal_length=3,
@@ -1930,8 +1968,10 @@ class Model(torch.nn.Module):
                     c_gpool=(self.c_gpool if use_gpool_this_block else None),
                     config=self.config,
                     activation=self.activation,
+                    pos_len=self.pos_len,
                 ))
             elif block_kind == "bottlenest1":
+                assert not self.trunk_use_nlc, "trunkUseNLC only supports pure transformer trunks"
                 self.blocks.append(NestedBottleneckResBlock(
                     name=block_name,
                     internal_length=1,
@@ -1940,8 +1980,10 @@ class Model(torch.nn.Module):
                     c_gpool=(self.c_gpool if use_gpool_this_block else None),
                     config=self.config,
                     activation=self.activation,
+                    pos_len=self.pos_len,
                 ))
             elif block_kind == "bottlenest2":
+                assert not self.trunk_use_nlc, "trunkUseNLC only supports pure transformer trunks"
                 self.blocks.append(NestedBottleneckResBlock(
                     name=block_name,
                     internal_length=2,
@@ -1950,8 +1992,10 @@ class Model(torch.nn.Module):
                     c_gpool=(self.c_gpool if use_gpool_this_block else None),
                     config=self.config,
                     activation=self.activation,
+                    pos_len=self.pos_len,
                 ))
             elif block_kind == "bottlenest3":
+                assert not self.trunk_use_nlc, "trunkUseNLC only supports pure transformer trunks"
                 self.blocks.append(NestedBottleneckResBlock(
                     name=block_name,
                     internal_length=3,
@@ -1960,8 +2004,10 @@ class Model(torch.nn.Module):
                     c_gpool=(self.c_gpool if use_gpool_this_block else None),
                     config=self.config,
                     activation=self.activation,
+                    pos_len=self.pos_len,
                 ))
             elif block_kind == "bottlenest2bottlenest2":
+                assert not self.trunk_use_nlc, "trunkUseNLC only supports pure transformer trunks"
                 self.blocks.append(NestedNestedBottleneckResBlock(
                     name=block_name,
                     internal_length=2,
@@ -1972,6 +2018,7 @@ class Model(torch.nn.Module):
                     c_gpool=(self.c_gpool if use_gpool_this_block else None),
                     config=self.config,
                     activation=self.activation,
+                    pos_len=self.pos_len,
                 ))
             elif block_kind == "transformer":
                 self.blocks.append(TransformerBlock(
@@ -2035,6 +2082,7 @@ class Model(torch.nn.Module):
             self.c_g1,
             self.config,
             self.activation,
+            self.pos_len,
         )
         self.value_head = ValueHead(
             self.c_trunk,
@@ -2055,6 +2103,7 @@ class Model(torch.nn.Module):
                 self.c_g1,
                 self.config,
                 self.activation,
+                self.pos_len,
             )
             self.intermediate_value_head = ValueHead(
                 self.c_trunk,
@@ -2175,19 +2224,22 @@ class Model(torch.nn.Module):
             mask_sum_hw = None
             mask_sum = None
         else:
-            mask = input_spatial[:, 0:1, :, :].contiguous()
-            mask_sum_hw = torch.sum(mask,dim=(2,3),keepdim=True)
+            mask = input_spatial[:, 0:1, :].contiguous()
+            mask_sum_hw = torch.sum(mask, dim=2, keepdim=True)
             mask_sum = torch.sum(mask)
 
-        x_spatial = self.conv_spatial(input_spatial)
-        x_global = self.linear_global(input_global).unsqueeze(-1).unsqueeze(-1)
+        x_spatial = ncdhw_to_ncl(self.conv_spatial(ncl_to_ncdhw(input_spatial, self.pos_len)))
+        x_global = self.linear_global(input_global).unsqueeze(-1)
 
         out = x_spatial + x_global
 
         if self.metadata_encoder is not None:
             assert input_meta is not None
             x_meta = self.metadata_encoder.forward(input_meta,extra_outputs)
-            out = out + x_meta.unsqueeze(-1).unsqueeze(-1)
+            out = out + x_meta.unsqueeze(-1)
+
+        if self.trunk_use_nlc:
+            out = out.transpose(1, 2)
 
         # print("TENSOR BEFORE TRUNK")
         # print(out)
@@ -2208,6 +2260,8 @@ class Model(torch.nn.Module):
                 #torch._dynamo.graph_break()
                 # print("INTERMEDIATE")
                 iout = out
+                if self.trunk_use_nlc:
+                    iout = iout.transpose(1, 2)
                 iout = self.norm_intermediate_trunkfinal(iout, mask=mask, mask_sum=mask_sum)
                 iout = self.act_intermediate_trunkfinal(iout)
                 iout_policy = self.intermediate_policy_head(iout, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
@@ -2236,6 +2290,8 @@ class Model(torch.nn.Module):
 
         #torch._dynamo.graph_break() # torch.compile sometimes HAVE BUGS
         with autocast(enabled=False):
+            if self.trunk_use_nlc:
+                out = out.transpose(1, 2)
             out = self.norm_trunkfinal(out, mask=mask, mask_sum=mask_sum)
             out = self.act_trunkfinal(out)
             #out=out.contiguous()

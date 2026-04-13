@@ -1,5 +1,6 @@
 import logging
 import os
+import itertools
 
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
@@ -8,6 +9,8 @@ import torch
 import torch.nn.functional
 
 import modelconfigs
+
+AXIS_PERMUTATIONS_3D = list(itertools.permutations((0, 1, 2)))
 
 def read_npz_training_data(
     npz_files,
@@ -36,14 +39,18 @@ def read_npz_training_data(
 
     def load_npz_file(npz_file):
         with np.load(npz_file) as npz:
-            binaryInputNCHWPacked = npz["binaryInputNCHWPacked"]
+            if "binaryInputNCLPacked" in npz:
+                binary_input_packed = npz["binaryInputNCLPacked"]
+            else:
+                # not sure: assuming some datasets may still keep the old packed key name after switching to NCL.
+                binary_input_packed = npz["binaryInputNCHWPacked"]
             globalInputNC = npz["globalInputNC"]
             policyTargetsNCMove = npz["policyTargetsNCMove"].astype(np.float32)
             globalTargetsNC = npz["globalTargetsNC"]
             if include_meta:
                 metadataInputNC = np.zeros(
                     (
-                        binaryInputNCHWPacked.shape[0],
+                        binary_input_packed.shape[0],
                         modelconfigs.get_num_meta_encoder_input_features(model_config),
                     ),
                     dtype=np.float32,
@@ -52,17 +59,15 @@ def read_npz_training_data(
                 metadataInputNC = None
         del npz
 
-        binaryInputNCHW = np.unpackbits(binaryInputNCHWPacked,axis=2)
-        assert len(binaryInputNCHW.shape) == 3
-        assert binaryInputNCHW.shape[2] == ((pos_len * pos_len + 7) // 8) * 8
-        binaryInputNCHW = binaryInputNCHW[:,:,:pos_len*pos_len]
-        binaryInputNCHW = np.reshape(binaryInputNCHW, (
-            binaryInputNCHW.shape[0], binaryInputNCHW.shape[1], pos_len, pos_len
-        )).astype(np.float32)
+        binaryInputNCL = np.unpackbits(binary_input_packed, axis=2)
+        assert len(binaryInputNCL.shape) == 3
+        expected_l = pos_len * pos_len * pos_len
+        assert binaryInputNCL.shape[2] == ((expected_l + 7) // 8) * 8
+        binaryInputNCL = binaryInputNCL[:, :, :expected_l].astype(np.float32)
 
-        assert binaryInputNCHW.shape[1] == num_bin_features
+        assert binaryInputNCL.shape[1] == num_bin_features
         assert globalInputNC.shape[1] == num_global_features
-        return (npz_file, binaryInputNCHW, globalInputNC, policyTargetsNCMove, globalTargetsNC, metadataInputNC)
+        return (npz_file, binaryInputNCL, globalInputNC, policyTargetsNCMove, globalTargetsNC, metadataInputNC)
 
     if not npz_files:
         return
@@ -71,9 +76,9 @@ def read_npz_training_data(
         future = executor.submit(load_npz_file, npz_files[0])
 
         for next_file in (npz_files[1:] + [None]):
-            (npz_file, binaryInputNCHW, globalInputNC, policyTargetsNCMove, globalTargetsNC, metadataInputNC) = future.result()
+            (npz_file, binaryInputNCL, globalInputNC, policyTargetsNCMove, globalTargetsNC, metadataInputNC) = future.result()
 
-            num_samples = binaryInputNCHW.shape[0]
+            num_samples = binaryInputNCL.shape[0]
             # Just discard stuff that doesn't divide evenly
             num_whole_steps = num_samples // (batch_size * world_size)
 
@@ -87,7 +92,7 @@ def read_npz_training_data(
                 start = (n * world_size + rank) * batch_size
                 end = start + batch_size
 
-                batch_binaryInputNCHW = torch.from_numpy(binaryInputNCHW[start:end]).to(device)
+                batch_binaryInputNCL = torch.from_numpy(binaryInputNCL[start:end]).to(device)
                 batch_globalInputNC = torch.from_numpy(globalInputNC[start:end]).to(device)
                 batch_policyTargetsNCMove = torch.from_numpy(policyTargetsNCMove[start:end]).to(device)
                 batch_globalTargetsNC = torch.from_numpy(globalTargetsNC[start:end]).to(device)
@@ -95,42 +100,31 @@ def read_npz_training_data(
                     batch_metadataInputNC = torch.from_numpy(metadataInputNC[start:end]).to(device)
 
                 if enable_history_matrices:
-                    (batch_binaryInputNCHW, batch_globalInputNC) = apply_history_matrices(
-                        model_config, batch_binaryInputNCHW, batch_globalInputNC, batch_globalTargetsNC, h_base, h_builder
+                    (batch_binaryInputNCL, batch_globalInputNC) = apply_history_matrices(
+                        model_config, batch_binaryInputNCL, batch_globalInputNC, batch_globalTargetsNC, h_base, h_builder
                     )
                 if is_gomoku_history:
-                    zero_mask = (torch.rand((batch_binaryInputNCHW.shape[0],), device=batch_binaryInputNCHW.device) < 0.3).to(batch_binaryInputNCHW.dtype)
-                    batch_binaryInputNCHW[:, 6, :, :] *= (1.0 - zero_mask).view(-1, 1, 1)
+                    zero_mask = (torch.rand((batch_binaryInputNCL.shape[0],), device=batch_binaryInputNCL.device) < 0.3).to(batch_binaryInputNCL.dtype)
+                    batch_binaryInputNCL[:, 6, :] *= (1.0 - zero_mask).view(-1, 1)
                     batch_globalInputNC[:, 1] *= (1.0 - zero_mask)
 
 
                 
                 if symmetry_type is not None and symmetry_type!="" and symmetry_type!="none":
-                    allowed_symms=[]
-                    if symmetry_type == "xyt": # 8 symmetries,  Go, Gomoku ...
-                        allowed_symms=[0,1,2,3,4,5,6,7]
-                    elif symmetry_type == "x": # x-axis only, Chess-like
-                        allowed_symms=[0,5]
-                    elif symmetry_type == "xy": # x-axis or y-axis only
-                        allowed_symms=[0,2,5,7]
-                    elif symmetry_type == "x+y": # rotate 180 degrees. Hex
-                        allowed_symms=[0,2]
-                    elif symmetry_type == "t": # transpose only. Tiaoqi
-                        allowed_symms=[0,4]
+                    if symmetry_type == "xyt":
+                        allowed_symms = list(range(48))
                     else:
-                        assert False, f"Unknown data symmetry type {symmetry_type}"
+                        assert False, f"Unknown or unsupported 3D data symmetry type {symmetry_type}"
                         
                     symm = allowed_symms[int(rand.integers(0,len(allowed_symms)))]
-                    #logging.info(symm)
-                               
-                    batch_binaryInputNCHW = apply_symmetry(batch_binaryInputNCHW, symm)
+                    batch_binaryInputNCL = apply_symmetry(batch_binaryInputNCL, symm)
                     batch_policyTargetsNCMove = apply_symmetry_policy(batch_policyTargetsNCMove, symm, pos_len)
 
-                batch_binaryInputNCHW = batch_binaryInputNCHW.contiguous()
+                batch_binaryInputNCL = batch_binaryInputNCL.contiguous()
                 batch_policyTargetsNCMove = batch_policyTargetsNCMove.contiguous()
 
                 batch = dict(
-                    binaryInputNCHW = batch_binaryInputNCHW,
+                    binaryInputNCL = batch_binaryInputNCL,
                     globalInputNC = batch_globalInputNC,
                     policyTargetsNCMove = batch_policyTargetsNCMove,
                     globalTargetsNC = batch_globalTargetsNC,
@@ -145,41 +139,41 @@ def apply_symmetry_policy(tensor, symm, pos_len):
     """Same as apply_symmetry but also handles the pass index"""
     batch_size = tensor.shape[0]
     channels = tensor.shape[1]
-    tensor_without_pass = tensor[:,:,:-1].view((batch_size, channels, pos_len, pos_len))
+    tensor_without_pass = tensor[:, :, :-1].view((batch_size, channels, pos_len, pos_len, pos_len))
     tensor_transformed = apply_symmetry(tensor_without_pass, symm)
     return torch.cat((
-        tensor_transformed.reshape(batch_size, channels, pos_len*pos_len),
-        tensor[:,:,-1:]
+        tensor_transformed.reshape(batch_size, channels, pos_len * pos_len * pos_len),
+        tensor[:, :, -1:]
     ), dim=2)
 
 def apply_symmetry(tensor, symm):
     """
-    Apply a symmetry operation to the given tensor.
+    Apply one of the 48 cube symmetries to the given tensor.
 
     Args:
-        tensor (torch.Tensor): Tensor to be rotated. (..., W, W)
-        symm (int):
-            0, 1, 2, 3: Rotation by symm * pi / 2 radians.
-            4, 5, 6, 7: Mirror symmetry on top of rotation.
+        tensor (torch.Tensor): Tensor to be transformed. (..., H, W, Z)
+        symm (int): 0..47 = 6 axis permutations * 8 flip combinations.
     """
-    assert tensor.shape[-1] == tensor.shape[-2]
+    assert tensor.shape[-1] == tensor.shape[-2] == tensor.shape[-3]
+    assert 0 <= symm < 48, f"3D symmetry id out of range: {symm}"
 
-    if symm == 0:
-        return tensor
-    if symm == 1:
-        return tensor.transpose(-2, -1).flip(-2)
-    if symm == 2:
-        return tensor.flip(-1).flip(-2)
-    if symm == 3:
-        return tensor.transpose(-2, -1).flip(-1)
-    if symm == 4:
-        return tensor.transpose(-2, -1)
-    if symm == 5:
-        return tensor.flip(-1)
-    if symm == 6:
-        return tensor.transpose(-2, -1).flip(-1).flip(-2)
-    if symm == 7:
-        return tensor.flip(-2)
+    perm_idx = symm // 8
+    flip_bits = symm % 8
+    spatial_perm = AXIS_PERMUTATIONS_3D[perm_idx]
+
+    permute_order = list(range(tensor.dim() - 3)) + [tensor.dim() - 3 + axis for axis in spatial_perm]
+    tensor = tensor.permute(permute_order)
+
+    flip_dims = []
+    if flip_bits & 1:
+        flip_dims.append(tensor.dim() - 3)
+    if flip_bits & 2:
+        flip_dims.append(tensor.dim() - 2)
+    if flip_bits & 4:
+        flip_dims.append(tensor.dim() - 1)
+    if flip_dims:
+        tensor = tensor.flip(flip_dims)
+    return tensor
 
 
 def build_history_matrices(model_config: modelconfigs.ModelConfig, device):
@@ -255,7 +249,7 @@ def build_history_matrices(model_config: modelconfigs.ModelConfig, device):
     return (h_base, h_builder)
 
 
-def apply_history_matrices(model_config, batch_binaryInputNCHW, batch_globalInputNC, batch_globalTargetsNC, h_base, h_builder):
+def apply_history_matrices(model_config, batch_binaryInputNCL, batch_globalInputNC, batch_globalTargetsNC, h_base, h_builder):
     num_global_features = modelconfigs.get_num_global_input_features(model_config)
     # include_history = batch_globalTargetsNC[:,36:41]
     should_stop_history = torch.rand_like(batch_globalTargetsNC[:,36:41]) >= 0.98
@@ -266,14 +260,14 @@ def apply_history_matrices(model_config, batch_binaryInputNCHW, batch_globalInpu
     h_matrix = h_base + torch.einsum("bi,ijk->bjk", include_history, h_builder)
 
 
-    # batch_binaryInputNCHW: (N, n_bin_in, 19, 19)
+    # batch_binaryInputNCL: (N, n_bin_in, L)
     # h_matrix: (N, n_bin_in, n_bin_out)
-    # Result: (N, n_bin_out, 19, 19)
-    batch_binaryInputNCHW = torch.einsum("bijk,bil->bljk", batch_binaryInputNCHW, h_matrix)
+    # Result: (N, n_bin_out, L)
+    batch_binaryInputNCL = torch.einsum("bcl,bcd->bdl", batch_binaryInputNCL, h_matrix)
 
     # First 5 global input features exactly correspond to include_history, pointwise multiply to
     # enable/disable them
     batch_globalInputNC = batch_globalInputNC * torch.nn.functional.pad(
         include_history, ((0, num_global_features - include_history.shape[1])), value=1.0
     )
-    return batch_binaryInputNCHW, batch_globalInputNC
+    return batch_binaryInputNCL, batch_globalInputNC

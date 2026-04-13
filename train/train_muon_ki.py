@@ -1383,7 +1383,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 if use_fp16:
                     with torch.amp.autocast(device_type='cuda'):
                         model_outputs = ddp_model(
-                            batch["binaryInputNCHW"],
+                            batch["binaryInputNCL"],
                             batch["globalInputNC"],
                             input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
                             extra_outputs=extra_outputs,
@@ -1391,7 +1391,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     model_outputs = raw_model.float32ify_output(model_outputs)
                 else:
                     model_outputs = ddp_model(
-                        batch["binaryInputNCHW"],
+                        batch["binaryInputNCL"],
                         batch["globalInputNC"],
                         input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
                         extra_outputs=extra_outputs,
@@ -1437,9 +1437,11 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                         metrics[stat] = value
 
                 if "use_repvgg_learning_rate" in model_config and model_config["use_repvgg_learning_rate"]:
-                    gradscale_constant = torch.tensor([[1.0,1.0,1.0],[1.0,2.0,1.0],[1.0,1.0,1.0]],dtype=torch.float32,device=device,requires_grad=False).view(1,1,3,3)
+                    # not sure: extending the old 2D center-heavy RepVGG grad scaling heuristic directly to 3D.
+                    gradscale_constant = torch.ones((1, 1, 3, 3, 3), dtype=torch.float32, device=device, requires_grad=False)
+                    gradscale_constant[:, :, 1, 1, 1] = 2.0
                     for name, param in ddp_model.named_parameters():
-                        if "normactconv" in name and ".conv.weight" in name and len(param.shape) == 4 and param.shape[2] == 3 and param.shape[3] == 3:
+                        if "normactconv" in name and ".conv.weight" in name and len(param.shape) == 5 and param.shape[2] == 3 and param.shape[3] == 3 and param.shape[4] == 3:
                             param.grad *= gradscale_constant
 
                 # Loosen gradient clipping as we shift to smaller learning rates
@@ -1592,7 +1594,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                         model_config=model_config
                     ):
                         model_outputs = ddp_model(
-                            batch["binaryInputNCHW"],
+                            batch["binaryInputNCL"],
                             batch["globalInputNC"],
                             input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
                         )
@@ -1656,7 +1658,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                             model_config=model_config
                         ):
                             model_outputs = swa_model(
-                                batch["binaryInputNCHW"],
+                                batch["binaryInputNCL"],
                                 batch["globalInputNC"],
                                 input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
                             )

@@ -30,6 +30,24 @@ from typing import Dict, Any, Union
 
 ModelConfig = Dict[str,Any]
 
+TRANSFORMER_BLOCK_KINDS = {
+    "transformer",
+    "transformerg",
+    "transformersg",
+    "transformerropeg",
+    "transformerropesg",
+}
+
+
+def _base_block_kind(block_kind: str) -> str:
+    if block_kind.endswith("gpool"):
+        return block_kind[:-5]
+    return block_kind
+
+
+def _is_pure_transformer_trunk(config: ModelConfig) -> bool:
+    return all(_base_block_kind(block[1]) in TRANSFORMER_BLOCK_KINDS for block in config["block_kind"])
+
 # version = 0 # V1 features, with old head architecture using crelus (no longer supported)
 # version = 1 # V1 features, with new head architecture, no crelus
 # version = 2 # V2 features, no internal architecture change.
@@ -2087,5 +2105,13 @@ for name, base_config in list(config_of_name.items()):
     config = base_config.copy()
     config["version"] = 102 
     config_of_name[name+"-v102"] = config
+
+for config in base_config_of_name.values():
+    if "trunkUseNLC" not in config:
+        config["trunkUseNLC"] = _is_pure_transformer_trunk(config)
+
+for config in config_of_name.values():
+    if "trunkUseNLC" not in config:
+        config["trunkUseNLC"] = _is_pure_transformer_trunk(config)
     
 # print("Len of config = ",len(config_of_name))  # Len of config = 222000 !, so some functions are removed

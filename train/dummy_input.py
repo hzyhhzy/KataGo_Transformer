@@ -4,10 +4,11 @@ import modelconfigs
 def generate_dummy_inputs(config, batch_size, pos_len, device):
     num_bin_input_features = modelconfigs.get_num_bin_input_features(config)
     num_global_input_features = modelconfigs.get_num_global_input_features(config)
+    pos_volume = pos_len * pos_len * pos_len
     
-    # binaryInputNCHW: (batch_size, num_bin_input_features, pos_len, pos_len)
-    binary_input = torch.randn(batch_size, num_bin_input_features, pos_len, pos_len).to(device)
-    binary_input[:,0,:,:] = 1.0 # mask channel
+    # binaryInputNCL: (batch_size, num_bin_input_features, pos_len^3)
+    binary_input = torch.randn(batch_size, num_bin_input_features, pos_volume).to(device)
+    binary_input[:, 0, :] = 1.0  # mask channel
     
     # globalInputNC: (batch_size, num_global_input_features)
     global_input = torch.randn(batch_size, num_global_input_features).to(device)
