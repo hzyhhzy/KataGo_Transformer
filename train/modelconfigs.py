@@ -71,9 +71,9 @@ def get_version(config: ModelConfig):
 def get_num_bin_input_features(config: ModelConfig):
     version = get_version(config)
     if version == 10 or version == 11 or version == 12 or version == 13 or version == 14 or version == 15:
-        return 22
+        return 6
     elif version == 101 or version == 102:
-        return 22
+        return 6
     else:
         assert(False)
 
@@ -954,6 +954,65 @@ b30c256bt = {
     "v2_size":96,
 }
 
+b10c256bt = {
+    "version":15,
+    "norm_kind":"fixup",
+    "bnorm_epsilon": 1e-4,
+    "bnorm_running_avg_momentum": 0.001,
+    "initial_conv_1x1": False,
+    "trunk_num_channels":256,
+    "mid_num_channels":128,
+    "gpool_num_channels":64,
+    "use_attention_pool":False,
+    "num_attention_pool_heads":4,
+    "block_kind": [
+        ["rconv1","bottle"],
+        ["rconv2","bottle"],
+        ["rconv3","bottlegpool"],
+        ["rconv4","bottle"],
+        ["rconv5","bottle"],
+        ["rconv6","bottle"],
+        ["rconv7","bottlegpool"],
+        ["rconv8","bottle"],
+        ["rconv9","bottle"],
+        ["rconv10","bottle"],
+    ],
+    "p1_num_channels":24,
+    "g1_num_channels":24,
+    "v1_num_channels":24,
+    "sbv2_num_channels":64,
+    "num_scorebeliefs":4,
+    "v2_size":64,
+}
+
+b5c256bt = {
+    "version":15,
+    "norm_kind":"fixup",
+    "bnorm_epsilon": 1e-4,
+    "bnorm_running_avg_momentum": 0.001,
+    "initial_conv_1x1": False,
+    "trunk_num_channels":256,
+    "mid_num_channels":128,
+    "gpool_num_channels":64,
+    "use_attention_pool":False,
+    "num_attention_pool_heads":4,
+    "block_kind": [
+        ["rconv1","bottle"],
+        ["rconv2","bottle"],
+        ["rconv3","bottlegpool"],
+        ["rconv4","bottle"],
+        ["rconv5","bottle"],
+    ],
+    "p1_num_channels":24,
+    "g1_num_channels":24,
+    "v1_num_channels":24,
+    "sbv2_num_channels":64,
+    "num_scorebeliefs":4,
+    "v2_size":64,
+}
+
+
+
 
 
 b11c96h4tfrs = {
@@ -1160,6 +1219,35 @@ b14c192h6tfrs = {
     "v2_size":96,
 }
 
+
+b5c192h4tfrs = {
+    "version":15,
+    "norm_kind":"fixup",
+    "bnorm_epsilon": 1e-4,
+    "bnorm_running_avg_momentum": 0.001,
+    "initial_conv_1x1": False,
+    "trunk_num_channels":192,
+    "mid_num_channels":192,
+    "gpool_num_channels":32,
+    "transformer_ffn_channels":512,
+    "transformer_heads":4,
+    "transformer_kv_heads":4,
+    "use_attention_pool":False,
+    "num_attention_pool_heads":4,
+    "block_kind": [
+        ["rconv1","transformerropesg"],
+        ["rconv2","transformerropesg"],
+        ["rconv3","transformerropesg"],
+        ["rconv4","transformerropesg"],
+        ["rconv5","transformerropesg"],
+    ],
+    "p1_num_channels":24,
+    "g1_num_channels":24,
+    "v1_num_channels":24,
+    "sbv2_num_channels":64,
+    "num_scorebeliefs":4,
+    "v2_size":64,
+}
 b14c192h6tfr2s = {
     "version":15,
     "norm_kind":"fixup",
@@ -1946,6 +2034,11 @@ base_config_of_name = {
     "b11c96h3tfrs": b11c96h3tfrs, # Recommended
     "b11c96h3tfr": b11c96h3tfr, 
 
+# 2M parameter wider model
+
+    "b5c192h4tfrs":b5c192h4tfrs, 
+    "b10c256bt": b10c256bt,  
+    "b5c256bt": b5c256bt,  
 
 # 6M parameter:
 
@@ -1956,6 +2049,7 @@ base_config_of_name = {
     "b7c256h8tfrs":b7c256h8tfrs,   # fast but weak
 
     "b14c192h6tfr2s": b14c192h6tfr2s, # partly rope
+
 
 # 20M parameter:
     "b12c384h12tfrs":b12c384h12tfrs, 

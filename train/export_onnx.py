@@ -367,8 +367,8 @@ def export_to_onnx(model: Model, full_name: str ,export_path: str, pos_len: int 
     
     # Create dummy inputs
     num_spatial_inputs = modelconfigs.get_num_bin_input_features(model.config)
-    input_spatial = torch.randn(batch_size, num_spatial_inputs, pos_len, pos_len, dtype=torch.float32)
-    input_spatial[:,0,:,:]=1.0
+    input_spatial = torch.randn(batch_size, num_spatial_inputs, pos_len * pos_len * pos_len, dtype=torch.float32)
+    input_spatial[:,0,:]=1.0
     num_global_inputs = modelconfigs.get_num_global_input_features(model.config)
     input_global = torch.randn(batch_size, num_global_inputs, dtype=torch.float32)
     
@@ -487,6 +487,7 @@ def export_to_onnx(model: Model, full_name: str ,export_path: str, pos_len: int 
             "pos_len": str(pos_len),
             "pos_len_x": str(pos_len),
             "pos_len_y": str(pos_len),
+            "pos_len_z": str(pos_len),
             "has_mask": "true" if not disable_mask else "false",
             "is_simplified": "false",
             "is_int8": "true" if (extra_meta_data and extra_meta_data.get("is_int8") == "true") else "false",

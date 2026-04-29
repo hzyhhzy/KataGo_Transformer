@@ -22,7 +22,7 @@ import numpy as np
 
 def assert_keys(npz,include_meta):
     keys = [
-        "binaryInputNCHWPacked",
+        "binaryInputNCLPacked",
         "globalInputNC",
         "policyTargetsNCMove",
         "globalTargetsNC",
@@ -58,7 +58,7 @@ def shardify(input_idx, input_file_group, num_out_files, out_tmp_dirs, keep_prob
                 ###
                 # WARNING - if adding anything here, also add it to joint_shuffle below!
                 ###
-                binaryInputNCHWPacked = npz["binaryInputNCHWPacked"]
+                binaryInputNCLPacked = npz["binaryInputNCLPacked"]
                 globalInputNC = npz["globalInputNC"]
                 policyTargetsNCMove = npz["policyTargetsNCMove"]
                 globalTargetsNC = npz["globalTargetsNC"]
@@ -67,7 +67,7 @@ def shardify(input_idx, input_file_group, num_out_files, out_tmp_dirs, keep_prob
             print("WARNING: file not found by shardify: ", input_file_group[0])
             return num_files_not_found # Early quit since we don't know shapes
     else:
-        binaryInputNCHWPackedList = []
+        binaryInputNCLPackedList = []
         globalInputNCList = []
         policyTargetsNCMoveList = []
         globalTargetsNCList = []
@@ -76,7 +76,7 @@ def shardify(input_idx, input_file_group, num_out_files, out_tmp_dirs, keep_prob
             try:
                 with np.load(input_file) as npz:
                     assert_keys(npz,include_meta)
-                    binaryInputNCHWPackedList.append(npz["binaryInputNCHWPacked"])
+                    binaryInputNCLPackedList.append(npz["binaryInputNCLPacked"])
                     globalInputNCList.append(npz["globalInputNC"])
                     policyTargetsNCMoveList.append(npz["policyTargetsNCMove"])
                     globalTargetsNCList.append(npz["globalTargetsNC"])
@@ -84,15 +84,15 @@ def shardify(input_idx, input_file_group, num_out_files, out_tmp_dirs, keep_prob
                 num_files_not_found += 1
                 print("WARNING: file not found by shardify: ", input_file)
                 pass
-        if len(binaryInputNCHWPackedList) <= 0:
+        if len(binaryInputNCLPackedList) <= 0:
             return num_files_not_found # Early quit since we don't know shapes
 
-        binaryInputNCHWPacked = np.concatenate(binaryInputNCHWPackedList,axis=0)
+        binaryInputNCLPacked = np.concatenate(binaryInputNCLPackedList,axis=0)
         globalInputNC = np.concatenate(globalInputNCList,axis=0)
         policyTargetsNCMove = np.concatenate(policyTargetsNCMoveList,axis=0)
         globalTargetsNC = np.concatenate(globalTargetsNCList,axis=0)
 
-    num_rows_to_keep = binaryInputNCHWPacked.shape[0]
+    num_rows_to_keep = binaryInputNCLPacked.shape[0]
     assert(globalInputNC.shape[0] == num_rows_to_keep)
     assert(policyTargetsNCMove.shape[0] == num_rows_to_keep)
     assert(globalTargetsNC.shape[0] == num_rows_to_keep)
@@ -100,14 +100,14 @@ def shardify(input_idx, input_file_group, num_out_files, out_tmp_dirs, keep_prob
     if keep_prob < 1.0:
         num_rows_to_keep = min(num_rows_to_keep,int(round(num_rows_to_keep * keep_prob)))
 
-    [binaryInputNCHWPacked,globalInputNC,policyTargetsNCMove,globalTargetsNC] = (
+    [binaryInputNCLPacked,globalInputNC,policyTargetsNCMove,globalTargetsNC] = (
         joint_shuffle_take_first_n(
             num_rows_to_keep,
-            [binaryInputNCHWPacked,globalInputNC,policyTargetsNCMove,globalTargetsNC]
+            [binaryInputNCLPacked,globalInputNC,policyTargetsNCMove,globalTargetsNC]
         )
     )
 
-    assert(binaryInputNCHWPacked.shape[0] == num_rows_to_keep)
+    assert(binaryInputNCLPacked.shape[0] == num_rows_to_keep)
     assert(globalInputNC.shape[0] == num_rows_to_keep)
     assert(policyTargetsNCMove.shape[0] == num_rows_to_keep)
     assert(globalTargetsNC.shape[0] == num_rows_to_keep)
@@ -125,7 +125,7 @@ def shardify(input_idx, input_file_group, num_out_files, out_tmp_dirs, keep_prob
         stop = countsums[out_idx]
         np.savez_compressed(
             os.path.join(out_tmp_dirs[out_idx], str(input_idx) + ".npz"),
-            binaryInputNCHWPacked = binaryInputNCHWPacked[start:stop],
+            binaryInputNCLPacked = binaryInputNCLPacked[start:stop],
             globalInputNC = globalInputNC[start:stop],
             policyTargetsNCMove = policyTargetsNCMove[start:stop],
             globalTargetsNC = globalTargetsNC[start:stop],
@@ -140,7 +140,7 @@ def merge_shards(filename, num_shards_to_merge, out_tmp_dir, batch_size, ensure_
     else:
         assert False, "No longer supports outputting tensorflow data"
 
-    binaryInputNCHWPackeds = []
+    binaryInputNCLPackeds = []
     globalInputNCs = []
     policyTargetsNCMoves = []
     globalTargetsNCs = []
@@ -151,43 +151,43 @@ def merge_shards(filename, num_shards_to_merge, out_tmp_dir, batch_size, ensure_
             with np.load(shard_filename) as npz:
                 assert_keys(npz,include_meta)
 
-                binaryInputNCHWPacked = npz["binaryInputNCHWPacked"]
+                binaryInputNCLPacked = npz["binaryInputNCLPacked"]
                 globalInputNC = npz["globalInputNC"]
                 policyTargetsNCMove = npz["policyTargetsNCMove"]
                 globalTargetsNC = npz["globalTargetsNC"]
 
-                binaryInputNCHWPackeds.append(binaryInputNCHWPacked)
+                binaryInputNCLPackeds.append(binaryInputNCLPacked)
                 globalInputNCs.append(globalInputNC)
                 policyTargetsNCMoves.append(policyTargetsNCMove)
                 globalTargetsNCs.append(globalTargetsNC)
         except FileNotFoundError:
             print("WARNING: Empty shard in merge_shards for shard :", input_idx, filename)
 
-    if len(binaryInputNCHWPackeds) <= 0:
+    if len(binaryInputNCLPackeds) <= 0:
         print("WARNING: empty merge file: ", filename)
         return 0
 
     ###
     # WARNING - if adding anything here, also add it to joint_shuffle below!
     ###
-    binaryInputNCHWPacked = np.concatenate(binaryInputNCHWPackeds)
+    binaryInputNCLPacked = np.concatenate(binaryInputNCLPackeds)
     globalInputNC = np.concatenate(globalInputNCs)
     policyTargetsNCMove = np.concatenate(policyTargetsNCMoves)
     globalTargetsNC = np.concatenate(globalTargetsNCs)
 
-    num_rows = binaryInputNCHWPacked.shape[0]
+    num_rows = binaryInputNCLPacked.shape[0]
     assert(globalInputNC.shape[0] == num_rows)
     assert(policyTargetsNCMove.shape[0] == num_rows)
     assert(globalTargetsNC.shape[0] == num_rows)
 
-    [binaryInputNCHWPacked,globalInputNC,policyTargetsNCMove,globalTargetsNC] = (
+    [binaryInputNCLPacked,globalInputNC,policyTargetsNCMove,globalTargetsNC] = (
         joint_shuffle_take_first_n(
             num_rows,
-            [binaryInputNCHWPacked,globalInputNC,policyTargetsNCMove,globalTargetsNC],
+            [binaryInputNCLPacked,globalInputNC,policyTargetsNCMove,globalTargetsNC],
         )
     )
 
-    assert(binaryInputNCHWPacked.shape[0] == num_rows)
+    assert(binaryInputNCLPacked.shape[0] == num_rows)
     assert(globalInputNC.shape[0] == num_rows)
     assert(policyTargetsNCMove.shape[0] == num_rows)
     assert(globalTargetsNC.shape[0] == num_rows)
@@ -201,7 +201,7 @@ def merge_shards(filename, num_shards_to_merge, out_tmp_dir, batch_size, ensure_
         stop = num_batches*batch_size
         np.savez_compressed(
             filename,
-            binaryInputNCHWPacked = binaryInputNCHWPacked[start:stop],
+            binaryInputNCLPacked = binaryInputNCLPacked[start:stop],
             globalInputNC = globalInputNC[start:stop],
             policyTargetsNCMove = policyTargetsNCMove[start:stop],
             globalTargetsNC = globalTargetsNC[start:stop],
@@ -230,7 +230,12 @@ def get_numpy_npz_headers(filename):
                 wasbad = True
                 print("WARNING: bad file, skipping it: %s (bad array %s)" % (filename,subfilename))
             else:
-                (shape, is_fortran, dtype) = np.lib.format._read_array_header(npyfile,version)
+                if version == (1, 0):
+                    (shape, is_fortran, dtype) = np.lib.format.read_array_header_1_0(npyfile)
+                elif version == (2, 0):
+                    (shape, is_fortran, dtype) = np.lib.format.read_array_header_2_0(npyfile)
+                else:
+                    print("WARNING: bad file version, skipping it: %s (bad array %s)" % (filename,subfilename))
                 npzheaders[subfilename] = (shape, is_fortran, dtype)
         if wasbad:
             return None
@@ -250,10 +255,10 @@ def compute_num_rows(filename):
         print("WARNING: bad npz headers for file: ", filename)
         return (filename,None)
 
-    if "binaryInputNCHWPacked" in npheaders:
-        (shape, is_fortran, dtype) = npheaders["binaryInputNCHWPacked"]
+    if "binaryInputNCLPacked" in npheaders:
+        (shape, is_fortran, dtype) = npheaders["binaryInputNCLPacked"]
     else:
-        (shape, is_fortran, dtype) = npheaders["binaryInputNCHWPacked.npy"]
+        (shape, is_fortran, dtype) = npheaders["binaryInputNCLPacked.npy"]
     num_rows = shape[0]
     return (filename,num_rows)
 

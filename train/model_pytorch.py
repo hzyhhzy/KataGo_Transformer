@@ -424,8 +424,8 @@ class KataGPool(torch.nn.Module):
     def __init__(self):
         super(KataGPool, self).__init__()
         # Constants should be tensor to make tensorrt work on int8
-        self.register_buffer("t_14", torch.tensor([14.0,], dtype=torch.float32), persistent=False)
-        self.register_buffer("t_10", torch.tensor([10.0,], dtype=torch.float32), persistent=False)
+        self.register_buffer("t_40", torch.tensor([40.0,], dtype=torch.float32), persistent=False)
+        self.register_buffer("t_30", torch.tensor([30.0,], dtype=torch.float32), persistent=False)
         self.register_buffer("t_1", torch.tensor([1.0,], dtype=torch.float32), persistent=False)
 
     def forward(self, x, mask, mask_sum_hw):
@@ -438,7 +438,7 @@ class KataGPool(torch.nn.Module):
         Returns: NC1
         """
         if mask is not None:
-            mask_sum_hw_sqrt_offset = torch.sqrt(mask_sum_hw) - self.t_14
+            mask_sum_hw_sqrt_offset = torch.sqrt(mask_sum_hw) - self.t_40
         
             x_fp32 = x.to(torch.float32)
             layer_mean = torch.sum(x_fp32, dim=2, keepdim=True) / mask_sum_hw
@@ -446,7 +446,7 @@ class KataGPool(torch.nn.Module):
             # So off-board areas will equal 0, and then this max is mask-safe if we assign -1.0 to off-board areas.
             (layer_max, _argmax) = torch.max((x + (mask - self.t_1)).to(torch.float32), dim=2)
         else:
-            mask_sum_hw_sqrt_offset = (x.shape[2] ** 0.5) - self.t_14
+            mask_sum_hw_sqrt_offset = (x.shape[2] ** 0.5) - self.t_40
             x_fp32 = x.to(torch.float32)
             layer_mean = torch.mean(x_fp32, dim=2, keepdim=True)
             # All activation functions we use right now are always greater than -1.0, and map 0 -> 0.
@@ -456,7 +456,7 @@ class KataGPool(torch.nn.Module):
         layer_max = layer_max.view(x.shape[0], x.shape[1], 1)
 
         out_pool1 = layer_mean
-        out_pool2 = layer_mean * (mask_sum_hw_sqrt_offset / self.t_10)
+        out_pool2 = layer_mean * (mask_sum_hw_sqrt_offset / self.t_30)
         out_pool3 = layer_max
 
         out = torch.cat((out_pool1, out_pool2, out_pool3), dim=1)
@@ -467,9 +467,9 @@ class KataValueHeadGPool(torch.nn.Module):
     def __init__(self):
         super(KataValueHeadGPool, self).__init__()
         # Constants should be tensor to make tensorrt work on int8
-        self.register_buffer("t_14", torch.tensor([14.0,], dtype=torch.float32), persistent=False) 
-        self.register_buffer("t_10", torch.tensor([10.0,], dtype=torch.float32), persistent=False)
-        self.register_buffer("t_100", torch.tensor([100.0,], dtype=torch.float32), persistent=False)
+        self.register_buffer("t_40", torch.tensor([40.0,], dtype=torch.float32), persistent=False) 
+        self.register_buffer("t_30", torch.tensor([30.0,], dtype=torch.float32), persistent=False)
+        self.register_buffer("t_1000", torch.tensor([1000.0,], dtype=torch.float32), persistent=False)
         self.register_buffer("t_0_1", torch.tensor([0.1,], dtype=torch.float32), persistent=False)
 
     def forward(self, x, mask, mask_sum_hw):
@@ -482,18 +482,18 @@ class KataValueHeadGPool(torch.nn.Module):
         Returns: NC1
         """
         if mask is not None:
-            mask_sum_hw_sqrt_offset = torch.sqrt(mask_sum_hw) - self.t_14
+            mask_sum_hw_sqrt_offset = torch.sqrt(mask_sum_hw) - self.t_40
         
             x_fp32 = x.to(torch.float32)
             layer_mean = torch.sum(x_fp32, dim=2, keepdim=True) / mask_sum_hw
         else:
-            mask_sum_hw_sqrt_offset = (x.shape[2] ** 0.5) - self.t_14
+            mask_sum_hw_sqrt_offset = (x.shape[2] ** 0.5) - self.t_40
             x_fp32 = x.to(torch.float32)
             layer_mean = torch.mean(x_fp32, dim=2, keepdim=True)
 
         out_pool1 = layer_mean
-        out_pool2 = layer_mean * (mask_sum_hw_sqrt_offset / self.t_10)
-        out_pool3 = layer_mean * ((mask_sum_hw_sqrt_offset * mask_sum_hw_sqrt_offset) / self.t_100 - self.t_0_1)
+        out_pool2 = layer_mean * (mask_sum_hw_sqrt_offset / self.t_30)
+        out_pool3 = layer_mean * ((mask_sum_hw_sqrt_offset * mask_sum_hw_sqrt_offset) / self.t_1000 - self.t_0_1)
 
         out = torch.cat((out_pool1, out_pool2, out_pool3), dim=1)
         return out

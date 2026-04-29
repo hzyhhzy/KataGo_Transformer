@@ -59,18 +59,18 @@ time python -u ./train_muon_ki.py \
      -datadir "$DATADIR" \
      -exportdir "$BASEDIR"/"$EXPORT_SUBDIR" \
      -exportprefix "$TRAININGNAME" \
-     -max-epochs-this-instance 100 \
-     -pos-len 19 \
-     -samples-per-epoch 5000000 \
+     -max-epochs-this-instance 1 \
+     -pos-len 11 \
+     -samples-per-epoch 1000000 \
      -lr-scale 1.0 \
-     -swa-scales "32.0" \
+     -swa-scales "1.0" \
      -use-fp16 \
      -symmetry-type "xyt" \
      -batch-size "$BATCHSIZE" \
      -model-kind "$MODELKIND" \
-     -swa-period-samples 500000 \
+     -swa-period-samples 100000 \
      -max-val-samples 20000 \
-     -history-matrices-type "go" \
+     -history-matrices-type "none" \
      $EXTRAFLAG \
      "$@" \
      2>&1 | tee -a "$BASEDIR"/train/"$TRAININGNAME"/stdout.txt

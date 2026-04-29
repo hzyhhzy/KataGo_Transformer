@@ -54,7 +54,7 @@ def muon_update_kimi(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
         raise ValueError(f"Muon 形状检查失败: original_shape {original_shape} 中大于4的维度只有 {dims_gt_4} 个 (必须 > 1)。这通常意味着该参数不适合使用 Muon。")
 
     #print(update.shape)
-    if update.ndim == 4:  # 对于卷积滤波器的情况
+    if update.ndim == 4 or update.ndim == 5:  # 对于卷积滤波器的情况
         update = update.view(len(update), -1)
         #print(update.shape)
     if update.shape[0] <= 4 or update.shape[1] <= 4 :
@@ -65,7 +65,7 @@ def muon_update_kimi(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
     update *= max(1, max(grad.size()))**0.5
     
     # 恢复原始形状
-    if len(original_shape) == 4:
+    if len(original_shape) == 4 or len(original_shape) == 5:
         update = update.view(original_shape)
     else:
         assert original_shape==update.shape, f"original_shape={original_shape}, update.shape={update.shape}"

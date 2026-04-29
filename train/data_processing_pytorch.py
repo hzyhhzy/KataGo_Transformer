@@ -117,7 +117,7 @@ def read_npz_training_data(
                         assert False, f"Unknown or unsupported 3D data symmetry type {symmetry_type}"
                         
                     symm = allowed_symms[int(rand.integers(0,len(allowed_symms)))]
-                    batch_binaryInputNCL = apply_symmetry(batch_binaryInputNCL, symm)
+                    batch_binaryInputNCL = apply_symmetry(batch_binaryInputNCL, symm, pos_len)
                     batch_policyTargetsNCMove = apply_symmetry_policy(batch_policyTargetsNCMove, symm, pos_len)
 
                 batch_binaryInputNCL = batch_binaryInputNCL.contiguous()
@@ -140,13 +140,13 @@ def apply_symmetry_policy(tensor, symm, pos_len):
     batch_size = tensor.shape[0]
     channels = tensor.shape[1]
     tensor_without_pass = tensor[:, :, :-1].view((batch_size, channels, pos_len, pos_len, pos_len))
-    tensor_transformed = apply_symmetry(tensor_without_pass, symm)
+    tensor_transformed = apply_symmetry(tensor_without_pass, symm, pos_len)
     return torch.cat((
         tensor_transformed.reshape(batch_size, channels, pos_len * pos_len * pos_len),
         tensor[:, :, -1:]
     ), dim=2)
 
-def apply_symmetry(tensor, symm):
+def apply_symmetry(tensor, symm, pos_len):
     """
     Apply one of the 48 cube symmetries to the given tensor.
 
@@ -154,6 +154,10 @@ def apply_symmetry(tensor, symm):
         tensor (torch.Tensor): Tensor to be transformed. (..., H, W, Z)
         symm (int): 0..47 = 6 axis permutations * 8 flip combinations.
     """
+    is_NCL = len(tensor.shape) == 3
+    if is_NCL:
+        assert tensor.shape[-1] == pos_len*pos_len*pos_len, f"Expected 3D tensor with last dimension {pos_len*pos_len*pos_len}, got {tensor.shape}"
+        tensor = tensor.view(tensor.shape[0], tensor.shape[1], pos_len, pos_len, pos_len)
     assert tensor.shape[-1] == tensor.shape[-2] == tensor.shape[-3]
     assert 0 <= symm < 48, f"3D symmetry id out of range: {symm}"
 
@@ -173,6 +177,10 @@ def apply_symmetry(tensor, symm):
         flip_dims.append(tensor.dim() - 1)
     if flip_dims:
         tensor = tensor.flip(flip_dims)
+    
+    if is_NCL:
+        tensor = tensor.reshape(tensor.shape[0], tensor.shape[1], pos_len*pos_len*pos_len)
+
     return tensor
 
 
