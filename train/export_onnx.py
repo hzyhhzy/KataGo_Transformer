@@ -147,18 +147,64 @@ def load_model_for_export(checkpoint_file, use_swa, device, pos_len=19, verbose=
     return model, swa_model, other_state_dict, is_qat
 
 
+def normalize_exportheads(exportheads) -> List[int]:
+    if exportheads is None:
+        exportheads = [0]
+    if isinstance(exportheads, int):
+        exportheads = [exportheads]
+    exportheads = [int(head) for head in exportheads]
+    assert len(exportheads) >= 1 and len(exportheads) <= 6, "-exportheads must contain 1 to 6 head indexes"
+    return exportheads
+
+
+def validate_exportheads_for_model(model: Model, exportheads) -> List[int]:
+    exportheads = normalize_exportheads(exportheads)
+    num_rule_heads = model.get_num_rule_distill_heads()
+
+    if exportheads == [0]:
+        return exportheads
+
+    if len(exportheads) == 1:
+        assert num_rule_heads > exportheads[0], (
+            f"Invalid export head {exportheads[0]}; model has heads 0..{num_rule_heads-1}"
+        )
+        return exportheads
+
+    assert exportheads == [0, 1, 2, 3, 4, 5], "Multihead models only support a single head or exactly heads 0 1 2 3 4 5"
+    assert model.config["version"] == 102, "Six-head ONNX export is only supported for v102 models"
+    assert num_rule_heads == 6, f"Six-head ONNX export requires exactly 6 model heads, got {num_rule_heads}"
+    for head_idx in exportheads:
+        assert head_idx >= 0 and head_idx < num_rule_heads, (
+            f"Invalid export head {head_idx}; model has heads 0..{num_rule_heads-1}"
+        )
+    return exportheads
+
+
+def select_export_outputs(outputs_by_heads, exportheads: List[int]) -> Tuple[torch.Tensor, ...]:
+    selected_outputs = [outputs_by_heads[head_idx] for head_idx in exportheads]
+    output_indexes = [0, 1, 2, 3, 4]
+    if len(selected_outputs) == 1:
+        outputs = selected_outputs[0]
+        return tuple([outputs[i] for i in output_indexes])
+    return tuple(
+        torch.cat([outputs[i] for outputs in selected_outputs], dim=1)
+        for i in output_indexes
+    )
+
+
 class ONNXExportWrapper(torch.nn.Module):
     """
     Wrapper class to handle the model's forward pass for ONNX export.
     This handles the complex output structure and makes it ONNX-compatible.
     """
     
-    def __init__(self, model: Model, disable_mask: bool):
+    def __init__(self, model: Model, disable_mask: bool, exportheads):
         super(ONNXExportWrapper, self).__init__()
         self.model = model
         self.has_intermediate_head = model.get_has_intermediate_head()
         self.has_metadata_encoder = model.get_has_metadata_encoder()    
         self.disable_mask = disable_mask
+        self.exportheads = validate_exportheads_for_model(model, exportheads)
     
     def forward(self, input_spatial: torch.Tensor, input_global: torch.Tensor, input_meta: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, ...]:
         """
@@ -170,9 +216,7 @@ class ONNXExportWrapper(torch.nn.Module):
         else:
             outputs = self.model(input_spatial, input_global, disable_mask=self.disable_mask)
         
-        outputs = outputs[0]
-        pruned_outputs = tuple([outputs[i] for i in [0, 1, 2, 3, 4]])
-        return pruned_outputs
+        return select_export_outputs(outputs, self.exportheads)
 
 if CalibrationDataReader is not None:
     class ONNXCalibrationDataReader(CalibrationDataReader):
@@ -342,7 +386,7 @@ def export_to_onnx(model: Model, full_name: str ,export_path: str, pos_len: int 
                    batch_size: int = 1, opset_version: int = 20, disable_mask: bool = False,
                    verbose: bool = False, extra_meta_data: Dict[str, str] = None,
                    auto_fp16: bool = False, fix_batchsize: bool = False,
-                   dynamo: bool = False) -> None:
+                   dynamo: bool = False, exportheads=None) -> None:
     """
     Export PyTorch model to ONNX format.
     
@@ -357,12 +401,14 @@ def export_to_onnx(model: Model, full_name: str ,export_path: str, pos_len: int 
         fix_batchsize: Whether to fix the batch size to the specified value
         dynamo: Whether to use TorchDynamo for export
     """
-    
+
     # Set model to evaluation mode
     model.eval()
-    
+
+    exportheads = validate_exportheads_for_model(model, exportheads)
+
     # Create wrapper for ONNX export
-    wrapper = ONNXExportWrapper(model, disable_mask=disable_mask)
+    wrapper = ONNXExportWrapper(model, disable_mask=disable_mask, exportheads=exportheads)
     wrapper.eval()
     
     # Create dummy inputs
@@ -475,9 +521,19 @@ def export_to_onnx(model: Model, full_name: str ,export_path: str, pos_len: int 
         onnx_model = onnx.load(export_path)
         
         # Add metadata_props
+        if exportheads == [0]:
+            meta_model_version = model.config["version"]
+        elif len(exportheads) == 1:
+            meta_model_version = model.config["version"]
+        elif exportheads == [0, 1, 2, 3, 4, 5]:
+            assert model.config["version"] == 102, "Multihead ONNX export metadata version 112 requires source model version 102"
+            assert model.get_num_rule_distill_heads() == 6, "Multihead ONNX export metadata version 112 requires exactly 6 model heads"
+            meta_model_version = 112
+        else:
+            assert False, "Unsupported -exportheads combination"
         meta = {
             "name": full_name,
-            "modelVersion": str(model.config["version"]),
+            "modelVersion": str(meta_model_version),
             # Add other useful info if available
             "exported_at": datetime.datetime.now().isoformat(),
             "auto_fp16_already": "true" if auto_fp16 else "false",
@@ -493,6 +549,8 @@ def export_to_onnx(model: Model, full_name: str ,export_path: str, pos_len: int 
             "is_int8": "true" if (extra_meta_data and extra_meta_data.get("is_int8") == "true") else "false",
             "model_config": str(model.config)
         }
+        if len(exportheads) > 1:
+            meta["multihead_indexes"] = json.dumps(exportheads)
         if extra_meta_data is not None:
             meta.update(extra_meta_data)
         
@@ -516,7 +574,7 @@ def export_to_onnx(model: Model, full_name: str ,export_path: str, pos_len: int 
 
 
 def compare_models(model1, model2, model1_type: str, model2_type: str, pos_len: int = 19, 
-                   batch_size: int = 1, calib_data_dir: str = None, config=None) -> bool:
+                   batch_size: int = 1, calib_data_dir: str = None, config=None, exportheads=None) -> bool:
     """
     Compare two models (either PyTorch or ONNX) to ensure they produce similar outputs.
     
@@ -533,6 +591,8 @@ def compare_models(model1, model2, model1_type: str, model2_type: str, pos_len: 
     Returns:
         True if verification passes, False otherwise
     """
+    exportheads = normalize_exportheads(exportheads)
+
     try:
         import onnxruntime as ort
     except ImportError:
@@ -578,8 +638,7 @@ def compare_models(model1, model2, model1_type: str, model2_type: str, pos_len: 
                     outputs = model(spatial, global_in, meta)
                 else:
                     outputs = model(spatial, global_in)
-            outputs = outputs[0]
-            return [outputs[i] for i in [0, 1, 2, 3, 4]]
+            return list(select_export_outputs(outputs, exportheads))
         else:
             ort_session = ort.InferenceSession(model)
             onnx_inputs = {
@@ -629,9 +688,9 @@ def compare_models(model1, model2, model1_type: str, model2_type: str, pos_len: 
 
 
 def verify_onnx_model(onnx_path: str, original_model: Model, pos_len: int = 19, 
-                      batch_size: int = 1, calib_data_dir: str = None) -> bool:
+                      batch_size: int = 1, calib_data_dir: str = None, exportheads=None) -> bool:
     torch.nn.RMSNorm.forward = original_rms_norm_forward
-    return compare_models(original_model, onnx_path, 'pytorch', 'onnx', pos_len, batch_size, calib_data_dir)
+    return compare_models(original_model, onnx_path, 'pytorch', 'onnx', pos_len, batch_size, calib_data_dir, exportheads=exportheads)
 
 
 if __name__ == "__main__":
@@ -660,6 +719,7 @@ if __name__ == "__main__":
         parser.add_argument('-comment', help='Comment for metadata', required=False,default="")
         parser.add_argument('-dynamo', help='Use TorchDynamo for ONNX export', action='store_true', required=False)
         parser.add_argument('-skip-verification', help='Skip ONNX model verification', action='store_true', required=False)
+        parser.add_argument('-exportheads', help='Head indexes to export. Multiple indexes concatenate each output on channel dim.', type=int, nargs='+', default=[0], required=False)
         
         args = parser.parse_args()
 
@@ -687,6 +747,7 @@ if __name__ == "__main__":
         comment = args.comment
         dynamo = args.dynamo
         skip_verification = args.skip_verification
+        exportheads = args.exportheads
         extra_meta_data = {}
         if author is not None:
             extra_meta_data["author"] = author
@@ -712,6 +773,7 @@ if __name__ == "__main__":
         verbose = False
         dynamo = False
         skip_verification = False
+        exportheads = [0]
     
     # Create export directory
     os.makedirs(export_dir, exist_ok=True)
@@ -735,6 +797,10 @@ if __name__ == "__main__":
     model, swa_model, other_state_dict, is_qat_in_checkpoint = load_model_for_export(
         checkpoint_file, use_swa, device="cpu", pos_len=pos_len, verbose=True, convert_qat_to_float=False
     )
+    exportheads = validate_exportheads_for_model(
+        swa_model if (use_swa and swa_model is not None) else model,
+        exportheads,
+    )
     
     # If convert_qat_to_float is requested, we need the float version too
     export_model = None
@@ -750,7 +816,7 @@ if __name__ == "__main__":
         export_model = float_swa_model if (use_swa and float_swa_model is not None) else float_model
         
         logging.info("Comparing original QAT model with converted float model...")
-        compare_models(qat_model_to_compare, export_model, 'pytorch', 'pytorch', pos_len, batch_size, calib_data)
+        compare_models(qat_model_to_compare, export_model, 'pytorch', 'pytorch', pos_len, batch_size, calib_data, exportheads=exportheads)
         
         # Now we proceed with the float model as the one to export
         is_qat = False 
@@ -770,6 +836,8 @@ if __name__ == "__main__":
     
     logging.info(f"Exporting {model_type} model")
     logging.info(f"Model config: {export_model.config}")
+    exportheads = validate_exportheads_for_model(export_model, exportheads)
+    logging.info(f"Export heads: {exportheads}")
     
     model_full_name = f"{model_name}"
     # Export to ONNX
@@ -799,13 +867,14 @@ if __name__ == "__main__":
         extra_meta_data=extra_meta_data,
         auto_fp16=auto_fp16,
         fix_batchsize=fix_batchsize,
-        dynamo=dynamo
+        dynamo=dynamo,
+        exportheads=exportheads
     )
     
     # Verify the exported model
     if not skip_verification:
         logging.info("Verifying exported ONNX model...")
-        verification_passed = verify_onnx_model(onnx_path, export_model, pos_len, batch_size, calib_data_dir=calib_data)
+        verification_passed = verify_onnx_model(onnx_path, export_model, pos_len, batch_size, calib_data_dir=calib_data, exportheads=exportheads)
         
         if not verification_passed:
             logging.error("ONNX model verification failed!")
@@ -864,7 +933,7 @@ if __name__ == "__main__":
             # Verify the quantized model
             if not skip_verification:
                 logging.info("Verifying quantized INT8 model...")
-                int8_verification_passed = verify_onnx_model(onnx_int8_path, export_model, pos_len, batch_size, calib_data_dir=calib_data)
+                int8_verification_passed = verify_onnx_model(onnx_int8_path, export_model, pos_len, batch_size, calib_data_dir=calib_data, exportheads=exportheads)
                 if not int8_verification_passed:
                     logging.warning("INT8 model verification failed! (This is common for INT8, check accuracy manually)")
             else:

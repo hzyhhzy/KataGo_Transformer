@@ -1,4 +1,5 @@
 import math
+import itertools
 import numpy as np
 import torch
 import torch.nn
@@ -1951,6 +1952,10 @@ class Model(torch.nn.Module):
         else:
             self.has_intermediate_head = False
             self.intermediate_head_blocks = 0
+        self.num_rule_distill_heads = config.get("num_rule_distill_heads", 1)
+        assert isinstance(self.num_rule_distill_heads, int) and self.num_rule_distill_heads >= 1
+        if self.num_rule_distill_heads != 1:
+            assert config["version"] == 102, "Multi-rule distillation heads are only supported for v102"
 
         self.activation = "relu" if "activation" not in config else config["activation"]
 
@@ -2144,6 +2149,26 @@ class Model(torch.nn.Module):
             self.activation,
             self.pos_len,
         )
+        self.rule_policy_heads = torch.nn.ModuleList()
+        self.rule_value_heads = torch.nn.ModuleList()
+        for _ in range(1, self.num_rule_distill_heads):
+            self.rule_policy_heads.append(PolicyHead(
+                self.c_trunk,
+                self.c_p1,
+                self.c_g1,
+                self.config,
+                self.activation,
+            ))
+            self.rule_value_heads.append(ValueHead(
+                self.c_trunk,
+                self.c_v1,
+                self.c_v2,
+                self.c_sv2,
+                self.num_scorebeliefs,
+                self.config,
+                self.activation,
+                self.pos_len,
+            ))
         if self.has_intermediate_head:
             self.norm_intermediate_trunkfinal = NormMask(self.c_trunk, self.config, fixup_use_gamma=False, is_last_batchnorm=True)
             self.act_intermediate_trunkfinal = act(self.activation)
@@ -2164,6 +2189,26 @@ class Model(torch.nn.Module):
                 self.activation,
                 self.pos_len,
             )
+            self.intermediate_rule_policy_heads = torch.nn.ModuleList()
+            self.intermediate_rule_value_heads = torch.nn.ModuleList()
+            for _ in range(1, self.num_rule_distill_heads):
+                self.intermediate_rule_policy_heads.append(PolicyHead(
+                    self.c_trunk,
+                    self.c_p1,
+                    self.c_g1,
+                    self.config,
+                    self.activation,
+                ))
+                self.intermediate_rule_value_heads.append(ValueHead(
+                    self.c_trunk,
+                    self.c_v1,
+                    self.c_v2,
+                    self.c_sv2,
+                    self.num_scorebeliefs,
+                    self.config,
+                    self.activation,
+                    self.pos_len,
+                ))
 
     @property
     def device(self):
@@ -2196,15 +2241,25 @@ class Model(torch.nn.Module):
 
             self.policy_head.initialize()
             self.value_head.initialize()
+            for policy_head, value_head in zip(self.rule_policy_heads, self.rule_value_heads):
+                policy_head.initialize()
+                value_head.initialize()
             if self.has_intermediate_head:
                 self.intermediate_policy_head.initialize()
                 self.intermediate_value_head.initialize()
+                for policy_head, value_head in zip(self.intermediate_rule_policy_heads, self.intermediate_rule_value_heads):
+                    policy_head.initialize()
+                    value_head.initialize()
 
     def get_norm_kind(self) -> bool:
         return self.norm_kind
 
     def get_has_intermediate_head(self) -> bool:
         return self.has_intermediate_head
+
+    def get_num_rule_distill_heads(self) -> int:
+        return self.num_rule_distill_heads
+
     def get_has_metadata_encoder(self) -> bool:
         return self.metadata_encoder is not None
 
@@ -2225,10 +2280,16 @@ class Model(torch.nn.Module):
         self.norm_trunkfinal.add_reg_dict(reg_dict)
         self.policy_head.add_reg_dict(reg_dict)
         self.value_head.add_reg_dict(reg_dict)
+        for policy_head, value_head in zip(self.rule_policy_heads, self.rule_value_heads):
+            policy_head.add_reg_dict(reg_dict)
+            value_head.add_reg_dict(reg_dict)
         if self.has_intermediate_head:
             self.norm_intermediate_trunkfinal.add_reg_dict(reg_dict)
             self.intermediate_policy_head.add_reg_dict(reg_dict)
             self.intermediate_value_head.add_reg_dict(reg_dict)
+            for policy_head, value_head in zip(self.intermediate_rule_policy_heads, self.intermediate_rule_value_heads):
+                policy_head.add_reg_dict(reg_dict)
+                value_head.add_reg_dict(reg_dict)
 
 
     def set_brenorm_params(self, renorm_avg_momentum: float, rmax: float, dmax: float):
@@ -2237,10 +2298,16 @@ class Model(torch.nn.Module):
         self.norm_trunkfinal.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
         self.policy_head.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
         self.value_head.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
+        for policy_head, value_head in zip(self.rule_policy_heads, self.rule_value_heads):
+            policy_head.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
+            value_head.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
         if self.has_intermediate_head:
             self.norm_intermediate_trunkfinal.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
             self.intermediate_policy_head.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
             self.intermediate_value_head.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
+            for policy_head, value_head in zip(self.intermediate_rule_policy_heads, self.intermediate_rule_value_heads):
+                policy_head.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
+                value_head.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
 
     def add_brenorm_clippage(self, upper_rclippage, lower_rclippage, dclippage):
         for block in self.blocks:
@@ -2248,14 +2315,63 @@ class Model(torch.nn.Module):
         self.norm_trunkfinal.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
         self.policy_head.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
         self.value_head.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
+        for policy_head, value_head in zip(self.rule_policy_heads, self.rule_value_heads):
+            policy_head.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
+            value_head.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
         if self.has_intermediate_head:
             self.norm_intermediate_trunkfinal.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
             self.intermediate_policy_head.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
             self.intermediate_value_head.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
+            for policy_head, value_head in zip(self.intermediate_rule_policy_heads, self.intermediate_rule_value_heads):
+                policy_head.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
+                value_head.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
+
+    def _forward_output_heads(
+        self,
+        x,
+        input_global,
+        policy_head,
+        value_head,
+        rule_policy_heads,
+        rule_value_heads,
+        mask,
+        mask_sum_hw,
+        mask_sum,
+        extra_outputs,
+    ):
+        outputs = []
+        for policy_head, value_head in itertools.chain(
+            ((policy_head, value_head),),
+            zip(rule_policy_heads, rule_value_heads),
+        ):
+            out_policy = policy_head(x, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+            (
+                out_value,
+                out_miscvalue,
+                out_moremiscvalue,
+                out_ownership,
+                out_scoring,
+                out_futurepos,
+                out_seki,
+                out_scorebelief_logprobs,
+            ) = value_head(x, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, input_global=input_global, extra_outputs=extra_outputs)
+            outputs.append((
+                out_policy,
+                out_value,
+                out_miscvalue,
+                out_moremiscvalue,
+                out_ownership,
+                out_scoring,
+                out_futurepos,
+                out_seki,
+                out_scorebelief_logprobs,
+            ))
+        return outputs
 
     # Returns a tuple of tuples of outputs
-    # The outer tuple indexes different sets of heads, such as if the net also computes intermediate heads.
-    #   0 is the main output, 1 is intermediate.
+    # The outer tuple indexes different sets of heads.
+    # Without rule distillation heads, 0 is the main output and 1 is intermediate when present.
+    # With rule distillation heads, all main rule heads come first followed by all intermediate rule heads.
     # The inner tuple ranges over the outputs of a set of heads (policy, value, etc).
     def forward(
         self,
@@ -2308,17 +2424,18 @@ class Model(torch.nn.Module):
                 iout = out
                 iout = self.norm_intermediate_trunkfinal(iout, mask=mask, mask_sum=mask_sum)
                 iout = self.act_intermediate_trunkfinal(iout)
-                iout_policy = self.intermediate_policy_head(iout, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
-                (
-                    iout_value,
-                    iout_miscvalue,
-                    iout_moremiscvalue,
-                    iout_ownership,
-                    iout_scoring,
-                    iout_futurepos,
-                    iout_seki,
-                    iout_scorebelief_logprobs,
-                ) = self.intermediate_value_head(iout, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, input_global=input_global, extra_outputs=extra_outputs)
+                intermediate_outputs = self._forward_output_heads(
+                    iout,
+                    input_global,
+                    self.intermediate_policy_head,
+                    self.intermediate_value_head,
+                    self.intermediate_rule_policy_heads,
+                    self.intermediate_rule_value_heads,
+                    mask,
+                    mask_sum_hw,
+                    mask_sum,
+                    extra_outputs,
+                )
                 #print(iout_scorebelief_logprobs.shape)
                 #torch._dynamo.graph_break() # torch.compile sometimes HAVE BUGS
 
@@ -2349,60 +2466,27 @@ class Model(torch.nn.Module):
             if extra_outputs is not None:
                 extra_outputs.report("trunkfinal", out)
     
-            # print("MAIN")
-            out_policy = self.policy_head(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
-            (
-                out_value,
-                out_miscvalue,
-                out_moremiscvalue,
-                out_ownership,
-                out_scoring,
-                out_futurepos,
-                out_seki,
-                out_scorebelief_logprobs,
-            ) = self.value_head(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, input_global=input_global, extra_outputs=extra_outputs)
+            main_outputs = self._forward_output_heads(
+                out,
+                input_global,
+                self.policy_head,
+                self.value_head,
+                self.rule_policy_heads,
+                self.rule_value_heads,
+                mask,
+                mask_sum_hw,
+                mask_sum,
+                extra_outputs,
+            )
             #print(iout_scoring.shape)
             #print(out_scoring.shape)
             #print(iout_scorebelief_logprobs.shape)
             #print(out_scorebelief_logprobs.shape)
         
             if self.has_intermediate_head:
-                return (
-                    (
-                        out_policy,
-                        out_value,
-                        out_miscvalue,
-                        out_moremiscvalue,
-                        out_ownership,
-                        out_scoring,
-                        out_futurepos,
-                        out_seki,
-                        out_scorebelief_logprobs,
-                    ),
-                    (
-                        iout_policy,
-                        iout_value,
-                        iout_miscvalue,
-                        iout_moremiscvalue,
-                        iout_ownership,
-                        iout_scoring,
-                        iout_futurepos,
-                        iout_seki,
-                        iout_scorebelief_logprobs,
-                    ),
-                )
+                return tuple(main_outputs + intermediate_outputs)
             else:
-                return ((
-                    out_policy,
-                    out_value,
-                    out_miscvalue,
-                    out_moremiscvalue,
-                    out_ownership,
-                    out_scoring,
-                    out_futurepos,
-                    out_seki,
-                    out_scorebelief_logprobs,
-                ),)
+                return tuple(main_outputs)
 
     def float32ify_output(self, outputs_byheads):
         return tuple(self.float32ify_single_heads_output(outputs) for outputs in outputs_byheads)

@@ -42,6 +42,22 @@ import data_processing_pytorch
 from metrics_logging import accumulate_metrics, log_metrics, clear_metric_nonfinite
 from muon_kissin import MuonWithAuxAdamKimi
 torch.set_float32_matmul_precision('high')
+
+
+# Specialized training entrypoints can replace these to adapt checkpoints/configs
+# before the ordinary Muon training flow constructs and loads its model.
+def prepare_model_config_for_training(model_config):
+    return model_config
+
+
+def prepare_loaded_state_dict_for_training(state_dict, is_initial_checkpoint):
+    return state_dict
+
+
+def prepare_loaded_model_state_dict_for_training(raw_model, model_state_dict, is_initial_checkpoint):
+    return model_state_dict
+
+
 # HANDLE COMMAND AND ARGS -------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -657,7 +673,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
         if path_to_load_from is None:
             logging.info("Initializing new model!")
             assert model_kind is not None, "Model kind is none or unspecified but the model is being created fresh"
-            model_config = modelconfigs.config_of_name[model_kind]
+            model_config = prepare_model_config_for_training(modelconfigs.config_of_name[model_kind])
             logging.info(str(model_config))
             raw_model = Model(model_config,pos_len)
             raw_model.initialize()
@@ -719,7 +735,10 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             return (model_config, ddp_model, raw_model, swa_models, optimizer, metrics_obj, running_metrics, train_state, last_val_metrics)
         else:
             state_dict = torch.load(path_to_load_from, map_location=device, weights_only=False)
+            is_initial_checkpoint = initial_checkpoint is not None and path_to_load_from == initial_checkpoint
+            state_dict = prepare_loaded_state_dict_for_training(state_dict, is_initial_checkpoint)
             model_config = state_dict["config"] if "config" in state_dict else modelconfigs.config_of_name[model_kind]
+            model_config = prepare_model_config_for_training(model_config)
             logging.info(str(model_config))
             raw_model = Model(model_config,pos_len)
             raw_model.initialize()
@@ -740,6 +759,9 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     logging.info(f"Model norm normal baseline computed: {modelnorm_normal_baseline}")
             
             model_state_dict = load_model.load_model_state_dict(state_dict)
+            model_state_dict = prepare_loaded_model_state_dict_for_training(
+                raw_model, model_state_dict, is_initial_checkpoint
+            )
             checkpoint_is_qat_like = is_qat_checkpoint(model_state_dict)
             
             if(qat_int8 and not checkpoint_is_qat_like):
