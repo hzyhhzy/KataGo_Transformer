@@ -97,6 +97,18 @@ def init_weights(tensor, activation, scale, fan_tensor=None):
     else:
         torch.nn.init.trunc_normal_(tensor, mean=0.0, std=std, a=-2.0*std, b=2.0*std)
 
+def conv2d(c_in, c_out, kernel_size, bias=False):
+    padding = kernel_size // 2
+    padding_mode = "circular" if padding > 0 else "zeros"
+    return torch.nn.Conv2d(
+        c_in,
+        c_out,
+        kernel_size=kernel_size,
+        padding=padding,
+        padding_mode=padding_mode,
+        bias=bias,
+    )
+
 class SoftPlusWithGradientFloorFunction(torch.autograd.Function):
     """
     Same as softplus, except on backward pass, we never let the gradient decrease below grad_floor.
@@ -491,8 +503,8 @@ class KataConvAndGPool(torch.nn.Module):
         self.name = name
         self.norm_kind = config["norm_kind"]
         self.activation = activation
-        self.conv1r = torch.nn.Conv2d(c_in, c_out, kernel_size=3, padding="same", bias=False)
-        self.conv1g = torch.nn.Conv2d(c_in, c_gpool, kernel_size=3, padding="same", bias=False)
+        self.conv1r = conv2d(c_in, c_out, kernel_size=3, bias=False)
+        self.conv1g = conv2d(c_in, c_gpool, kernel_size=3, bias=False)
         self.normg = NormMask(
             c_gpool,
             config=config,
@@ -554,15 +566,16 @@ class KataConvAndGPool(torch.nn.Module):
 class KataConvAndAttentionPool(torch.nn.Module):
     def __init__(self, name, c_in, c_out, c_gpool, config, activation):
         super(KataConvAndAttentionPool, self).__init__()
+        assert False, "Attention pooling is disabled for circular-boundary CNN export/training"
         self.name = name
         self.norm_kind = config["norm_kind"]
         self.c_gpool = c_gpool
         self.c_apheads = config["num_attention_pool_heads"]
         self.activation = activation
-        self.conv1r = torch.nn.Conv2d(c_in, c_out, kernel_size=3, padding="same", bias=False)
-        self.conv1g = torch.nn.Conv2d(c_in, c_gpool, kernel_size=3, padding="same", bias=False)
-        self.conv1k = torch.nn.Conv2d(c_in, c_gpool, kernel_size=1, padding="same", bias=False)
-        self.conv1q = torch.nn.Conv2d(c_in, c_gpool, kernel_size=1, padding="same", bias=False)
+        self.conv1r = conv2d(c_in, c_out, kernel_size=3, bias=False)
+        self.conv1g = conv2d(c_in, c_gpool, kernel_size=3, bias=False)
+        self.conv1k = conv2d(c_in, c_gpool, kernel_size=1, bias=False)
+        self.conv1q = conv2d(c_in, c_gpool, kernel_size=1, bias=False)
 
         assert c_gpool % self.c_apheads == 0, "Gpool channels must be divisible by num_attention_pool_heads"
 
@@ -572,7 +585,7 @@ class KataConvAndAttentionPool(torch.nn.Module):
             fixup_use_gamma=False,
         )
         self.actg = act(activation, inplace=True)
-        self.conv_mix = torch.nn.Conv2d(c_gpool*2, c_out, kernel_size=1, padding="same", bias=False)
+        self.conv_mix = conv2d(c_gpool*2, c_out, kernel_size=1, bias=False)
 
         self.register_buffer("t_1", torch.tensor(1.0, dtype=torch.float32), persistent=False)
         self.register_buffer("t_6000", torch.tensor(6000.0, dtype=torch.float32), persistent=False)
@@ -723,12 +736,12 @@ class NormActConv(torch.nn.Module):
                 self.convpool = KataConvAndGPool(name=name+".convpool",c_in=c_in, c_out=c_out, c_gpool=c_gpool, config=config, activation=activation)
                 self.conv = None
         else:
-            self.conv = torch.nn.Conv2d(c_in, c_out, kernel_size=kernel_size, padding="same", bias=False)
+            self.conv = conv2d(c_in, c_out, kernel_size=kernel_size, bias=False)
             self.convpool = None
 
         self.conv1x1 = None
         if self.conv is not None and kernel_size > 1 and "use_repvgg_linear" in config and config["use_repvgg_linear"]:
-            self.conv1x1 = torch.nn.Conv2d(c_in, c_out, kernel_size=1, padding="same", bias=False)
+            self.conv1x1 = conv2d(c_in, c_out, kernel_size=1, bias=False)
         
         if MAYBE_QAT:
             self.quant_before_conv = QuantStub()
@@ -884,6 +897,7 @@ class TransformerBlock(torch.nn.Module):
         activation: str,
     ):
         super(TransformerBlock, self).__init__()
+        assert False, "Transformer blocks are disabled for circular-boundary CNN export/training"
         self.name = name
         self.norm_kind = config["norm_kind"]
         self.ffn_dim = config["transformer_ffn_channels"] if "transformer_ffn_channels" in config else c_main*2
@@ -1068,6 +1082,7 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         use_rope: bool = True
     ):
         super(TransformerRoPEGQABlock, self).__init__()
+        assert False, "Transformer blocks are disabled for circular-boundary CNN export/training"
         self.name = name
         self.norm_kind = config.get("norm_kind", "layer")
         self.ffn_dim = config.get("transformer_ffn_channels", c_main * 2)
@@ -1577,8 +1592,8 @@ class PolicyHead(torch.nn.Module):
         # Output 4: long-term-optimistic policy prediction
         # Output 5: short-term-optimistic policy prediction
 
-        self.conv1p = torch.nn.Conv2d(c_in, c_p1, kernel_size=1, padding="same", bias=False)
-        self.conv1g = torch.nn.Conv2d(c_in, c_g1, kernel_size=1, padding="same", bias=False)
+        self.conv1p = conv2d(c_in, c_p1, kernel_size=1, bias=False)
+        self.conv1g = conv2d(c_in, c_g1, kernel_size=1, bias=False)
 
         self.biasg = BiasMask(
             c_g1,
@@ -1602,7 +1617,7 @@ class PolicyHead(torch.nn.Module):
             is_after_batchnorm=True,
         )
         self.act2 = act(activation)
-        self.conv2p = torch.nn.Conv2d(c_p1, self.num_policy_outputs, kernel_size=1, padding="same", bias=False)
+        self.conv2p = conv2d(c_p1, self.num_policy_outputs, kernel_size=1, bias=False)
 
         # Constants should be tensor to make tensorrt work on int8
         self.register_buffer("t_1", torch.tensor([1.0,], dtype=torch.float32), persistent=False)
@@ -1682,7 +1697,7 @@ class ValueHead(torch.nn.Module):
     def __init__(self, c_in, c_v1, c_v2, c_sv2, num_scorebeliefs, config, activation, pos_len):
         super(ValueHead, self).__init__()
         self.activation = activation
-        self.conv1 = torch.nn.Conv2d(c_in, c_v1, kernel_size=1, padding="same", bias=False)
+        self.conv1 = conv2d(c_in, c_v1, kernel_size=1, bias=False)
         self.bias1 = BiasMask(
             c_v1,
             config=config,
@@ -1697,10 +1712,10 @@ class ValueHead(torch.nn.Module):
         self.linear_valuehead = torch.nn.Linear(c_v2, 3, bias=True)
         self.linear_miscvaluehead = torch.nn.Linear(c_v2, 10, bias=True)
         self.linear_moremiscvaluehead = torch.nn.Linear(c_v2, 8, bias=True)
-        self.conv_ownership = torch.nn.Conv2d(c_v1, 1, kernel_size=1, padding="same", bias=False)
-        self.conv_scoring = torch.nn.Conv2d(c_v1, 1, kernel_size=1, padding="same", bias=False)
-        self.conv_futurepos = torch.nn.Conv2d(c_in, 2, kernel_size=1, padding="same", bias=False)
-        self.conv_seki = torch.nn.Conv2d(c_in, 4, kernel_size=1, padding="same", bias=False)
+        self.conv_ownership = conv2d(c_v1, 1, kernel_size=1, bias=False)
+        self.conv_scoring = conv2d(c_v1, 1, kernel_size=1, bias=False)
+        self.conv_futurepos = conv2d(c_in, 2, kernel_size=1, bias=False)
+        self.conv_seki = conv2d(c_in, 4, kernel_size=1, bias=False)
 
         self.pos_len = pos_len
         self.scorebelief_mid = self.pos_len*self.pos_len + EXTRA_SCORE_DISTR_RADIUS
@@ -1955,9 +1970,9 @@ class Model(torch.nn.Module):
         self.activation = "relu" if "activation" not in config else config["activation"]
 
         if config["initial_conv_1x1"]:
-            self.conv_spatial = torch.nn.Conv2d(modelconfigs.get_num_bin_input_features(config), self.c_trunk, kernel_size=1, padding="same", bias=False)
+            self.conv_spatial = conv2d(modelconfigs.get_num_bin_input_features(config), self.c_trunk, kernel_size=1, bias=False)
         else:
-            self.conv_spatial = torch.nn.Conv2d(modelconfigs.get_num_bin_input_features(config), self.c_trunk, kernel_size=3, padding="same", bias=False)
+            self.conv_spatial = conv2d(modelconfigs.get_num_bin_input_features(config), self.c_trunk, kernel_size=3, bias=False)
         self.linear_global = torch.nn.Linear(modelconfigs.get_num_global_input_features(config), self.c_trunk, bias=False)
 
         if "metadata_encoder" in config and config["metadata_encoder"] is not None:
