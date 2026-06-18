@@ -98,8 +98,10 @@ def init_weights(tensor, activation, scale, fan_tensor=None):
         torch.nn.init.trunc_normal_(tensor, mean=0.0, std=std, a=-2.0*std, b=2.0*std)
 
 def conv2d(c_in, c_out, kernel_size, bias=False):
+    assert kernel_size % 2 == 1, "Circular convolution requires odd kernel sizes"
     padding = kernel_size // 2
     padding_mode = "circular" if padding > 0 else "zeros"
+    assert padding == 0 or padding_mode == "circular", "Non-1x1 convolutions must use circular padding"
     return torch.nn.Conv2d(
         c_in,
         c_out,
@@ -2280,6 +2282,7 @@ class Model(torch.nn.Module):
         extra_outputs: Optional[ExtraOutputs] = None,
         disable_mask = False
     ):
+        assert disable_mask, "Circular-boundary training/export requires disable_mask=True"
         # float_formatter = "{:.3f}".format
         # np.set_printoptions(formatter={'float_kind':float_formatter}, threshold=1000000, linewidth=10000)
 

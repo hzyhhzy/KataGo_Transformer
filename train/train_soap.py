@@ -79,6 +79,7 @@ if __name__ == "__main__":
     required_args.add_argument('-batch-size', help='Per-GPU batch size to use for training', type=int, required=True)
     optional_args.add_argument('-samples-per-epoch', help='Number of data samples to consider as one epoch', type=int, required=False)
     optional_args.add_argument('-history-matrices-type', help='History matrices mode: "go", "gomoku", "none", or empty', type=str, default="", required=False)
+    optional_args.add_argument('-disable-mask', help='Disable model mask handling. Required for circular-boundary CNN training.', required=False, action='store_true')
     optional_args.add_argument('-symmetry-type', help='Data symmetry type. "none" to disable, "xyt" for Go/Gomoku, "x+y" for Hex, "x" for chess, "t" for tiaoqi', type=str, default="xyt", required=False)
 
     
@@ -257,6 +258,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     lookahead_alpha = args["lookahead_alpha"]
     lookahead_print = args["lookahead_print"]
     history_matrices_type = args["history_matrices_type"]
+    disable_mask = args["disable_mask"]
 
     use_fp16 = args["use_fp16"]
     master_port = args["master_port"]
@@ -770,7 +772,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 raw_model.eval()
                 dummy_binary, dummy_global, dummy_meta = dummy_input.generate_dummy_inputs(model_config, 1, pos_len, device="cpu")
                 with torch.no_grad():
-                    raw_model(dummy_binary, dummy_global, input_meta=dummy_meta)
+                    raw_model(dummy_binary, dummy_global, input_meta=dummy_meta, disable_mask=disable_mask)
                 raw_model.train()
                 raw_model.load_state_dict(model_state_dict)
                 
@@ -1387,6 +1389,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                             batch["globalInputNC"],
                             input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
                             extra_outputs=extra_outputs,
+                            disable_mask=disable_mask,
                         )
                     model_outputs = raw_model.float32ify_output(model_outputs)
                 else:
@@ -1395,6 +1398,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                         batch["globalInputNC"],
                         input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
                         extra_outputs=extra_outputs,
+                        disable_mask=disable_mask,
                     )
 
                 postprocessed = raw_model.postprocess_output(model_outputs)
@@ -1596,6 +1600,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                             batch["binaryInputNCHW"],
                             batch["globalInputNC"],
                             input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
+                            disable_mask=disable_mask,
                         )
                         postprocessed = raw_model.postprocess_output(model_outputs)
                         extra_outputs = None
@@ -1661,6 +1666,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                                 batch["binaryInputNCHW"],
                                 batch["globalInputNC"],
                                 input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
+                                disable_mask=disable_mask,
                             )
                             postprocessed = swa_model.module.postprocess_output(model_outputs)
                             extra_outputs = None

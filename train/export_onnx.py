@@ -516,7 +516,8 @@ def export_to_onnx(model: Model, full_name: str ,export_path: str, pos_len: int 
 
 
 def compare_models(model1, model2, model1_type: str, model2_type: str, pos_len: int = 19, 
-                   batch_size: int = 1, calib_data_dir: str = None, config=None) -> bool:
+                   batch_size: int = 1, calib_data_dir: str = None, config=None,
+                   disable_mask: bool = False) -> bool:
     """
     Compare two models (either PyTorch or ONNX) to ensure they produce similar outputs.
     
@@ -575,9 +576,9 @@ def compare_models(model1, model2, model1_type: str, model2_type: str, pos_len: 
             model.eval()
             with torch.no_grad():
                 if meta is not None:
-                    outputs = model(spatial, global_in, meta)
+                    outputs = model(spatial, global_in, meta, disable_mask=disable_mask)
                 else:
-                    outputs = model(spatial, global_in)
+                    outputs = model(spatial, global_in, disable_mask=disable_mask)
             outputs = outputs[0]
             return [outputs[i] for i in [0, 1, 2, 3, 4]]
         else:
@@ -629,9 +630,10 @@ def compare_models(model1, model2, model1_type: str, model2_type: str, pos_len: 
 
 
 def verify_onnx_model(onnx_path: str, original_model: Model, pos_len: int = 19, 
-                      batch_size: int = 1, calib_data_dir: str = None) -> bool:
+                      batch_size: int = 1, calib_data_dir: str = None,
+                      disable_mask: bool = False) -> bool:
     torch.nn.RMSNorm.forward = original_rms_norm_forward
-    return compare_models(original_model, onnx_path, 'pytorch', 'onnx', pos_len, batch_size, calib_data_dir)
+    return compare_models(original_model, onnx_path, 'pytorch', 'onnx', pos_len, batch_size, calib_data_dir, disable_mask=disable_mask)
 
 
 if __name__ == "__main__":
@@ -750,7 +752,7 @@ if __name__ == "__main__":
         export_model = float_swa_model if (use_swa and float_swa_model is not None) else float_model
         
         logging.info("Comparing original QAT model with converted float model...")
-        compare_models(qat_model_to_compare, export_model, 'pytorch', 'pytorch', pos_len, batch_size, calib_data)
+        compare_models(qat_model_to_compare, export_model, 'pytorch', 'pytorch', pos_len, batch_size, calib_data, disable_mask=disable_mask)
         
         # Now we proceed with the float model as the one to export
         is_qat = False 
@@ -805,7 +807,7 @@ if __name__ == "__main__":
     # Verify the exported model
     if not skip_verification:
         logging.info("Verifying exported ONNX model...")
-        verification_passed = verify_onnx_model(onnx_path, export_model, pos_len, batch_size, calib_data_dir=calib_data)
+        verification_passed = verify_onnx_model(onnx_path, export_model, pos_len, batch_size, calib_data_dir=calib_data, disable_mask=disable_mask)
         
         if not verification_passed:
             logging.error("ONNX model verification failed!")
@@ -864,7 +866,7 @@ if __name__ == "__main__":
             # Verify the quantized model
             if not skip_verification:
                 logging.info("Verifying quantized INT8 model...")
-                int8_verification_passed = verify_onnx_model(onnx_int8_path, export_model, pos_len, batch_size, calib_data_dir=calib_data)
+                int8_verification_passed = verify_onnx_model(onnx_int8_path, export_model, pos_len, batch_size, calib_data_dir=calib_data, disable_mask=disable_mask)
                 if not int8_verification_passed:
                     logging.warning("INT8 model verification failed! (This is common for INT8, check accuracy manually)")
             else:

@@ -90,6 +90,7 @@ def main():
     parser.add_argument('-use-swa', help='Use SWA model if available', action='store_true')
     parser.add_argument('-swa-index', help='Index of SWA model to use (default 0)', type=int, default=0)
     parser.add_argument('-history-matrices-type', help='History matrices mode: "go", "gomoku", "none", or empty', type=str, default="")
+    parser.add_argument('-disable-mask', help='Disable model mask handling. Required for circular-boundary CNN validation.', action='store_true')
     parser.add_argument('-symmetry-type', help='Data symmetry type', type=str, default="none")
     parser.add_argument('-max-batches', help='Max batches to validate', type=int, default=None)
     parser.add_argument('-no-compile', help='Do not torch.compile', action='store_true')
@@ -116,6 +117,7 @@ def main():
     use_swa = args.use_swa
     swa_index = args.swa_index
     history_matrices_type = args.history_matrices_type
+    disable_mask = args.disable_mask
     symmetry_type = args.symmetry_type
     max_batches = args.max_batches
     no_compile = args.no_compile
@@ -235,7 +237,8 @@ def main():
             model_outputs = model(
                 batch["binaryInputNCHW"],
                 batch["globalInputNC"],
-                batch.get("metadataInputNC") # Pass if exists
+                input_meta=batch.get("metadataInputNC"),
+                disable_mask=disable_mask,
             )
             
             postprocessed = raw_model.postprocess_output(model_outputs)

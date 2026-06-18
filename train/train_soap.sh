@@ -71,6 +71,7 @@ time python -u ./train_soap.py \
      -swa-period-samples 500000 \
      -max-val-samples 20000 \
      -history-matrices-type "go" \
+     -disable-mask \
      $EXTRAFLAG \
      "$@" \
      2>&1 | tee -a "$BASEDIR"/train/"$TRAININGNAME"/stdout.txt
