@@ -1056,6 +1056,45 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, cos: torch.Tensor, sin:
 
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
+def compute_learnable_rope_cos_sin(s_x: torch.Tensor, s_y: torch.Tensor, freqs: torch.Tensor):
+    """
+    Compute cos/sin rotation tables from spatial positions and learnable 2D frequencies.
+    s_x: (...,) float tensor of column positions
+    s_y: (...,) float tensor of row positions
+    freqs: (num_kv_heads, head_dim/2, 2) learnable (omega_x, omega_y) frequencies
+    Returns: (cos, sin), each shaped (..., num_kv_heads, head_dim/2)
+    """
+    angles = s_x.unsqueeze(-1).unsqueeze(-1) * freqs[:, :, 0] + s_y.unsqueeze(-1).unsqueeze(-1) * freqs[:, :, 1]
+    return torch.cos(angles), torch.sin(angles)
+
+def apply_learnable_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    cos_q: torch.Tensor,
+    sin_q: torch.Tensor,
+    cos_k: torch.Tensor,
+    sin_k: torch.Tensor,
+):
+    """
+    Apply learnable rotary embeddings to Q/K tensors.
+    xq: (Batch, Seq, num_heads, Dim)
+    xk: (Batch, Seq, num_kv_heads, Dim)
+    cos_q/sin_q: (Seq, num_heads, Dim/2)
+    cos_k/sin_k: (Seq, num_kv_heads, Dim/2)
+    """
+    def _rotate(x, cos, sin):
+        batch_size, seq_len, num_heads, head_dim = x.shape
+        num_pairs = head_dim // 2
+        x_pairs = x.view(batch_size, seq_len, num_heads, num_pairs, 2)
+        x0, x1 = x_pairs.unbind(dim=-1)
+        if cos.dim() == 3:
+            cos = cos.unsqueeze(0)
+            sin = sin.unsqueeze(0)
+        out = torch.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], dim=-1)
+        return out.reshape(batch_size, seq_len, num_heads, head_dim).type_as(x)
+
+    return _rotate(xq, cos_q, sin_q), _rotate(xk, cos_k, sin_k)
+
 class TransformerRoPEGQABlock(torch.nn.Module):
     def __init__(
         self,
@@ -1076,6 +1115,7 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         # --- GQA Config ---
         self.num_heads = config.get("transformer_heads", 4)             # Query Heads
         self.num_kv_heads = config.get("transformer_kv_heads", self.num_heads) # KV Heads (Key/Value)
+        self.learnable_rope = config.get("learnable_rope", False) if self.use_rope else False
         
         # Compute how many query heads each KV head serves (group size)
         self.n_rep = self.num_heads // self.num_kv_heads
@@ -1083,7 +1123,11 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         self.head_dim = c_main // self.num_heads
         
         assert self.head_dim * self.num_heads == c_main, "Embed dim mismatch"
-        assert self.head_dim % 4 == 0, "Head dim mismatch for 2D RoPE"
+        if self.use_rope:
+            if self.learnable_rope:
+                assert self.head_dim % 2 == 0, "Head dim mismatch for learnable RoPE"
+            else:
+                assert self.head_dim % 4 == 0, "Head dim mismatch for 2D RoPE"
         assert self.num_heads % self.num_kv_heads == 0, \
             f"Query heads ({self.num_heads}) must be divisible by KV heads ({self.num_kv_heads})"
 
@@ -1098,11 +1142,24 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         # Cache cos and sin
         # Assume precompute_freqs_cos_sin_2d_fixed is defined externally
         if self.use_rope:
-            self.rope_theta = config.get("rope_theta", 100.0) # KV Heads (Key/Value)
-            assert self.rope_theta > pos_len * 2.0, f"theta={self.rope_theta} of RoPE may be too small for pos_len={pos_len}"
-            cos_cached, sin_cached = precompute_freqs_cos_sin_2d(self.head_dim, pos_len, self.rope_theta)
-            self.register_buffer("cos_cached", cos_cached, persistent=False)
-            self.register_buffer("sin_cached", sin_cached, persistent=False)
+            if self.learnable_rope:
+                num_pairs = self.head_dim // 2
+                log_lo = math.log(1.0 / 50.0)
+                log_hi = math.log(1.0)
+                init_freqs = (
+                    torch.exp(torch.empty(self.num_kv_heads, num_pairs, 2).uniform_(log_lo, log_hi))
+                    * (torch.randint(0, 2, (self.num_kv_heads, num_pairs, 2)) * 2 - 1).float()
+                )
+                self.rope_freqs = torch.nn.Parameter(init_freqs)
+                self.pos_len = pos_len
+                self.cos_cached = None
+                self.sin_cached = None
+            else:
+                self.rope_theta = config.get("rope_theta", 100.0) # KV Heads (Key/Value)
+                assert self.rope_theta > pos_len * 2.0, f"theta={self.rope_theta} of RoPE may be too small for pos_len={pos_len}"
+                cos_cached, sin_cached = precompute_freqs_cos_sin_2d(self.head_dim, pos_len, self.rope_theta)
+                self.register_buffer("cos_cached", cos_cached, persistent=False)
+                self.register_buffer("sin_cached", sin_cached, persistent=False)
         else:
             self.cos_cached = None
             self.sin_cached = None
@@ -1137,6 +1194,12 @@ class TransformerRoPEGQABlock(torch.nn.Module):
 
     def initialize(self, fixup_scale):
         pass
+
+    def set_brenorm_params(self, renorm_avg_momentum: float, rmax: float, dmax: float):
+        pass
+
+    def add_brenorm_clippage(self, upper_rclippage, lower_rclippage, dclippage):
+        pass
         
     def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[Dict] = None):
         batch_size, channels, height, width = x.shape
@@ -1160,7 +1223,20 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         
         # 3. Apply RoPE (Broadcasting works here automatically)
         if self.use_rope:
-            q, k = apply_rotary_emb(q, k, self.cos_cached, self.sin_cached)
+            if self.learnable_rope:
+                s_idx = torch.arange(seq_len, device=q.device)
+                s_y = (s_idx // width).float()
+                s_x = (s_idx % width).float()
+                cos_k, sin_k = compute_learnable_rope_cos_sin(s_x, s_y, self.rope_freqs)
+                if self.n_rep > 1:
+                    cos_q = cos_k.unsqueeze(-2).expand(*cos_k.shape[:-1], self.n_rep, cos_k.shape[-1]).reshape(*cos_k.shape[:-2], self.num_heads, -1)
+                    sin_q = sin_k.unsqueeze(-2).expand(*sin_k.shape[:-1], self.n_rep, sin_k.shape[-1]).reshape(*sin_k.shape[:-2], self.num_heads, -1)
+                else:
+                    cos_q = cos_k
+                    sin_q = sin_k
+                q, k = apply_learnable_rotary_emb(q, k, cos_q, sin_q, cos_k, sin_k)
+            else:
+                q, k = apply_rotary_emb(q, k, self.cos_cached, self.sin_cached)
         
         # 4. Permute to (B, H, S, D)
         q = q.permute(0, 2, 1, 3) 
@@ -1443,6 +1519,116 @@ class NestedBottleneckResBlock(torch.nn.Module):
         out = self.normactconvp(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
         for i in range(self.internal_length):
             out = self.blockstack[i](out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+        out = self.normactconvq(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+        result = x + out
+        if extra_outputs is not None:
+            extra_outputs.report(self.name+".out", result)
+        return result
+
+
+class NestedBottleneckTransformerBlock(torch.nn.Module):
+    def __init__(
+        self,
+        name: str,
+        internal_length: int,
+        c_main: int,
+        c_mid: int,
+        config: modelconfigs.ModelConfig,
+        activation: str,
+        pos_len: int,
+        use_swiglu: bool,
+        use_rope: bool = True,
+    ):
+        super(NestedBottleneckTransformerBlock, self).__init__()
+        self.name = name
+        self.norm_kind = config["norm_kind"]
+        self.internal_length = internal_length
+        assert internal_length >= 1
+
+        self.normactconvp = NormActConv(
+            name=name+".normactconvp",
+            c_in=c_main,
+            c_out=c_mid,
+            c_gpool=None,
+            config=config,
+            activation=activation,
+            kernel_size=1,
+            fixup_use_gamma=False,
+        )
+
+        self.blockstack = torch.nn.ModuleList()
+        for i in range(self.internal_length):
+            self.blockstack.append(TransformerRoPEGQABlock(
+                name=name+".blockstack."+str(i),
+                c_main=c_mid,
+                config=config,
+                activation=activation,
+                pos_len=pos_len,
+                use_swiglu=use_swiglu,
+                use_rope=use_rope,
+            ))
+
+        self.normactconvq = NormActConv(
+            name=name+".normactconvq",
+            c_in=c_mid,
+            c_out=c_main,
+            c_gpool=None,
+            config=config,
+            activation=activation,
+            kernel_size=1,
+            fixup_use_gamma=True,
+        )
+
+    def initialize(self, fixup_scale):
+        if self.norm_kind == "fixup":
+            inner_scale = math.pow(fixup_scale, 1.0 / (1.0 + self.internal_length))
+            self.normactconvp.initialize(scale=inner_scale)
+            for block in self.blockstack:
+                block.initialize(fixup_scale=inner_scale)
+            self.normactconvq.initialize(scale=0.0)
+        elif self.norm_kind == "fixscale" or self.norm_kind == "fixbrenorm" or self.norm_kind == "fixscaleonenorm":
+            self.normactconvp.initialize(scale=1.0, norm_scale=fixup_scale)
+            for i, block in enumerate(self.blockstack):
+                block.initialize(fixup_scale=1.0 / math.sqrt(i+1.0))
+            self.normactconvq.initialize(scale=1.0, norm_scale=1.0 / math.sqrt(self.internal_length+1.0))
+        else:
+            self.normactconvp.initialize(scale=1.0)
+            for block in self.blockstack:
+                block.initialize(fixup_scale=1.0)
+            self.normactconvq.initialize(scale=1.0)
+
+    def add_reg_dict(self, reg_dict:Dict[str,List]):
+        self.normactconvp.add_reg_dict(reg_dict)
+        for block in self.blockstack:
+            block.add_reg_dict(reg_dict)
+        self.normactconvq.add_reg_dict(reg_dict)
+
+    def set_brenorm_params(self, renorm_avg_momentum: float, rmax: float, dmax: float):
+        self.normactconvp.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
+        for block in self.blockstack:
+            block.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
+        self.normactconvq.set_brenorm_params(renorm_avg_momentum, rmax, dmax)
+
+    def add_brenorm_clippage(self, upper_rclippage, lower_rclippage, dclippage):
+        self.normactconvp.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
+        for block in self.blockstack:
+            block.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
+        self.normactconvq.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
+
+    def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[ExtraOutputs]):
+        """
+        Parameters:
+        x: NCHW
+        mask: N1HW
+        mask_sum_hw: N111
+        mask_sum: scalar
+
+        Returns: NCHW
+        """
+        out = x
+        out = self.normactconvp(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+        for block in self.blockstack:
+            out = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
         out = self.normactconvq(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
         result = x + out
         if extra_outputs is not None:
@@ -2112,6 +2298,42 @@ class Model(torch.nn.Module):
                 self.blocks.append(TransformerRoPEGQABlock(
                     name=block_name,
                     c_main=self.c_trunk,
+                    config=self.config,
+                    activation=self.activation,
+                    pos_len=pos_len,
+                    use_swiglu=True,
+                    use_rope=True
+                ))
+            elif block_kind == "bottlenest2transformerrope":
+                self.blocks.append(NestedBottleneckTransformerBlock(
+                    name=block_name,
+                    internal_length=2,
+                    c_main=self.c_trunk,
+                    c_mid=self.c_mid,
+                    config=self.config,
+                    activation=self.activation,
+                    pos_len=pos_len,
+                    use_swiglu=False,
+                    use_rope=True
+                ))
+            elif block_kind == "bottlenest2transformerropesg":
+                self.blocks.append(NestedBottleneckTransformerBlock(
+                    name=block_name,
+                    internal_length=2,
+                    c_main=self.c_trunk,
+                    c_mid=self.c_mid,
+                    config=self.config,
+                    activation=self.activation,
+                    pos_len=pos_len,
+                    use_swiglu=True,
+                    use_rope=True
+                ))
+            elif block_kind == "bottlenest3transformerropesg":
+                self.blocks.append(NestedBottleneckTransformerBlock(
+                    name=block_name,
+                    internal_length=3,
+                    c_main=self.c_trunk,
+                    c_mid=self.c_mid,
                     config=self.config,
                     activation=self.activation,
                     pos_len=pos_len,

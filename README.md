@@ -16,6 +16,8 @@ The implementation can be found in `./train/muon_kissin.py` (adapted for KataGo 
 ### Transformer Architecture
 The transformer architecture shares similarities with **QWen3**.
 *   **Components**: Uses **RoPE** (Rotary Positional Embeddings), **SwiGLU**, and **RMSNorm**. These components have been verified to provide stable performance.
+    *   Use `tflrs` model aliases or add `-lrope` to transformer RoPE model names for learnable 2D RoPE frequencies, e.g. `b14c192h6tflrs-bng-silu` or `b14c192h6tfrs-bng-silu-lrope`.
+    *   `nbttflrs` models use nested bottleneck transformer blocks: 1x1 channel reduction, transformer blocks in the bottleneck, then 1x1 expansion back to trunk channels.
 *   **GQA**: Grouped Query Attention (GQA) is currently **disabled** by default due to the lack of a highly optimized implementation.
 
 **Source Code**: `TransformerRoPEGQABlock` class in `./train/model_pytorch.py`.
@@ -23,6 +25,7 @@ The transformer architecture shares similarities with **QWen3**.
 **Configurations**:
 Pre-defined model configurations are available in `./train/modelconfigs.py`.
 *   Example `b14c192h6tfrs`: 14 layers, 192 hidden size, 6 QKV heads, 512 feedforward size, with RoPE and SwiGLU.
+*   Example `b4c256h4nbttflrs`: 4 nested bottleneck transformer blocks, 256 trunk channels, 128 bottleneck channels, 4 heads, learnable RoPE, and SwiGLU.
 
 ---
 
@@ -72,6 +75,7 @@ Parameters can be modified in `./train/train_muon_ki.sh` or passed as arguments 
 *   **Model Structure**: `b14c192h6tfrs` is a pre-defined structure in `./train/modelconfigs.py`. You can modify this file to define custom architectures.
 *   **Postfixes**:
     *   `-bng-silu`: Recommended. Enables Batch Normalization in Conv layers and SiLU activation in Transformer layers.
+    *   `-lrope` / `tflrs`: Uses learnable 2D RoPE frequencies instead of fixed axis-aligned RoPE tables.
     *   `-v11`: Use version 11 of the model input features (common for games other than Go).
 
 ---

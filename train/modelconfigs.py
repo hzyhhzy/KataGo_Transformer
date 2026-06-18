@@ -1834,6 +1834,170 @@ b80c256h8tfrs = {
     "num_scorebeliefs":8,
     "v2_size":144,
 }
+
+def _nbttflrs_config(
+    num_blocks: int,
+    trunk_num_channels: int,
+    mid_num_channels: int,
+    transformer_ffn_channels: int,
+    transformer_heads: int,
+    gpool_num_channels: int,
+    p1_num_channels: int,
+    g1_num_channels: int,
+    v1_num_channels: int,
+    sbv2_num_channels: int,
+    num_scorebeliefs: int,
+    v2_size: int,
+    internal_length: int = 2,
+):
+    block_kind = "bottlenest" + str(internal_length) + "transformerropesg"
+    return {
+        "version":15,
+        "norm_kind":"fixup",
+        "bnorm_epsilon": 1e-4,
+        "bnorm_running_avg_momentum": 0.001,
+        "initial_conv_1x1": False,
+        "trunk_num_channels":trunk_num_channels,
+        "mid_num_channels":mid_num_channels,
+        "gpool_num_channels":gpool_num_channels,
+        "transformer_ffn_channels":transformer_ffn_channels,
+        "transformer_heads":transformer_heads,
+        "transformer_kv_heads":transformer_heads,
+        "learnable_rope":True,
+        "use_attention_pool":False,
+        "num_attention_pool_heads":4,
+        "block_kind": [
+            ["block"+str(i), block_kind] for i in range(1, num_blocks+1)
+        ],
+        "p1_num_channels":p1_num_channels,
+        "g1_num_channels":g1_num_channels,
+        "v1_num_channels":v1_num_channels,
+        "sbv2_num_channels":sbv2_num_channels,
+        "num_scorebeliefs":num_scorebeliefs,
+        "v2_size":v2_size,
+    }
+
+b4c256h4nbttflrs = _nbttflrs_config(
+    num_blocks=4,
+    trunk_num_channels=256,
+    mid_num_channels=128,
+    transformer_ffn_channels=384,
+    transformer_heads=4,
+    gpool_num_channels=32,
+    p1_num_channels=32,
+    g1_num_channels=32,
+    v1_num_channels=32,
+    sbv2_num_channels=64,
+    num_scorebeliefs=6,
+    v2_size=80,
+)
+
+b5c384h6nbttflrs = _nbttflrs_config(
+    num_blocks=5,
+    trunk_num_channels=384,
+    mid_num_channels=192,
+    transformer_ffn_channels=512,
+    transformer_heads=6,
+    gpool_num_channels=32,
+    p1_num_channels=32,
+    g1_num_channels=32,
+    v1_num_channels=32,
+    sbv2_num_channels=80,
+    num_scorebeliefs=8,
+    v2_size=96,
+)
+
+b6c384h6nbttflrs = _nbttflrs_config(
+    num_blocks=6,
+    trunk_num_channels=384,
+    mid_num_channels=192,
+    transformer_ffn_channels=512,
+    transformer_heads=6,
+    gpool_num_channels=32,
+    p1_num_channels=32,
+    g1_num_channels=32,
+    v1_num_channels=32,
+    sbv2_num_channels=80,
+    num_scorebeliefs=8,
+    v2_size=96,
+)
+
+b7c384h6nbttflrs = _nbttflrs_config(
+    num_blocks=7,
+    trunk_num_channels=384,
+    mid_num_channels=192,
+    transformer_ffn_channels=512,
+    transformer_heads=6,
+    gpool_num_channels=32,
+    p1_num_channels=32,
+    g1_num_channels=32,
+    v1_num_channels=32,
+    sbv2_num_channels=80,
+    num_scorebeliefs=8,
+    v2_size=96,
+)
+
+b10c384h6nbttflrs = _nbttflrs_config(
+    num_blocks=10,
+    trunk_num_channels=384,
+    mid_num_channels=192,
+    transformer_ffn_channels=512,
+    transformer_heads=6,
+    gpool_num_channels=48,
+    p1_num_channels=48,
+    g1_num_channels=48,
+    v1_num_channels=96,
+    sbv2_num_channels=96,
+    num_scorebeliefs=8,
+    v2_size=96,
+)
+
+b9c768h12nbttflrs = _nbttflrs_config(
+    num_blocks=9,
+    trunk_num_channels=768,
+    mid_num_channels=384,
+    transformer_ffn_channels=1024,
+    transformer_heads=12,
+    gpool_num_channels=64,
+    p1_num_channels=64,
+    g1_num_channels=64,
+    v1_num_channels=128,
+    sbv2_num_channels=128,
+    num_scorebeliefs=8,
+    v2_size=128,
+)
+
+b15c512h8nbttflrs = _nbttflrs_config(
+    num_blocks=15,
+    trunk_num_channels=512,
+    mid_num_channels=256,
+    transformer_ffn_channels=768,
+    transformer_heads=8,
+    gpool_num_channels=64,
+    p1_num_channels=64,
+    g1_num_channels=64,
+    v1_num_channels=128,
+    sbv2_num_channels=128,
+    num_scorebeliefs=8,
+    v2_size=128,
+)
+
+b10c512h8nbt3tflrs = _nbttflrs_config(
+    num_blocks=10,
+    trunk_num_channels=512,
+    mid_num_channels=256,
+    transformer_ffn_channels=768,
+    transformer_heads=8,
+    gpool_num_channels=64,
+    p1_num_channels=64,
+    g1_num_channels=64,
+    v1_num_channels=128,
+    sbv2_num_channels=128,
+    num_scorebeliefs=8,
+    v2_size=128,
+    internal_length=3,
+)
+
 sandbox = {
     "version":15,
     "norm_kind":"fixup",
@@ -1943,9 +2107,14 @@ base_config_of_name = {
     "b12c384h12tfrs":b12c384h12tfrs, 
     "b24c256h8tfrs":b24c256h8tfrs, 
     "b46c192h6tfrs":b46c192h6tfrs, 
+    "b4c256h4nbttflrs":b4c256h4nbttflrs,
+    "b5c384h6nbttflrs":b5c384h6nbttflrs,
+    "b6c384h6nbttflrs":b6c384h6nbttflrs,
+    "b7c384h6nbttflrs":b7c384h6nbttflrs,
 
 # 32M parameter
     "b18c384h12tfrs":b18c384h12tfrs, 
+    "b10c384h6nbttflrs":b10c384h6nbttflrs,
 
 # 70M parameter:
     "b10c768h24tfrs":b10c768h24tfrs, 
@@ -1953,6 +2122,9 @@ base_config_of_name = {
     "b40c384h12tfrs":b40c384h12tfrs, 
     "b40c384h12tfr":b40c384h12tfr, 
     "b80c256h8tfrs":b80c256h8tfrs, 
+    "b9c768h12nbttflrs":b9c768h12nbttflrs,
+    "b15c512h8nbttflrs":b15c512h8nbttflrs,
+    "b10c512h8nbt3tflrs":b10c512h8nbt3tflrs,
     
     "b40c512h16tfrs":b40c512h16tfrs, 
     "sandbox": sandbox,
@@ -1962,6 +2134,17 @@ config_of_name = {}
 for name, base_config in base_config_of_name.items():
     config = base_config.copy()
     config_of_name[name] = config
+
+for name, base_config in list(config_of_name.items()):
+    if any("transformerrope" in block_kind for _, block_kind in base_config["block_kind"]):
+        if name.endswith("tfrs"):
+            config = base_config.copy()
+            config["learnable_rope"] = True
+            config_of_name[name[:-4]+"tflrs"] = config
+        elif name.endswith("tfr"):
+            config = base_config.copy()
+            config["learnable_rope"] = True
+            config_of_name[name[:-3]+"tflr"] = config
 
 
 for name, base_config in list(config_of_name.items()):
@@ -2030,6 +2213,15 @@ for name, base_config in list(config_of_name.items()):
     config = base_config.copy()
     config["activation"] = "silu"
     config_of_name[name+"-silu"] = config
+
+for name, base_config in list(config_of_name.items()):
+    if (
+        not base_config.get("learnable_rope", False)
+        and any("transformerrope" in block_kind for _, block_kind in base_config["block_kind"])
+    ):
+        config = base_config.copy()
+        config["learnable_rope"] = True
+        config_of_name[name+"-lrope"] = config
 
 for name, base_config in list(config_of_name.items()):
     config = base_config.copy()
