@@ -2130,6 +2130,21 @@ base_config_of_name = {
     "sandbox": sandbox,
 }
 
+def _is_pure_transformer_trunk(config: ModelConfig):
+    supported_block_kinds = {
+        "transformer",
+        "transformerg",
+        "transformersg",
+        "transformerropeg",
+        "transformerropesg",
+    }
+    for _, block_kind in config["block_kind"]:
+        if block_kind.endswith("gpool"):
+            return False
+        if block_kind not in supported_block_kinds:
+            return False
+    return True
+
 config_of_name = {}
 for name, base_config in base_config_of_name.items():
     config = base_config.copy()
@@ -2145,6 +2160,14 @@ for name, base_config in list(config_of_name.items()):
             config = base_config.copy()
             config["learnable_rope"] = True
             config_of_name[name[:-3]+"tflr"] = config
+
+for name, base_config in list(config_of_name.items()):
+    if _is_pure_transformer_trunk(base_config):
+        config = base_config.copy()
+        config["trunk_odd_half"] = True
+        config["transformer_trunk_nhwc"] = True
+        config["transformer_block_reshape_nchw_to_nlc"] = False
+        config_of_name[name+"-oddhalf"] = config
 
 
 for name, base_config in list(config_of_name.items()):

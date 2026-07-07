@@ -886,6 +886,11 @@ class TransformerBlock(torch.nn.Module):
         super(TransformerBlock, self).__init__()
         self.name = name
         self.norm_kind = config["norm_kind"]
+        self.c_main = c_main
+        self.transformer_trunk_nhwc = config.get("transformer_trunk_nhwc", config.get("trunk_odd_half", False))
+        self.reshape_nchw_to_nlc = config.get("transformer_block_reshape_nchw_to_nlc", not self.transformer_trunk_nhwc)
+        if self.transformer_trunk_nhwc:
+            assert not self.reshape_nchw_to_nlc, "NHWC/NLC transformer trunk must not reshape NCHW inside each block"
         self.ffn_dim = config["transformer_ffn_channels"] if "transformer_ffn_channels" in config else c_main*2
         
 
@@ -955,18 +960,29 @@ class TransformerBlock(torch.nn.Module):
             
                 
     def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[ExtraOutputs]):
-        # Convert NCHW to NLC since transformer expects sequence input
-        batch_size, channels, height, width = x.shape
-        x = x.view(batch_size, channels, -1).permute(0, 2, 1)  # (H*W, N, C)
+        if self.reshape_nchw_to_nlc:
+            batch_size, channels, height, width = x.shape
+            assert channels == self.c_main
+            x = x.view(batch_size, channels, -1).permute(0, 2, 1)
+            seq_len = height * width
+        else:
+            assert x.dim() == 3, "NHWC/NLC transformer trunk expects input shaped (N, L, C)"
+            batch_size, seq_len, channels = x.shape
+            assert channels == self.c_main
         
         x1 = self.norm1(x)
         
-        # Convert mask from N1HW to N(H*W)
-        mask1 = mask.view(batch_size, -1)  # (N, H*W)
+        if mask is not None:
+            mask1 = mask.view(batch_size, -1)
+            assert mask1.shape[1] == seq_len
+            key_padding_mask = (mask1 == 0)
+        else:
+            key_padding_mask = None
+
         # Self-attention
         attn_output, _ = self.attention(
             x1, x1, x1,
-            key_padding_mask=(mask1==0)
+            key_padding_mask=key_padding_mask
         )
         x = x + attn_output
         x = self.norm2(x)
@@ -977,8 +993,8 @@ class TransformerBlock(torch.nn.Module):
         x1 = self.ffn_linear2(x1)
         x = x + x1
         
-        # Convert NLC back to NCHW
-        x = x.permute(0, 2, 1).view(batch_size, channels, height, width)
+        if self.reshape_nchw_to_nlc:
+            x = x.permute(0, 2, 1).view(batch_size, channels, height, width)
 
         return x
 
@@ -1019,6 +1035,12 @@ def precompute_freqs_cos_sin_2d(dim: int, pos_len: int, theta: float = 100.0):
     
     # 7. Return cos, sin
     return emb.cos(), emb.sin()
+
+def get_odd_half_board_indices(pos_len: int):
+    indices = torch.arange(pos_len * pos_len, dtype=torch.long)
+    y = torch.div(indices, pos_len, rounding_mode='floor')
+    x = indices % pos_len
+    return indices[((x + y) % 2) == 1]
 
 # --- 2. Rewrite: real-valued version of Apply function ---
 
@@ -1109,6 +1131,12 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         super(TransformerRoPEGQABlock, self).__init__()
         self.name = name
         self.norm_kind = config.get("norm_kind", "layer")
+        self.c_main = c_main
+        self.trunk_odd_half = config.get("trunk_odd_half", False)
+        self.transformer_trunk_nhwc = config.get("transformer_trunk_nhwc", self.trunk_odd_half)
+        self.reshape_nchw_to_nlc = config.get("transformer_block_reshape_nchw_to_nlc", not self.transformer_trunk_nhwc)
+        if self.transformer_trunk_nhwc:
+            assert not self.reshape_nchw_to_nlc, "NHWC/NLC transformer trunk must not reshape NCHW inside each block"
         self.ffn_dim = config.get("transformer_ffn_channels", c_main * 2)
         self.use_swiglu = use_swiglu  
         self.use_rope = use_rope
@@ -1141,6 +1169,14 @@ class TransformerRoPEGQABlock(torch.nn.Module):
 
         # Cache cos and sin
         # Assume precompute_freqs_cos_sin_2d_fixed is defined externally
+        if self.transformer_trunk_nhwc:
+            if self.trunk_odd_half:
+                rope_position_indices = get_odd_half_board_indices(pos_len)
+            else:
+                rope_position_indices = torch.arange(pos_len * pos_len, dtype=torch.long)
+        else:
+            rope_position_indices = None
+
         if self.use_rope:
             if self.learnable_rope:
                 num_pairs = self.head_dim // 2
@@ -1154,15 +1190,26 @@ class TransformerRoPEGQABlock(torch.nn.Module):
                 self.pos_len = pos_len
                 self.cos_cached = None
                 self.sin_cached = None
+                if rope_position_indices is not None:
+                    self.register_buffer("rope_position_x", (rope_position_indices % pos_len).float(), persistent=False)
+                    self.register_buffer("rope_position_y", torch.div(rope_position_indices, pos_len, rounding_mode='floor').float(), persistent=False)
+                else:
+                    self.rope_position_x = None
+                    self.rope_position_y = None
             else:
                 self.rope_theta = config.get("rope_theta", 100.0) # KV Heads (Key/Value)
                 assert self.rope_theta > pos_len * 2.0, f"theta={self.rope_theta} of RoPE may be too small for pos_len={pos_len}"
                 cos_cached, sin_cached = precompute_freqs_cos_sin_2d(self.head_dim, pos_len, self.rope_theta)
+                if rope_position_indices is not None:
+                    cos_cached = cos_cached.index_select(0, rope_position_indices)
+                    sin_cached = sin_cached.index_select(0, rope_position_indices)
                 self.register_buffer("cos_cached", cos_cached, persistent=False)
                 self.register_buffer("sin_cached", sin_cached, persistent=False)
         else:
             self.cos_cached = None
             self.sin_cached = None
+            self.rope_position_x = None
+            self.rope_position_y = None
 
         self.ffn_linear1 = torch.nn.Linear(c_main, self.ffn_dim, bias=False)
         if self.use_swiglu:
@@ -1202,8 +1249,16 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         pass
         
     def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[Dict] = None):
-        batch_size, channels, height, width = x.shape
-        x_in = x.view(batch_size, channels, -1).permute(0, 2, 1)
+        if self.reshape_nchw_to_nlc:
+            batch_size, channels, height, width = x.shape
+            assert channels == self.c_main
+            x_in = x.view(batch_size, channels, -1).permute(0, 2, 1)
+            seq_len = height * width
+        else:
+            assert x.dim() == 3, "NHWC/NLC transformer trunk expects input shaped (N, L, C)"
+            batch_size, seq_len, channels = x.shape
+            assert channels == self.c_main
+            x_in = x
         
         x_norm = self.norm1(x_in)
         
@@ -1211,8 +1266,6 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         q = self.q_proj(x_norm)
         k = self.k_proj(x_norm)
         v = self.v_proj(x_norm)
-        
-        seq_len = height * width
         
         # 2. Reshape for RoPE
         # Q: (B, S, Num_Heads, D)
@@ -1224,9 +1277,14 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         # 3. Apply RoPE (Broadcasting works here automatically)
         if self.use_rope:
             if self.learnable_rope:
-                s_idx = torch.arange(seq_len, device=q.device)
-                s_y = (s_idx // width).float()
-                s_x = (s_idx % width).float()
+                if self.rope_position_x is not None:
+                    assert self.rope_position_x.shape[0] == seq_len
+                    s_x = self.rope_position_x
+                    s_y = self.rope_position_y
+                else:
+                    s_idx = torch.arange(seq_len, device=q.device)
+                    s_y = (s_idx // width).float()
+                    s_x = (s_idx % width).float()
                 cos_k, sin_k = compute_learnable_rope_cos_sin(s_x, s_y, self.rope_freqs)
                 if self.n_rep > 1:
                     cos_q = cos_k.unsqueeze(-2).expand(*cos_k.shape[:-1], self.n_rep, cos_k.shape[-1]).reshape(*cos_k.shape[:-2], self.num_heads, -1)
@@ -1236,6 +1294,7 @@ class TransformerRoPEGQABlock(torch.nn.Module):
                     sin_q = sin_k
                 q, k = apply_learnable_rotary_emb(q, k, cos_q, sin_q, cos_k, sin_k)
             else:
+                assert self.cos_cached.shape[0] == seq_len
                 q, k = apply_rotary_emb(q, k, self.cos_cached, self.sin_cached)
         
         # 4. Permute to (B, H, S, D)
@@ -1299,7 +1358,8 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         x1 = self.ffn_linear2(x1)
         x = x + x1
         
-        x = x.permute(0, 2, 1).view(batch_size, channels, height, width)
+        if self.reshape_nchw_to_nlc:
+            x = x.permute(0, 2, 1).view(batch_size, channels, height, width)
         return x
         
 class BottleneckResBlock(torch.nn.Module):
@@ -2111,6 +2171,13 @@ class Model(torch.nn.Module):
         self.num_scorebeliefs = config["num_scorebeliefs"]
         self.num_total_blocks = len(self.block_kind)
         self.pos_len = pos_len
+        self.trunk_odd_half = config.get("trunk_odd_half", False)
+        if self.trunk_odd_half:
+            assert config.get("transformer_trunk_nhwc", True), "trunk_odd_half requires transformer_trunk_nhwc"
+            assert not config.get("transformer_block_reshape_nchw_to_nlc", False), "trunk_odd_half requires transformer_block_reshape_nchw_to_nlc=False"
+            self.register_buffer("trunk_odd_half_indices", get_odd_half_board_indices(pos_len), persistent=False)
+        else:
+            self.trunk_odd_half_indices = None
 
         if config["version"] <= 12 or (config["version"] >= 101 and config["version"] <= 199):
             self.td_score_multiplier = 20.0
@@ -2162,6 +2229,16 @@ class Model(torch.nn.Module):
             if block_kind.endswith("gpool"):
                 use_gpool_this_block = True
                 block_kind = block_kind[:-5]
+
+            if self.trunk_odd_half:
+                assert not use_gpool_this_block, "trunk_odd_half does not support gpool block variants"
+                assert block_kind in (
+                    "transformer",
+                    "transformerg",
+                    "transformersg",
+                    "transformerropeg",
+                    "transformerropesg",
+                ), f"trunk_odd_half only supports pure transformer trunk blocks, got {block_config[1]}"
 
             if block_kind == "regular":
                 self.blocks.append(ResBlock(
@@ -2475,6 +2552,33 @@ class Model(torch.nn.Module):
             self.intermediate_policy_head.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
             self.intermediate_value_head.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
 
+    def _crop_odd_half_trunk(self, x):
+        assert self.trunk_odd_half
+        batch_size, channels, height, width = x.shape
+        assert height == self.pos_len and width == self.pos_len
+        x = x.permute(0, 2, 3, 1).contiguous().view(batch_size, height * width, channels)
+        return x.index_select(1, self.trunk_odd_half_indices)
+
+    def _crop_odd_half_mask(self, mask):
+        assert self.trunk_odd_half
+        if mask is None:
+            return None
+        batch_size, channels, height, width = mask.shape
+        assert channels == 1
+        assert height == self.pos_len and width == self.pos_len
+        mask = mask.permute(0, 2, 3, 1).contiguous().view(batch_size, height * width, 1)
+        return mask.index_select(1, self.trunk_odd_half_indices)
+
+    def _restore_odd_half_trunk(self, x):
+        assert self.trunk_odd_half
+        assert x.dim() == 3
+        batch_size, seq_len, channels = x.shape
+        assert seq_len == self.trunk_odd_half_indices.shape[0]
+        full = x.new_zeros(batch_size, self.pos_len * self.pos_len, channels)
+        indices = self.trunk_odd_half_indices.view(1, seq_len, 1).expand(batch_size, seq_len, channels)
+        full = full.scatter(1, indices, x)
+        return full.view(batch_size, self.pos_len, self.pos_len, channels).permute(0, 3, 1, 2).contiguous()
+
     # Returns a tuple of tuples of outputs
     # The outer tuple indexes different sets of heads, such as if the net also computes intermediate heads.
     #   0 is the main output, 1 is intermediate.
@@ -2509,6 +2613,19 @@ class Model(torch.nn.Module):
             x_meta = self.metadata_encoder.forward(input_meta,extra_outputs)
             out = out + x_meta.unsqueeze(-1).unsqueeze(-1)
 
+        trunk_mask = mask
+        trunk_mask_sum_hw = mask_sum_hw
+        trunk_mask_sum = mask_sum
+        if self.trunk_odd_half:
+            out = self._crop_odd_half_trunk(out)
+            trunk_mask = self._crop_odd_half_mask(mask)
+            if trunk_mask is not None:
+                trunk_mask_sum_hw = torch.sum(trunk_mask, dim=1, keepdim=True).view(trunk_mask.shape[0], 1, 1, 1)
+                trunk_mask_sum = torch.sum(trunk_mask)
+            else:
+                trunk_mask_sum_hw = None
+                trunk_mask_sum = None
+
         # print("TENSOR BEFORE TRUNK")
         # print(out)
 
@@ -2518,7 +2635,7 @@ class Model(torch.nn.Module):
                 # print("TENSOR BEFORE BLOCK")
                 # print(count)
                 # print(out)
-                out = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+                out = block(out, mask=trunk_mask, mask_sum_hw=trunk_mask_sum_hw, mask_sum=trunk_mask_sum, extra_outputs=extra_outputs)
                 count += 1
                 
             #torch._dynamo.graph_break()
@@ -2527,7 +2644,7 @@ class Model(torch.nn.Module):
 
                 #torch._dynamo.graph_break()
                 # print("INTERMEDIATE")
-                iout = out
+                iout = self._restore_odd_half_trunk(out) if self.trunk_odd_half else out
                 iout = self.norm_intermediate_trunkfinal(iout, mask=mask, mask_sum=mask_sum)
                 iout = self.act_intermediate_trunkfinal(iout)
                 iout_policy = self.intermediate_policy_head(iout, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
@@ -2548,7 +2665,7 @@ class Model(torch.nn.Module):
                 # print("TENSOR BEFORE BLOCK")
                 # print(count)
                 # print(out)
-                out = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+                out = block(out, mask=trunk_mask, mask_sum_hw=trunk_mask_sum_hw, mask_sum=trunk_mask_sum, extra_outputs=extra_outputs)
                 count += 1
 
         else:
@@ -2557,8 +2674,11 @@ class Model(torch.nn.Module):
                 # print("TENSOR BEFORE BLOCK")
                 # print(count)
                 # print(out)
-                out = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+                out = block(out, mask=trunk_mask, mask_sum_hw=trunk_mask_sum_hw, mask_sum=trunk_mask_sum, extra_outputs=extra_outputs)
                 count += 1
+
+        if self.trunk_odd_half:
+            out = self._restore_odd_half_trunk(out)
 
         #torch._dynamo.graph_break() # torch.compile sometimes HAVE BUGS
         with autocast(enabled=False):
