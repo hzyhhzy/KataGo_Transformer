@@ -19,6 +19,31 @@ class TransformerOptimizationTests(unittest.TestCase):
     def tearDown(self):
         model_pytorch.LEARNED_ROPE_CAST_TO_INPUT_DTYPE = self.old_rope_cast
 
+    @staticmethod
+    def _small_odd_half_config():
+        config = copy.deepcopy(modelconfigs.config_of_name["b11c96h4tflrs-bng-silu"])
+        config.update(
+            {
+                "trunk_num_channels": 16,
+                "mid_num_channels": 16,
+                "gpool_num_channels": 8,
+                "transformer_ffn_channels": 24,
+                "transformer_heads": 2,
+                "transformer_kv_heads": 2,
+                "num_attention_pool_heads": 2,
+                "block_kind": [["rconv1", "transformerropesg"]],
+                "p1_num_channels": 8,
+                "g1_num_channels": 8,
+                "v1_num_channels": 8,
+                "sbv2_num_channels": 8,
+                "v2_size": 16,
+                "trunk_odd_half": True,
+                "transformer_trunk_nhwc": True,
+                "transformer_block_reshape_nchw_to_nlc": False,
+            }
+        )
+        return config
+
     def test_learned_rope_low_precision_rotation_is_close(self):
         torch.manual_seed(5678)
         batch_size = 2
@@ -189,6 +214,103 @@ class TransformerOptimizationTests(unittest.TestCase):
                         torch.tensor(kv_idx),
                     )
                     self.assertEqual(bool(actual.item()), expected_value)
+
+    def test_odd_half_disable_mask_keeps_all_masks_out_of_trunk(self):
+        torch.manual_seed(8642)
+        config = self._small_odd_half_config()
+        model = model_pytorch.Model(config, pos_len=3).eval()
+        model.configure_flex_attention(enabled=True)
+        block = model.blocks[0]
+
+        num_spatial = modelconfigs.get_num_bin_input_features(config)
+        num_global = modelconfigs.get_num_global_input_features(config)
+        spatial = torch.randn(2, num_spatial, 3, 3)
+        global_input = torch.randn(2, num_global)
+
+        with mock.patch.object(
+            model_pytorch,
+            "create_kv_flex_attention_block_mask",
+            wraps=model_pytorch.create_kv_flex_attention_block_mask,
+        ) as create_mask_mock, mock.patch.object(
+            block, "forward", wraps=block.forward
+        ) as block_forward_mock:
+            model(spatial, global_input, disable_mask=True)
+
+        create_mask_mock.assert_not_called()
+        self.assertEqual(block_forward_mock.call_count, 1)
+        trunk_input = block_forward_mock.call_args.args[0]
+        self.assertEqual(tuple(trunk_input.shape), (2, 4, 16))
+        self.assertIsNone(block_forward_mock.call_args.kwargs["mask"])
+        self.assertIsNone(block_forward_mock.call_args.kwargs["mask_sum_hw"])
+        self.assertIsNone(block_forward_mock.call_args.kwargs["mask_sum"])
+        self.assertIsNone(
+            block_forward_mock.call_args.kwargs["attention_block_mask"]
+        )
+
+    def test_odd_half_rope_block_full_mask_matches_maskless(self):
+        torch.manual_seed(8643)
+        config = self._small_odd_half_config()
+        block_with_mask = model_pytorch.TransformerRoPEGQABlock(
+            "test", 16, config, "silu", pos_len=3, use_swiglu=True
+        )
+        block_without_mask = model_pytorch.TransformerRoPEGQABlock(
+            "test", 16, config, "silu", pos_len=3, use_swiglu=True
+        )
+        block_without_mask.load_state_dict(block_with_mask.state_dict())
+
+        x_with_mask = torch.randn(2, 4, 16, requires_grad=True)
+        x_without_mask = x_with_mask.detach().clone().requires_grad_(True)
+        mask = torch.ones(2, 4, 1)
+        output_with_mask = block_with_mask(
+            x_with_mask,
+            mask=mask,
+            mask_sum_hw=mask.sum(dim=1, keepdim=True).view(2, 1, 1, 1),
+            mask_sum=mask.sum(),
+        )
+        output_without_mask = block_without_mask(
+            x_without_mask,
+            mask=None,
+            mask_sum_hw=None,
+            mask_sum=None,
+        )
+
+        torch.testing.assert_close(output_without_mask, output_with_mask)
+        output_with_mask.square().mean().backward()
+        output_without_mask.square().mean().backward()
+        torch.testing.assert_close(x_without_mask.grad, x_with_mask.grad)
+
+    def test_odd_half_flex_mask_is_built_from_cropped_trunk_mask(self):
+        torch.manual_seed(9754)
+        config = self._small_odd_half_config()
+        model = model_pytorch.Model(config, pos_len=3).eval()
+        model.configure_flex_attention(enabled=True)
+        block = model.blocks[0]
+
+        num_spatial = modelconfigs.get_num_bin_input_features(config)
+        num_global = modelconfigs.get_num_global_input_features(config)
+        spatial = torch.randn(2, num_spatial, 3, 3)
+        spatial[:, 0, :, :] = 1.0
+        global_input = torch.randn(2, num_global)
+        sentinel_block_mask = object()
+
+        with mock.patch.object(
+            model_pytorch,
+            "create_kv_flex_attention_block_mask",
+            return_value=sentinel_block_mask,
+        ) as create_mask_mock, mock.patch.object(
+            block, "forward", side_effect=lambda x, **kwargs: x
+        ) as block_forward_mock:
+            model(spatial, global_input, disable_mask=False)
+
+        create_mask_mock.assert_called_once()
+        cropped_mask = create_mask_mock.call_args.args[0]
+        self.assertEqual(tuple(cropped_mask.shape), (2, 4, 1))
+        self.assertEqual(block_forward_mock.call_count, 1)
+        self.assertIs(block_forward_mock.call_args.kwargs["mask"], cropped_mask)
+        self.assertIs(
+            block_forward_mock.call_args.kwargs["attention_block_mask"],
+            sentinel_block_mask,
+        )
 
     def test_transformer_preserves_channels_last_without_changing_values(self):
         torch.manual_seed(4321)
