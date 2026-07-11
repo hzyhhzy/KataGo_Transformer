@@ -2151,40 +2151,46 @@ base_config_of_name = {
     "sandbox": sandbox,
 }
 
-# 16-layer, 128-channel TFRS/TFLRS MoE configurations.
+# 16-layer, 128-channel dense baselines and matching TFRS/TFLRS MoE configurations.
 for rope_name, learnable_rope in (("tfrs", False), ("tflrs", True)):
+    dense_name = f"b16c128h4{rope_name}"
+    dense_config = {
+        "version": 15,
+        "norm_kind": "fixup",
+        "bnorm_epsilon": 1e-4,
+        "bnorm_running_avg_momentum": 0.001,
+        "initial_conv_1x1": False,
+        "trunk_num_channels": 128,
+        "mid_num_channels": 128,
+        "gpool_num_channels": 32,
+        "transformer_ffn_channels": 384,
+        "transformer_heads": 4,
+        "transformer_kv_heads": 4,
+        "learnable_rope": learnable_rope,
+        "use_attention_pool": False,
+        "num_attention_pool_heads": 4,
+        "block_kind": [
+            [f"rconv{i}", "transformerropesg"] for i in range(1, 17)
+        ],
+        "p1_num_channels": 32,
+        "g1_num_channels": 32,
+        "v1_num_channels": 32,
+        "sbv2_num_channels": 48,
+        "num_scorebeliefs": 4,
+        "v2_size": 64,
+    }
+    base_config_of_name[dense_name] = dense_config
     for expert_name, num_experts, top_k in (("e16a2", 16, 2), ("e64a4", 64, 4)):
         for moe_name, routing_mode in (("moet", "token"), ("moeb", "board")):
             name = f"b16c128h4{rope_name}{expert_name}{moe_name}"
-            base_config_of_name[name] = {
-                "version": 15,
-                "norm_kind": "fixup",
-                "bnorm_epsilon": 1e-4,
-                "bnorm_running_avg_momentum": 0.001,
-                "initial_conv_1x1": False,
-                "trunk_num_channels": 128,
-                "mid_num_channels": 128,
-                "gpool_num_channels": 32,
-                "transformer_ffn_channels": 384,
-                "transformer_heads": 4,
-                "transformer_kv_heads": 4,
-                "learnable_rope": learnable_rope,
-                "use_attention_pool": False,
-                "num_attention_pool_heads": 4,
-                "block_kind": [
-                    [f"rconv{i}", "transformerropesg"] for i in range(1, 17)
-                ],
+            moe_config = dense_config.copy()
+            moe_config.update({
                 "moe_num_experts": num_experts,
                 "moe_top_k": top_k,
                 "moe_routing_mode": routing_mode,
                 "moe_load_balance_loss_scale": 0.01,
-                "p1_num_channels": 32,
-                "g1_num_channels": 32,
-                "v1_num_channels": 32,
-                "sbv2_num_channels": 48,
-                "num_scorebeliefs": 4,
-                "v2_size": 64,
-            }
+            })
+            base_config_of_name[name] = moe_config
 
 config_of_name = {}
 for name, base_config in base_config_of_name.items():
