@@ -424,13 +424,47 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
         if t < 32:
             return lr0 * 2 ** (-6.0)
         return lr0 * 2 ** (-7.0)
-        
-        
+
+    def lr_scale_auto_factor_custom_fast(train_state):
+
+        x = train_state["global_step_samples"]
+        lr0 = 1.0
+        s0 = 5e7
+        t = x/s0
+
+        # time ~ wdtc (weight decay time constant)
+        if t < 2.0**0:
+            return lr0 * 2 ** (-0.0)
+        if t < 2.0**1:
+            return lr0 * 2 ** (-0.5)
+        if t < 2.0**2:
+            return lr0 * 2 ** (-1.0)
+        if t < 2.0**3:
+            return lr0 * 2 ** (-1.5)
+        if t < 2.0**4:
+            return lr0 * 2 ** (-2.0)
+        if t < 24:
+            return lr0 * 2 ** (-2.5)
+        # final drop
+        if t < 30:
+            return lr0 * 2 ** (-3.0)
+        if t < 36:
+            return lr0 * 2 ** (-3.5)
+        if t < 40:
+            return lr0 * 2 ** (-4.0)
+        if t < 44:
+            return lr0 * 2 ** (-5.0)
+        if t < 48:
+            return lr0 * 2 ** (-6.0)
+        return lr0 * 2 ** (-7.0)
+
     def lr_scale_auto_factor(train_state):
         if lr_scale_auto_type == "":
             return 1.0
         elif lr_scale_auto_type == "custom":
             return lr_scale_auto_factor_custom(train_state)
+        elif lr_scale_auto_type == "customfast":
+            return lr_scale_auto_factor_custom_fast(train_state)
         #elif lr_scale_auto_type == "1b":
         #    return lr_scale_auto_factor_1b(train_state)
         #elif lr_scale_auto_type == "2":
