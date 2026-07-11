@@ -1142,6 +1142,25 @@ b14c192h6tfrs = {
     "v2_size":96,
 }
 
+# Reference TFLRS MoE configs. Change moe_num_experts/moe_top_k here for other sizes.
+b14c192h6tflrsmoet = b14c192h6tfrs.copy()
+b14c192h6tflrsmoet.update({
+    "learnable_rope": True,
+    "moe_num_experts": 8,
+    "moe_top_k": 2,
+    "moe_routing_mode": "token",
+    "moe_load_balance_loss_scale": 0.01,
+})
+
+b14c192h6tflrsmoeb = b14c192h6tfrs.copy()
+b14c192h6tflrsmoeb.update({
+    "learnable_rope": True,
+    "moe_num_experts": 8,
+    "moe_top_k": 1,
+    "moe_routing_mode": "board",
+    "moe_load_balance_loss_scale": 0.01,
+})
+
 b14c192h6tfr2s = {
     "version":15,
     "norm_kind":"fixup",
@@ -2099,6 +2118,8 @@ base_config_of_name = {
     "b24c128tf1b": b24c128tf1b,  # old, CNN+transformer mixed, no RoPE/SwiGLU
     "b30c128h4tfrs":b30c128h4tfrs, # strong but slow
     "b14c192h6tfrs":b14c192h6tfrs, # good trade-off, Recommended
+    "b14c192h6tflrsmoet":b14c192h6tflrsmoet,
+    "b14c192h6tflrsmoeb":b14c192h6tflrsmoeb,
     "b7c256h8tfrs":b7c256h8tfrs,   # fast but weak
 
     "b14c192h6tfr2s": b14c192h6tfr2s, # partly rope
@@ -2129,6 +2150,41 @@ base_config_of_name = {
     "b40c512h16tfrs":b40c512h16tfrs, 
     "sandbox": sandbox,
 }
+
+# 16-layer, 128-channel TFRS/TFLRS MoE configurations.
+for rope_name, learnable_rope in (("tfrs", False), ("tflrs", True)):
+    for expert_name, num_experts, top_k in (("e16a2", 16, 2), ("e64a4", 64, 4)):
+        for moe_name, routing_mode in (("moet", "token"), ("moeb", "board")):
+            name = f"b16c128h4{rope_name}{expert_name}{moe_name}"
+            base_config_of_name[name] = {
+                "version": 15,
+                "norm_kind": "fixup",
+                "bnorm_epsilon": 1e-4,
+                "bnorm_running_avg_momentum": 0.001,
+                "initial_conv_1x1": False,
+                "trunk_num_channels": 128,
+                "mid_num_channels": 128,
+                "gpool_num_channels": 32,
+                "transformer_ffn_channels": 320,
+                "transformer_heads": 4,
+                "transformer_kv_heads": 4,
+                "learnable_rope": learnable_rope,
+                "use_attention_pool": False,
+                "num_attention_pool_heads": 4,
+                "block_kind": [
+                    [f"rconv{i}", "transformerropesg"] for i in range(1, 17)
+                ],
+                "moe_num_experts": num_experts,
+                "moe_top_k": top_k,
+                "moe_routing_mode": routing_mode,
+                "moe_load_balance_loss_scale": 0.01,
+                "p1_num_channels": 32,
+                "g1_num_channels": 32,
+                "v1_num_channels": 32,
+                "sbv2_num_channels": 48,
+                "num_scorebeliefs": 4,
+                "v2_size": 64,
+            }
 
 config_of_name = {}
 for name, base_config in base_config_of_name.items():

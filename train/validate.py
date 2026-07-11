@@ -451,7 +451,9 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     def get_weight_decay(raw_model, lr_scale, warmup_scale, train_state, running_metrics, group_name, wd_scale):
         lr_scale_with_auto = lr_scale * lr_scale_auto_factor(train_state)
         if raw_model.get_norm_kind() == "fixup" or raw_model.get_norm_kind() == "fixscale":
-            if group_name == "normal" or group_name == "normal_gamma" or group_name == "normal_attn" or group_name == "output":
+            if group_name == "normal_router":
+                return 0.1 * 0.00000003 * world_size * batch_size / 256.0 * wd_scale
+            elif group_name == "normal" or group_name == "normal_gamma" or group_name == "normal_attn" or group_name == "output":
                 return 0.00000003 * world_size * batch_size / 256.0 * wd_scale
             elif group_name == "noreg":
                 return 0.0000000003 * world_size * batch_size / 256.0 * wd_scale
@@ -471,6 +473,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             
             if group_name == "normal":
                 group_factor = 1.0
+            elif group_name == "normal_router":
+                group_factor = 0.1
             elif group_name == "normal_attn":
                 group_factor = 0.5
             elif group_name == "normal_gamma":
@@ -509,6 +513,12 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 "weight_decay": get_weight_decay(raw_model, lr_scale, warmup_scale=1.0, train_state=train_state, running_metrics=running_metrics, group_name="normal_attn", wd_scale=wd_scale),
                 "group_name": "normal_attn",
             })
+        if len(reg_dict["normal_router"]) > 0:
+            param_groups.append({
+                "params": reg_dict["normal_router"],
+                "weight_decay": get_weight_decay(raw_model, lr_scale, warmup_scale=1.0, train_state=train_state, running_metrics=running_metrics, group_name="normal_router", wd_scale=wd_scale),
+                "group_name": "normal_router",
+            })
         param_groups.append({
             "params": reg_dict["output"],
             "weight_decay": get_weight_decay(raw_model, lr_scale, warmup_scale=1.0, train_state=train_state, running_metrics=running_metrics, group_name="output", wd_scale=wd_scale),
@@ -525,7 +535,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             "group_name": "output_noreg",
         })
         num_params = len(list(raw_model.parameters()))
-        num_reg_dict_params = len(reg_dict["normal"]) + len(reg_dict["normal_gamma"])  + len(reg_dict["normal_attn"]) + len(reg_dict["output"]) + len(reg_dict["noreg"]) + len(reg_dict["output_noreg"])
+        num_reg_dict_params = len(reg_dict["normal"]) + len(reg_dict["normal_gamma"]) + len(reg_dict["normal_attn"]) + len(reg_dict["normal_router"]) + len(reg_dict["output"]) + len(reg_dict["noreg"]) + len(reg_dict["output_noreg"])
         assert num_params == num_reg_dict_params, "Reg dict does not have entries for all params in model"
         return param_groups
 
@@ -812,6 +822,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             elif group_name == "normal_gamma":
                 group_scale = 1.0
             elif group_name == "normal_attn":
+                group_scale = 1.0
+            elif group_name == "normal_router":
                 group_scale = 1.0
             elif group_name == "output":
                 group_scale = 0.5

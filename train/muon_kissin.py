@@ -118,7 +118,8 @@ class MuonWithAuxAdamKimi(torch.optim.Optimizer):
 
     def is_muon_group(self, group_name: str) -> bool:
         """自动判断参数是否应该使用Muon优化"""
-        # 根据组名判断
+        if group_name in ("normal", "normal_attn", "normal_router"):
+            return True
         if "output" in group_name.lower():
             return False
         if "gamma" in group_name.lower():
@@ -127,9 +128,6 @@ class MuonWithAuxAdamKimi(torch.optim.Optimizer):
         if "noreg" in group_name.lower():
             #logging.info(f"{group_name} is output")
             return False
-        if "normal" in group_name.lower():
-            assert group_name=="normal" or group_name=="normal_attn", f"Unknown group_name: {group_name}, you should add it to is_muon_group()"
-            return True
         assert False, f"Unknown group_name: {group_name}, you should add it to is_muon_group()"
         # 默认情况下根据参数维度判断
         #return param.ndim >= 2

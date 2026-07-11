@@ -291,6 +291,9 @@ class Metrics:
             modelnorm_normal_gamma += torch.sum(tensor * tensor)
         for tensor in reg_dict["normal_attn"]:
             modelnorm_normal_attn += torch.sum(tensor * tensor)
+        # Router uses the same optimizer behavior as attention, with a separate WD factor.
+        for tensor in reg_dict["normal_router"]:
+            modelnorm_normal_attn += torch.sum(tensor * tensor)
         for tensor in reg_dict["output"]:
             modelnorm_output += torch.sum(tensor * tensor)
         for tensor in reg_dict["noreg"]:
@@ -388,9 +391,11 @@ class Metrics:
         main_loss_scale,
         intermediate_loss_scale,
     ):
+        main_output = model_output_postprocessed_byheads[0]
+        moe_load_balance_loss = main_output[15] if len(main_output) > 15 else None
         results = self.metrics_dict_batchwise_single_heads_output(
             raw_model,
-            model_output_postprocessed_byheads[0],
+            main_output[:15],
             batch,
             is_training=is_training,
             soft_policy_weight_scale=soft_policy_weight_scale,
@@ -432,6 +437,16 @@ class Metrics:
                     if key != "loss_sum":
                         results["I"+key] = value
                 results["loss_sum"] = results["loss_sum"] + intermediate_loss_scale * iresults["loss_sum"]
+
+        if moe_load_balance_loss is not None:
+            global_weight_sum = batch["globalTargetsNC"][:, 25].sum()
+            moe_load_balance_loss_sum = moe_load_balance_loss * global_weight_sum
+            moe_loss_sum = (
+                raw_model.moe_load_balance_loss_scale * moe_load_balance_loss_sum
+            )
+            results["moeloadbal_sum"] = moe_load_balance_loss_sum
+            results["moeloss_sum"] = moe_loss_sum
+            results["loss_sum"] = results["loss_sum"] + moe_loss_sum
 
         return results
 

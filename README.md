@@ -19,6 +19,18 @@ The transformer architecture shares similarities with **QWen3**.
     *   Use `tflrs` model aliases or add `-lrope` to transformer RoPE model names for learnable 2D RoPE frequencies, e.g. `b14c192h6tflrs-bng-silu` or `b14c192h6tfrs-bng-silu-lrope`.
     *   `nbttflrs` models use nested bottleneck transformer blocks: 1x1 channel reduction, transformer blocks in the bottleneck, then 1x1 expansion back to trunk channels.
 *   **GQA**: Grouped Query Attention (GQA) is currently **disabled** by default due to the lack of a highly optimized implementation.
+*   **Sparse MoE FFN**: TFLRS blocks can replace their SwiGLU FFN with a dropless Top-K mixture of experts. `moe_routing_mode: "token"` routes every valid board point independently; `"board"` uses a masked board average so every point in one sample shares the same selected expert set.
+
+MoE is enabled by adding these fields to a model config:
+
+```python
+"moe_num_experts": 8,                 # total experts
+"moe_top_k": 2,                       # active experts per token or board
+"moe_routing_mode": "token",          # "token" or "board"
+"moe_load_balance_loss_scale": 0.01,  # optional, defaults to 0.01
+```
+
+Reference model names are `b14c192h6tflrsmoet-bng-silu` (token routing, 8 experts, Top-2) and `b14c192h6tflrsmoeb-bng-silu` (board routing, 8 experts, Top-1). The Switch-style load-balancing loss is averaged across MoE layers and reported as `moeloadbal` and `moeloss`.
 
 **Source Code**: `TransformerRoPEGQABlock` class in `./train/model_pytorch.py`.
 

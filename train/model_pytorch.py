@@ -1095,6 +1095,145 @@ def apply_learnable_rotary_emb(
 
     return _rotate(xq, cos_q, sin_q), _rotate(xk, cos_k, sin_k)
 
+
+class FeedForwardExpert(torch.nn.Module):
+    """One expert with the same FFN shape as a TFLRS block."""
+
+    def __init__(self, c_main: int, ffn_dim: int, activation: str, use_swiglu: bool):
+        super().__init__()
+        self.use_swiglu = use_swiglu
+        self.linear1 = torch.nn.Linear(c_main, ffn_dim, bias=False)
+        if use_swiglu:
+            self.linear_gate = torch.nn.Linear(c_main, ffn_dim, bias=False)
+            self.activation = torch.nn.SiLU(inplace=False)
+        else:
+            self.activation = act(activation, inplace=False)
+        self.linear2 = torch.nn.Linear(ffn_dim, c_main, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        hidden = self.activation(self.linear1(x))
+        if self.use_swiglu:
+            hidden = hidden * self.linear_gate(x)
+        return self.linear2(hidden)
+
+
+class SparseMoE(torch.nn.Module):
+    """Dropless sparse Top-K MoE supporting token-level and board-level routing."""
+
+    TOKEN_ROUTING = "token"
+    BOARD_ROUTING = "board"
+
+    def __init__(
+        self,
+        c_main: int,
+        ffn_dim: int,
+        num_experts: int,
+        top_k: int,
+        routing_mode: str,
+        activation: str,
+        use_swiglu: bool,
+    ):
+        super().__init__()
+        assert num_experts >= 1, "moe_num_experts must be positive"
+        assert 1 <= top_k <= num_experts, "moe_top_k must be in [1, moe_num_experts]"
+        assert routing_mode in (self.TOKEN_ROUTING, self.BOARD_ROUTING), \
+            "moe_routing_mode must be 'token' or 'board'"
+
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.routing_mode = routing_mode
+        self.router = torch.nn.Linear(c_main, num_experts, bias=False)
+        # A small random initialization breaks Top-K ties while keeping initial probabilities near uniform.
+        torch.nn.init.normal_(self.router.weight, mean=0.0, std=0.02)
+        self.experts = torch.nn.ModuleList([
+            FeedForwardExpert(c_main, ffn_dim, activation, use_swiglu)
+            for _ in range(num_experts)
+        ])
+
+    def _route(
+        self,
+        router_input: torch.Tensor,
+        item_weights: Optional[torch.Tensor] = None,
+    ):
+        # Router logits and probabilities stay in FP32 even under AMP. Small
+        # routing-score differences can otherwise change the discrete Top-K choice.
+        with torch.autocast(device_type=router_input.device.type, enabled=False):
+            router_logits = torch.nn.functional.linear(
+                router_input.float(), self.router.weight.float()
+            )
+            router_probs = torch.softmax(router_logits, dim=-1)
+        top_probs, top_indices = torch.topk(router_probs, self.top_k, dim=-1)
+        top_weights = top_probs / top_probs.sum(dim=-1, keepdim=True)
+
+        # Switch-style auxiliary loss. For balanced routing its value is approximately 1.
+        assignments = torch.nn.functional.one_hot(
+            top_indices, num_classes=self.num_experts
+        ).float()
+        if item_weights is None:
+            assignment_fraction = assignments.mean(dim=(0, 1))
+            probability_fraction = router_probs.mean(dim=0)
+        else:
+            item_weights = item_weights.float()
+            weight_sum = item_weights.sum().clamp_min(1.0)
+            assignment_fraction = (
+                assignments * item_weights[:, None, None]
+            ).sum(dim=(0, 1)) / (weight_sum * self.top_k)
+            probability_fraction = (
+                router_probs * item_weights[:, None]
+            ).sum(dim=0) / weight_sum
+        load_balance_loss = self.num_experts * torch.sum(
+            assignment_fraction * probability_fraction
+        )
+        return top_indices, top_weights, load_balance_loss
+
+    def _dispatch(
+        self,
+        x: torch.Tensor,
+        top_indices: torch.Tensor,
+        top_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        output = torch.zeros_like(x)
+        for expert_idx, expert in enumerate(self.experts):
+            token_indices, slot_indices = torch.where(top_indices == expert_idx)
+            expert_input = x.index_select(0, token_indices)
+            expert_output = expert(expert_input)
+            weights = top_weights[token_indices, slot_indices].to(expert_output.dtype).unsqueeze(-1)
+            scatter_indices = token_indices.unsqueeze(-1).expand_as(expert_output)
+            output = output.scatter_add(
+                0, scatter_indices, expert_output * weights
+            )
+        return output
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor]):
+        batch_size, seq_len, channels = x.shape
+        if mask is None:
+            valid = torch.ones((batch_size, seq_len), dtype=torch.bool, device=x.device)
+        else:
+            valid = mask.reshape(batch_size, seq_len) > 0
+
+        flat_x = x.reshape(batch_size * seq_len, channels)
+        flat_valid = valid.reshape(batch_size * seq_len)
+
+        if self.routing_mode == self.TOKEN_ROUTING:
+            top_indices, top_weights, load_balance_loss = self._route(
+                flat_x, flat_valid
+            )
+        else:
+            valid_float = valid.to(x.dtype).unsqueeze(-1)
+            pooled = (x * valid_float).sum(dim=1) / valid_float.sum(dim=1).clamp_min(1.0)
+            board_indices, board_weights, load_balance_loss = self._route(
+                pooled, valid.any(dim=1)
+            )
+            # Every valid token on a board receives exactly the same selected experts and gates.
+            top_indices = board_indices.unsqueeze(1).expand(-1, seq_len, -1)
+            top_weights = board_weights.unsqueeze(1).expand(-1, seq_len, -1)
+            top_indices = top_indices.reshape(batch_size * seq_len, self.top_k)
+            top_weights = top_weights.reshape(batch_size * seq_len, self.top_k)
+
+        flat_output = self._dispatch(flat_x, top_indices, top_weights)
+        flat_output = flat_output * flat_valid.to(flat_output.dtype).unsqueeze(-1)
+        return flat_output.reshape(batch_size, seq_len, channels), load_balance_loss
+
 class TransformerRoPEGQABlock(torch.nn.Module):
     def __init__(
         self,
@@ -1112,6 +1251,9 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         self.ffn_dim = config.get("transformer_ffn_channels", c_main * 2)
         self.use_swiglu = use_swiglu  
         self.use_rope = use_rope
+        self.use_moe = "moe_num_experts" in config
+        if self.use_moe:
+            assert self.use_swiglu, "MoE is supported on TFLRS/SwiGLU transformer blocks"
         # --- GQA Config ---
         self.num_heads = config.get("transformer_heads", 4)             # Query Heads
         self.num_kv_heads = config.get("transformer_kv_heads", self.num_heads) # KV Heads (Key/Value)
@@ -1164,14 +1306,25 @@ class TransformerRoPEGQABlock(torch.nn.Module):
             self.cos_cached = None
             self.sin_cached = None
 
-        self.ffn_linear1 = torch.nn.Linear(c_main, self.ffn_dim, bias=False)
-        if self.use_swiglu:
-            self.ffn_linear_gate = torch.nn.Linear(c_main, self.ffn_dim, bias=False)
-            self.ffn_act = torch.nn.SiLU(inplace=False)  # Only QAT-int8 training requires inplace=False, but for normal training it will not be harmful after compilation
+        if self.use_moe:
+            self.moe = SparseMoE(
+                c_main=c_main,
+                ffn_dim=self.ffn_dim,
+                num_experts=config["moe_num_experts"],
+                top_k=config.get("moe_top_k", 1),
+                routing_mode=config.get("moe_routing_mode", SparseMoE.TOKEN_ROUTING),
+                activation=activation,
+                use_swiglu=use_swiglu,
+            )
         else:
-            self.ffn_act = act(activation, inplace=False) # Only QAT-int8 training requires inplace=False, but for normal training it will not be harmful after compilation
-            
-        self.ffn_linear2 = torch.nn.Linear(self.ffn_dim, c_main, bias=False)
+            self.ffn_linear1 = torch.nn.Linear(c_main, self.ffn_dim, bias=False)
+            if self.use_swiglu:
+                self.ffn_linear_gate = torch.nn.Linear(c_main, self.ffn_dim, bias=False)
+                self.ffn_act = torch.nn.SiLU(inplace=False)  # Only QAT-int8 training requires inplace=False, but for normal training it will not be harmful after compilation
+            else:
+                self.ffn_act = act(activation, inplace=False) # Only QAT-int8 training requires inplace=False, but for normal training it will not be harmful after compilation
+
+            self.ffn_linear2 = torch.nn.Linear(self.ffn_dim, c_main, bias=False)
         
         self.norm1 = torch.nn.RMSNorm(c_main, eps=1e-6)
         self.norm2 = torch.nn.RMSNorm(c_main, eps=1e-6)
@@ -1185,7 +1338,9 @@ class TransformerRoPEGQABlock(torch.nn.Module):
                 reg_dict["noreg"].append(param)
                 continue
             if "weight" in name:
-                if any(x in name for x in ["q_proj", "k_proj", "v_proj", "out_proj"]):
+                if "moe.router" in name:
+                    reg_dict["normal_router"].append(param)
+                elif any(x in name for x in ["q_proj", "k_proj", "v_proj", "out_proj"]):
                     reg_dict["normal_attn"].append(param)
                 else:
                     reg_dict["normal"].append(param)
@@ -1286,20 +1441,25 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         x = x_in + attn_output
         xn = self.norm2(x)
         
-        if self.use_swiglu:
-            # SwiGLU: (Act(Linear1(x)) * LinearGate(x)) -> Linear2
-            x1 = self.ffn_linear1(xn)
-            x1 = self.ffn_act(x1)
-            x_gate = self.ffn_linear_gate(xn)
-            x1 = x1 * x_gate
+        if self.use_moe:
+            x1, load_balance_loss = self.moe(xn, mask)
         else:
-            # Standard: Act(Linear1(x)) -> Linear2
-            x1 = self.ffn_linear1(xn)
-            x1 = self.ffn_act(x1)
-        x1 = self.ffn_linear2(x1)
+            if self.use_swiglu:
+                # SwiGLU: (Act(Linear1(x)) * LinearGate(x)) -> Linear2
+                x1 = self.ffn_linear1(xn)
+                x1 = self.ffn_act(x1)
+                x_gate = self.ffn_linear_gate(xn)
+                x1 = x1 * x_gate
+            else:
+                # Standard: Act(Linear1(x)) -> Linear2
+                x1 = self.ffn_linear1(xn)
+                x1 = self.ffn_act(x1)
+            x1 = self.ffn_linear2(x1)
         x = x + x1
         
         x = x.permute(0, 2, 1).view(batch_size, channels, height, width)
+        if self.use_moe:
+            return x, load_balance_loss
         return x
         
 class BottleneckResBlock(torch.nn.Module):
@@ -1543,6 +1703,7 @@ class NestedBottleneckTransformerBlock(torch.nn.Module):
         self.name = name
         self.norm_kind = config["norm_kind"]
         self.internal_length = internal_length
+        self.use_moe = "moe_num_experts" in config
         assert internal_length >= 1
 
         self.normactconvp = NormActConv(
@@ -1627,12 +1788,20 @@ class NestedBottleneckTransformerBlock(torch.nn.Module):
         """
         out = x
         out = self.normactconvp(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+        load_balance_loss = out.new_zeros(())
         for block in self.blockstack:
-            out = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+            block_result = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+            if self.use_moe:
+                out, block_load_balance_loss = block_result
+                load_balance_loss = load_balance_loss + block_load_balance_loss
+            else:
+                out = block_result
         out = self.normactconvq(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
         result = x + out
         if extra_outputs is not None:
             extra_outputs.report(self.name+".out", result)
+        if self.use_moe:
+            return result, load_balance_loss
         return result
 
 
@@ -2111,6 +2280,10 @@ class Model(torch.nn.Module):
         self.num_scorebeliefs = config["num_scorebeliefs"]
         self.num_total_blocks = len(self.block_kind)
         self.pos_len = pos_len
+        self.use_moe = "moe_num_experts" in config
+        self.moe_load_balance_loss_scale = config.get("moe_load_balance_loss_scale", 0.01)
+        assert self.moe_load_balance_loss_scale >= 0.0, \
+            "moe_load_balance_loss_scale must be nonnegative"
 
         if config["version"] <= 12 or (config["version"] >= 101 and config["version"] <= 199):
             self.td_score_multiplier = 20.0
@@ -2343,6 +2516,13 @@ class Model(torch.nn.Module):
             else:
                 assert False, f"Unknown block kind: {block_config[1]}"
 
+        self.num_moe_layers = sum(
+            1 for module in self.modules() if isinstance(module, SparseMoE)
+        )
+        if self.use_moe:
+            assert self.num_moe_layers > 0, \
+                "moe_num_experts requires at least one TFLRS/SwiGLU transformer block"
+
         if self.trunk_normless:
             self.norm_trunkfinal = BiasMask(self.c_trunk, self.config, is_after_batchnorm=True)
         else:
@@ -2434,6 +2614,7 @@ class Model(torch.nn.Module):
         reg_dict["normal"] = []
         reg_dict["normal_gamma"] = []
         reg_dict["normal_attn"] = []
+        reg_dict["normal_router"] = []
         reg_dict["output"] = []
         reg_dict["noreg"] = []
         reg_dict["output_noreg"] = []
@@ -2503,6 +2684,7 @@ class Model(torch.nn.Module):
         x_global = self.linear_global(input_global).unsqueeze(-1).unsqueeze(-1)
 
         out = x_spatial + x_global
+        moe_load_balance_loss = out.new_zeros(())
 
         if self.metadata_encoder is not None:
             assert input_meta is not None
@@ -2518,7 +2700,12 @@ class Model(torch.nn.Module):
                 # print("TENSOR BEFORE BLOCK")
                 # print(count)
                 # print(out)
-                out = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+                block_result = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+                if isinstance(block_result, tuple):
+                    out, block_load_balance_loss = block_result
+                    moe_load_balance_loss = moe_load_balance_loss + block_load_balance_loss
+                else:
+                    out = block_result
                 count += 1
                 
             #torch._dynamo.graph_break()
@@ -2548,7 +2735,12 @@ class Model(torch.nn.Module):
                 # print("TENSOR BEFORE BLOCK")
                 # print(count)
                 # print(out)
-                out = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+                block_result = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+                if isinstance(block_result, tuple):
+                    out, block_load_balance_loss = block_result
+                    moe_load_balance_loss = moe_load_balance_loss + block_load_balance_loss
+                else:
+                    out = block_result
                 count += 1
 
         else:
@@ -2557,7 +2749,12 @@ class Model(torch.nn.Module):
                 # print("TENSOR BEFORE BLOCK")
                 # print(count)
                 # print(out)
-                out = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+                block_result = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+                if isinstance(block_result, tuple):
+                    out, block_load_balance_loss = block_result
+                    moe_load_balance_loss = moe_load_balance_loss + block_load_balance_loss
+                else:
+                    out = block_result
                 count += 1
 
         #torch._dynamo.graph_break() # torch.compile sometimes HAVE BUGS
@@ -2589,18 +2786,23 @@ class Model(torch.nn.Module):
             #print(out_scorebelief_logprobs.shape)
         
             if self.has_intermediate_head:
+                main_outputs = (
+                    out_policy,
+                    out_value,
+                    out_miscvalue,
+                    out_moremiscvalue,
+                    out_ownership,
+                    out_scoring,
+                    out_futurepos,
+                    out_seki,
+                    out_scorebelief_logprobs,
+                )
+                if self.use_moe:
+                    main_outputs = main_outputs + (
+                        moe_load_balance_loss / self.num_moe_layers,
+                    )
                 return (
-                    (
-                        out_policy,
-                        out_value,
-                        out_miscvalue,
-                        out_moremiscvalue,
-                        out_ownership,
-                        out_scoring,
-                        out_futurepos,
-                        out_seki,
-                        out_scorebelief_logprobs,
-                    ),
+                    main_outputs,
                     (
                         iout_policy,
                         iout_value,
@@ -2614,7 +2816,7 @@ class Model(torch.nn.Module):
                     ),
                 )
             else:
-                return ((
+                main_outputs = (
                     out_policy,
                     out_value,
                     out_miscvalue,
@@ -2624,7 +2826,12 @@ class Model(torch.nn.Module):
                     out_futurepos,
                     out_seki,
                     out_scorebelief_logprobs,
-                ),)
+                )
+                if self.use_moe:
+                    main_outputs = main_outputs + (
+                        moe_load_balance_loss / self.num_moe_layers,
+                    )
+                return (main_outputs,)
 
     def float32ify_output(self, outputs_byheads):
         return tuple(self.float32ify_single_heads_output(outputs) for outputs in outputs_byheads)
@@ -2640,8 +2847,8 @@ class Model(torch.nn.Module):
             out_futurepos,
             out_seki,
             out_scorebelief_logprobs,
-        ) = outputs
-        return (
+        ) = outputs[:9]
+        float_outputs = (
             out_policy.to(torch.float32),
             out_value.to(torch.float32),
             out_miscvalue.to(torch.float32),
@@ -2652,6 +2859,9 @@ class Model(torch.nn.Module):
             out_seki.to(torch.float32),
             out_scorebelief_logprobs.to(torch.float32),
         )
+        if len(outputs) > 9:
+            float_outputs = float_outputs + (outputs[9].to(torch.float32),)
+        return float_outputs
 
     def postprocess_output(self, outputs_byheads):
         return tuple(self.postprocess_single_heads_output(outputs) for outputs in outputs_byheads)
@@ -2667,7 +2877,7 @@ class Model(torch.nn.Module):
             out_futurepos,
             out_seki,
             out_scorebelief_logprobs,
-        ) = outputs
+        ) = outputs[:9]
 
         policy_logits = out_policy
         value_logits = out_value
@@ -2690,7 +2900,7 @@ class Model(torch.nn.Module):
         scorebelief_logits = out_scorebelief_logprobs
 
         #print(out_scorebelief_logprobs.shape)
-        return (
+        postprocessed = (
             policy_logits,      # N, num_policy_outputs, move
             value_logits,       # N, {win,loss,noresult}
             td_value_logits,    # N, {long, mid, short} {win,loss,noresult}
@@ -2707,3 +2917,6 @@ class Model(torch.nn.Module):
             pred_shortterm_score_error, # N
             scorebelief_logits, # N, 2 * (self.pos_len*self.pos_len + EXTRA_SCORE_DISTR_RADIUS)
         )
+        if len(outputs) > 9:
+            postprocessed = postprocessed + (outputs[9],)
+        return postprocessed
