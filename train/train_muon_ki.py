@@ -92,6 +92,11 @@ if __name__ == "__main__":
     optional_args.add_argument('-qat-int8', help='Enable INT8 QAT', required=False, action='store_true')    
     optional_args.add_argument('-master-port', help='Localhost port', default=23456, type=int, required=False)
     optional_args.add_argument('-no-compile', help='Do not torch.compile', required=False, action='store_true')
+    optional_args.add_argument('-moe-batched-experts-per-group', type=int, default=0, help='Runtime-only moeb grouped GEMM width; 0 disables it', required=False)
+    optional_args.add_argument('-moe-load-stats-every', type=int, default=0, help='Write MoE load statistics every N batches; 0 disables it', required=False)
+    optional_args.add_argument('-moe-load-balance-loss-scale', type=float, help='Runtime override for the MoE load-balancing loss scale', required=False)
+    optional_args.add_argument('-moe-router-jitter-noise', type=float, default=0.0, help='Multiplicative router-input jitter used only during training', required=False)
+    optional_args.add_argument('-moe-balance-bias-update-rate', type=float, default=0.0005, help='Per-batch update rate for expert selection bias balancing; 0 disables it', required=False)
 
     optional_args.add_argument('-epochs-per-export', help='Export model once every this many epochs', type=int, required=False)
     optional_args.add_argument('-export-prob', help='Export model with this probablity', type=float, required=False)
@@ -255,6 +260,19 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     use_fp16 = args["use_fp16"]
     master_port = args["master_port"]
     no_compile = args["no_compile"]
+    moe_batched_experts_per_group = args["moe_batched_experts_per_group"]
+    moe_load_stats_every = args["moe_load_stats_every"]
+    moe_load_balance_loss_scale = args["moe_load_balance_loss_scale"]
+    moe_router_jitter_noise = args["moe_router_jitter_noise"]
+    moe_balance_bias_update_rate = args["moe_balance_bias_update_rate"]
+    assert moe_batched_experts_per_group >= 0
+    assert moe_load_stats_every >= 0
+    assert 0.0 <= moe_router_jitter_noise < 1.0
+    assert moe_balance_bias_update_rate >= 0.0
+    if moe_load_balance_loss_scale is not None:
+        assert moe_load_balance_loss_scale >= 0.0
+    if moe_batched_experts_per_group > 0:
+        torch._dynamo.config.capture_scalar_outputs = True
     
     epochs_per_export = args["epochs_per_export"]
     export_prob = args["export_prob"]
@@ -671,6 +689,13 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             logging.info(str(model_config))
             raw_model = Model(model_config,pos_len)
             raw_model.initialize()
+            raw_model.configure_moe_runtime(
+                batched_experts_per_group=moe_batched_experts_per_group,
+                collect_load_stats=moe_load_stats_every > 0,
+                router_jitter_noise=moe_router_jitter_noise,
+                balance_bias_update_rate=moe_balance_bias_update_rate,
+                load_balance_loss_scale=moe_load_balance_loss_scale,
+            )
             
             if qat_int8:
                 logging.info("Preparing model for INT8 QAT (TensorRT compatible)...")
@@ -733,6 +758,13 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             logging.info(str(model_config))
             raw_model = Model(model_config,pos_len)
             raw_model.initialize()
+            raw_model.configure_moe_runtime(
+                batched_experts_per_group=moe_batched_experts_per_group,
+                collect_load_stats=moe_load_stats_every > 0,
+                router_jitter_noise=moe_router_jitter_noise,
+                balance_bias_update_rate=moe_balance_bias_update_rate,
+                load_balance_loss_scale=moe_load_balance_loss_scale,
+            )
 
             train_state = {}
             if "train_state" in state_dict:
@@ -1251,12 +1283,20 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     if rank == 0:
         train_metrics_out = open(os.path.join(traindir,"metrics_train.json"),"a")
         val_metrics_out = open(os.path.join(traindir,"metrics_val.json"),"a")
+        moe_load_stats_out = (
+            open(os.path.join(traindir, "moe_load_stats.jsonl"), "a")
+            if moe_load_stats_every > 0 else None
+        )
         val_swa_metrics_outs=[]
         for i in range(len(swa_scales)):
             val_swa_metrics_outs.append( open(os.path.join(traindir,f"metrics_val_swa{i}.json"),"a"))
     else:
         train_metrics_out = open(os.path.join(traindir,f"metrics_train_rank{rank}.json"),"a")
         val_metrics_out = open(os.path.join(traindir,f"metrics_val_rank{rank}.json"),"a")
+        moe_load_stats_out = (
+            open(os.path.join(traindir, f"moe_load_stats_rank{rank}.jsonl"), "a")
+            if moe_load_stats_every > 0 else None
+        )
 
     # TRAIN! -----------------------------------------------------------------------------------
 
@@ -1483,6 +1523,27 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 batch_count_this_epoch += 1
                 train_state["train_steps_since_last_reload"] += batch_size * world_size
                 train_state["global_step_samples"] += batch_size * world_size
+
+                if (
+                    moe_load_stats_out is not None
+                    and batch_count_this_epoch % moe_load_stats_every == 0
+                ):
+                    layer_stats = raw_model.get_moe_load_stats()
+                    max_mean_values = [
+                        layer["max_mean"] for layer in layer_stats.values()
+                    ]
+                    record = {
+                        "global_step_samples": train_state["global_step_samples"],
+                        "batch_count_this_epoch": batch_count_this_epoch,
+                        "worst_max_mean": max(max_mean_values, default=0.0),
+                        "mean_max_mean": (
+                            sum(max_mean_values) / len(max_mean_values)
+                            if len(max_mean_values) > 0 else 0.0
+                        ),
+                        "layers": layer_stats,
+                    }
+                    moe_load_stats_out.write(json.dumps(record) + "\n")
+                    moe_load_stats_out.flush()
 
                 metrics = detensorify_metrics(metrics)
 
@@ -1760,6 +1821,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
     train_metrics_out.close()
     val_metrics_out.close()
+    if moe_load_stats_out is not None:
+        moe_load_stats_out.close()
 
 
 if __name__ == "__main__":

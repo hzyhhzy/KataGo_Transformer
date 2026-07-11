@@ -1142,6 +1142,20 @@ class SparseMoE(torch.nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.routing_mode = routing_mode
+        self.use_swiglu = use_swiglu
+        self.batched_experts_per_group = 0
+        self.collect_load_stats = False
+        self.router_jitter_noise = 0.0
+        self.balance_bias_update_rate = 0.0
+        self.register_buffer(
+            "router_selection_bias",
+            torch.zeros(num_experts, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "last_assignment_fraction",
+            torch.zeros(num_experts, dtype=torch.float32),
+            persistent=False,
+        )
         self.router = torch.nn.Linear(c_main, num_experts, bias=False)
         # A small random initialization breaks Top-K ties while keeping initial probabilities near uniform.
         torch.nn.init.normal_(self.router.weight, mean=0.0, std=0.02)
@@ -1149,6 +1163,29 @@ class SparseMoE(torch.nn.Module):
             FeedForwardExpert(c_main, ffn_dim, activation, use_swiglu)
             for _ in range(num_experts)
         ])
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        bias_key = prefix + "router_selection_bias"
+        if bias_key not in state_dict:
+            state_dict[bias_key] = torch.zeros_like(self.router_selection_bias)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _route(
         self,
@@ -1158,11 +1195,21 @@ class SparseMoE(torch.nn.Module):
         # Router logits and probabilities stay in FP32 even under AMP. Small
         # routing-score differences can otherwise change the discrete Top-K choice.
         with torch.autocast(device_type=router_input.device.type, enabled=False):
+            router_input_float = router_input.float()
+            if self.training and self.router_jitter_noise > 0.0:
+                router_input_float = router_input_float * torch.empty_like(
+                    router_input_float
+                ).uniform_(
+                    1.0 - self.router_jitter_noise,
+                    1.0 + self.router_jitter_noise,
+                )
             router_logits = torch.nn.functional.linear(
-                router_input.float(), self.router.weight.float()
+                router_input_float, self.router.weight.float()
             )
             router_probs = torch.softmax(router_logits, dim=-1)
-        top_probs, top_indices = torch.topk(router_probs, self.top_k, dim=-1)
+        selection_scores = router_probs + self.router_selection_bias
+        _, top_indices = torch.topk(selection_scores, self.top_k, dim=-1)
+        top_probs = router_probs.gather(1, top_indices)
         top_weights = top_probs / top_probs.sum(dim=-1, keepdim=True)
 
         # Switch-style auxiliary loss. For balanced routing its value is approximately 1.
@@ -1184,6 +1231,16 @@ class SparseMoE(torch.nn.Module):
         load_balance_loss = self.num_experts * torch.sum(
             assignment_fraction * probability_fraction
         )
+        if self.collect_load_stats:
+            self.last_assignment_fraction.copy_(assignment_fraction.detach())
+        if self.training and self.balance_bias_update_rate > 0.0:
+            with torch.no_grad():
+                target_fraction = 1.0 / self.num_experts
+                self.router_selection_bias.add_(
+                    self.balance_bias_update_rate
+                    * torch.sign(target_fraction - assignment_fraction)
+                )
+                self.router_selection_bias.sub_(self.router_selection_bias.mean())
         return top_indices, top_weights, load_balance_loss
 
     def _dispatch(
@@ -1203,6 +1260,97 @@ class SparseMoE(torch.nn.Module):
                 0, scatter_indices, expert_output * weights
             )
         return output
+
+    def _dispatch_boards_batched(
+        self,
+        x: torch.Tensor,
+        top_indices: torch.Tensor,
+        top_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Padded grouped board dispatch, enabled explicitly by the trainer."""
+        batch_size, seq_len, channels = x.shape
+        flat_expert_indices = top_indices.reshape(-1)
+        flat_board_indices = torch.arange(
+            batch_size, device=x.device
+        ).unsqueeze(1).expand(-1, self.top_k).reshape(-1)
+        assignments = torch.nn.functional.one_hot(
+            flat_expert_indices, num_classes=self.num_experts
+        )
+        positions = (assignments.cumsum(dim=0) - 1).gather(
+            1, flat_expert_indices.unsqueeze(1)
+        ).squeeze(1)
+        device_type = x.device.type
+        compute_dtype = (
+            torch.get_autocast_dtype(device_type)
+            if torch.is_autocast_enabled(device_type)
+            else x.dtype
+        )
+        linear1_weight = torch.stack([
+            expert.linear1.weight for expert in self.experts
+        ])
+        linear_gate_weight = torch.stack([
+            expert.linear_gate.weight for expert in self.experts
+        ])
+        linear2_weight = torch.stack([
+            expert.linear2.weight for expert in self.experts
+        ])
+        flat_weights = top_weights.reshape(-1)
+        output = torch.zeros_like(x)
+        group_width = self.batched_experts_per_group
+        for group_start in range(0, self.num_experts, group_width):
+            group_end = min(group_start + group_width, self.num_experts)
+            group_size = group_end - group_start
+            route_indices = torch.where(
+                (flat_expert_indices >= group_start)
+                & (flat_expert_indices < group_end)
+            )[0]
+            group_expert_indices = flat_expert_indices.index_select(
+                0, route_indices
+            ) - group_start
+            group_positions = positions.index_select(0, route_indices)
+            capacity_tensor = torch.bincount(
+                group_expert_indices, minlength=group_size
+            ).max().clamp_min(1)
+            torch._constrain_as_size(
+                capacity_tensor, min=1, max=batch_size * self.top_k
+            )
+            capacity = capacity_tensor.item()
+            dispatch_indices = group_expert_indices * capacity + group_positions
+            board_indices = flat_board_indices.index_select(0, route_indices)
+            routed_inputs = x.index_select(0, board_indices).to(compute_dtype)
+            expert_inputs = torch.zeros(
+                (group_size * capacity, seq_len, channels),
+                dtype=compute_dtype,
+                device=x.device,
+            ).index_copy(0, dispatch_indices, routed_inputs).reshape(
+                group_size, capacity * seq_len, channels
+            )
+            hidden = torch.bmm(
+                expert_inputs,
+                linear1_weight[group_start:group_end].transpose(1, 2),
+            )
+            gate = torch.bmm(
+                expert_inputs,
+                linear_gate_weight[group_start:group_end].transpose(1, 2),
+            )
+            hidden = torch.nn.functional.silu(hidden) * gate
+            expert_outputs = torch.bmm(
+                hidden,
+                linear2_weight[group_start:group_end].transpose(1, 2),
+            ).reshape(group_size * capacity, seq_len, channels)
+            routed_outputs = expert_outputs.index_select(0, dispatch_indices)
+            routed_outputs = routed_outputs * flat_weights.index_select(
+                0, route_indices
+            ).to(routed_outputs.dtype).view(-1, 1, 1)
+            output.index_add_(0, board_indices, routed_outputs.to(x.dtype))
+        return output
+
+    def _can_use_batched_board_dispatch(self) -> bool:
+        if self.batched_experts_per_group <= 0 or not self.use_swiglu:
+            return False
+        if torch.onnx.is_in_onnx_export():
+            return False
+        return not hasattr(self.experts[0].linear1, "weight_fake_quant")
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor]):
         batch_size, seq_len, channels = x.shape
@@ -1224,6 +1372,12 @@ class SparseMoE(torch.nn.Module):
             board_indices, board_weights, load_balance_loss = self._route(
                 pooled, valid.any(dim=1)
             )
+            if self._can_use_batched_board_dispatch():
+                output = self._dispatch_boards_batched(
+                    x, board_indices, board_weights
+                )
+                output = output * valid.to(output.dtype).unsqueeze(-1)
+                return output, load_balance_loss
             # Every valid token on a board receives exactly the same selected experts and gates.
             top_indices = board_indices.unsqueeze(1).expand(-1, seq_len, -1)
             top_weights = board_weights.unsqueeze(1).expand(-1, seq_len, -1)
@@ -2657,6 +2811,53 @@ class Model(torch.nn.Module):
             self.intermediate_value_head.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
 
     # Returns a tuple of tuples of outputs
+    def configure_moe_runtime(
+        self,
+        batched_experts_per_group: int = 0,
+        collect_load_stats: bool = False,
+        router_jitter_noise: float = 0.0,
+        balance_bias_update_rate: float = 0.0,
+        load_balance_loss_scale: Optional[float] = None,
+    ):
+        assert batched_experts_per_group >= 0
+        assert 0.0 <= router_jitter_noise < 1.0
+        assert balance_bias_update_rate >= 0.0
+        if load_balance_loss_scale is not None:
+            assert load_balance_loss_scale >= 0.0
+            self.moe_load_balance_loss_scale = load_balance_loss_scale
+        for module in self.modules():
+            if isinstance(module, SparseMoE):
+                assert batched_experts_per_group <= module.num_experts
+                if batched_experts_per_group > 0:
+                    assert module.routing_mode == SparseMoE.BOARD_ROUTING, \
+                        "Batched expert GEMM is only supported for moeb"
+                    assert module.num_experts % batched_experts_per_group == 0
+                module.batched_experts_per_group = batched_experts_per_group
+                module.collect_load_stats = collect_load_stats
+                module.router_jitter_noise = router_jitter_noise
+                module.balance_bias_update_rate = balance_bias_update_rate
+
+    def get_moe_load_stats(self):
+        stats = {}
+        for name, module in self.named_modules():
+            if isinstance(module, SparseMoE) and module.collect_load_stats:
+                fractions = module.last_assignment_fraction.detach().float().cpu()
+                mean = fractions.mean().clamp_min(1e-12)
+                normalized = fractions / mean
+                entropy = -torch.sum(
+                    fractions * torch.log(fractions.clamp_min(1e-12))
+                ) / math.log(module.num_experts)
+                stats[name] = {
+                    "max_mean": normalized.max().item(),
+                    "min_mean": normalized.min().item(),
+                    "cv": normalized.std(unbiased=False).item(),
+                    "entropy": entropy.item(),
+                    "selection_bias_min": module.router_selection_bias.min().item(),
+                    "selection_bias_max": module.router_selection_bias.max().item(),
+                    "fractions": fractions.tolist(),
+                }
+        return stats
+
     # The outer tuple indexes different sets of heads, such as if the net also computes intermediate heads.
     #   0 is the main output, 1 is intermediate.
     # The inner tuple ranges over the outputs of a set of heads (policy, value, etc).

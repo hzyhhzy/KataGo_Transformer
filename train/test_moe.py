@@ -58,6 +58,80 @@ class SparseMoETest(unittest.TestCase):
         self.assertTrue(torch.equal(expanded_indices[:, 0], expanded_indices[:, 2]))
         self.assertTrue(torch.equal(expanded_weights[:, 0], expanded_weights[:, 2]))
 
+    def test_batched_board_runtime_switch_matches_sequential_dispatch(self):
+        moe = SparseMoE(
+            c_main=8,
+            ffn_dim=16,
+            num_experts=4,
+            top_k=2,
+            routing_mode=SparseMoE.BOARD_ROUTING,
+            activation="silu",
+            use_swiglu=True,
+        )
+        x = torch.randn(5, 4, 8)
+        mask = torch.ones(5, 4)
+        sequential_output, sequential_loss = moe(x, mask)
+        moe.batched_experts_per_group = 4
+        batched_output, batched_loss = moe(x, mask)
+        torch.testing.assert_close(batched_output, sequential_output)
+        torch.testing.assert_close(batched_loss, sequential_loss)
+
+    def test_moe_load_stats_collection(self):
+        moe = SparseMoE(
+            c_main=8,
+            ffn_dim=16,
+            num_experts=4,
+            top_k=2,
+            routing_mode=SparseMoE.BOARD_ROUTING,
+            activation="silu",
+            use_swiglu=True,
+        )
+        moe.collect_load_stats = True
+        x = torch.randn(4, 4, 8)
+        mask = torch.ones(4, 4)
+        moe(x, mask)
+        self.assertAlmostEqual(
+            moe.last_assignment_fraction.sum().item(), 1.0, places=6
+        )
+
+    def test_selection_bias_tracks_actual_top_k_load(self):
+        moe = SparseMoE(
+            c_main=8,
+            ffn_dim=16,
+            num_experts=4,
+            top_k=2,
+            routing_mode=SparseMoE.BOARD_ROUTING,
+            activation="silu",
+            use_swiglu=True,
+        )
+        moe.balance_bias_update_rate = 0.001
+        with torch.no_grad():
+            moe.router.weight.zero_()
+
+        first_indices, _, _ = moe._route(torch.zeros(16, 8))
+        second_indices, _, _ = moe._route(torch.zeros(16, 8))
+
+        self.assertFalse(torch.equal(first_indices, second_indices))
+        self.assertAlmostEqual(moe.router_selection_bias.sum().item(), 0.0, places=6)
+
+    def test_old_checkpoint_without_selection_bias_loads_strictly(self):
+        moe = SparseMoE(
+            c_main=8,
+            ffn_dim=16,
+            num_experts=4,
+            top_k=2,
+            routing_mode=SparseMoE.BOARD_ROUTING,
+            activation="silu",
+            use_swiglu=True,
+        )
+        old_state_dict = moe.state_dict()
+        del old_state_dict["router_selection_bias"]
+
+        moe.load_state_dict(old_state_dict, strict=True)
+        torch.testing.assert_close(
+            moe.router_selection_bias, torch.zeros_like(moe.router_selection_bias)
+        )
+
     def test_router_stays_float32_under_autocast(self):
         moe = SparseMoE(
             c_main=8,
