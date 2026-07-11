@@ -2165,7 +2165,7 @@ for rope_name, learnable_rope in (("tfrs", False), ("tflrs", True)):
                 "trunk_num_channels": 128,
                 "mid_num_channels": 128,
                 "gpool_num_channels": 32,
-                "transformer_ffn_channels": 320,
+                "transformer_ffn_channels": 384,
                 "transformer_heads": 4,
                 "transformer_kv_heads": 4,
                 "learnable_rope": learnable_rope,
