@@ -2180,7 +2180,11 @@ for rope_name, learnable_rope in (("tfrs", False), ("tflrs", True)):
         "v2_size": 64,
     }
     base_config_of_name[dense_name] = dense_config
-    for expert_name, num_experts, top_k in (("e16a2", 16, 2), ("e64a4", 64, 4)):
+    for expert_name, num_experts, top_k in (
+        ("e4a1", 4, 1),
+        ("e16a2", 16, 2),
+        ("e64a4", 64, 4),
+    ):
         for moe_name, routing_mode in (("moet", "token"), ("moeb", "board")):
             name = f"b16c128h4{rope_name}{expert_name}{moe_name}"
             moe_config = dense_config.copy()
