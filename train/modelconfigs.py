@@ -2192,7 +2192,7 @@ for rope_name, learnable_rope in (("tfrs", False), ("tflrs", True)):
                 "moe_num_experts": num_experts,
                 "moe_top_k": top_k,
                 "moe_routing_mode": routing_mode,
-                "moe_load_balance_loss_scale": 0.01,
+                "moe_load_balance_loss_scale": 0.0 if routing_mode == "board" else 0.01,
             })
             base_config_of_name[name] = moe_config
 

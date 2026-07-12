@@ -148,6 +148,23 @@ class SparseMoETest(unittest.TestCase):
         self.assertEqual(weights.dtype, torch.float32)
         self.assertEqual(load_balance_loss.dtype, torch.float32)
 
+    def test_top_one_gate_is_one_with_task_gradient(self):
+        moe = SparseMoE(
+            c_main=8,
+            ffn_dim=16,
+            num_experts=4,
+            top_k=1,
+            routing_mode=SparseMoE.BOARD_ROUTING,
+            activation="silu",
+            use_swiglu=True,
+        )
+        _, weights, _ = moe._route(torch.randn(32, 8))
+
+        torch.testing.assert_close(weights, torch.ones_like(weights))
+        weights.sum().backward()
+        self.assertIsNotNone(moe.router.weight.grad)
+        self.assertGreater(moe.router.weight.grad.norm().item(), 0.0)
+
     def test_tflrs_block_returns_auxiliary_loss(self):
         config = {
             "norm_kind": "fixup",

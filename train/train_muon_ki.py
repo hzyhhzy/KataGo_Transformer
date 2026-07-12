@@ -671,6 +671,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 "params": reg_dict["normal_router"],
                 "weight_decay": get_weight_decay(raw_model, lr_scale, warmup_scale=1.0, train_state=train_state, running_metrics=running_metrics, group_name="normal_router", wd_scale=wd_scale),
                 "group_name": "normal_router",
+                "use_muon": False,
             })
         param_groups.append({
             "params": reg_dict["output"],

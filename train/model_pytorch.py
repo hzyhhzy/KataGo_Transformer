@@ -1211,6 +1211,10 @@ class SparseMoE(torch.nn.Module):
         _, top_indices = torch.topk(selection_scores, self.top_k, dim=-1)
         top_probs = router_probs.gather(1, top_indices)
         top_weights = top_probs / top_probs.sum(dim=-1, keepdim=True)
+        if self.top_k == 1:
+            # Keep the forward gate exactly 1 while allowing the task loss to
+            # train a Top-1 router through the selected probability.
+            top_weights = top_weights + top_probs - top_probs.detach()
 
         # Switch-style auxiliary loss. For balanced routing its value is approximately 1.
         assignments = torch.nn.functional.one_hot(
