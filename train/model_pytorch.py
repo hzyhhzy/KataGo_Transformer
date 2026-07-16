@@ -1147,6 +1147,7 @@ class SparseMoE(torch.nn.Module):
         self.collect_load_stats = False
         self.router_jitter_noise = 0.0
         self.balance_bias_update_rate = 0.0
+        self.defer_balance_bias_update = False
         self.register_buffer(
             "router_selection_bias",
             torch.zeros(num_experts, dtype=torch.float32),
@@ -1154,6 +1155,11 @@ class SparseMoE(torch.nn.Module):
         self.register_buffer(
             "last_assignment_fraction",
             torch.zeros(num_experts, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "last_assignment_weight",
+            torch.zeros((), dtype=torch.float32),
             persistent=False,
         )
         self.router = torch.nn.Linear(c_main, num_experts, bias=False)
@@ -1220,24 +1226,41 @@ class SparseMoE(torch.nn.Module):
         assignments = torch.nn.functional.one_hot(
             top_indices, num_classes=self.num_experts
         ).float()
+        store_assignment_load = self.collect_load_stats or (
+            self.training
+            and self.balance_bias_update_rate > 0.0
+            and self.defer_balance_bias_update
+        )
         if item_weights is None:
             assignment_fraction = assignments.mean(dim=(0, 1))
+            if store_assignment_load:
+                assignment_weight = assignment_fraction.new_tensor(
+                    assignments.shape[0] * assignments.shape[1]
+                )
             probability_fraction = router_probs.mean(dim=0)
         else:
             item_weights = item_weights.float()
-            weight_sum = item_weights.sum().clamp_min(1.0)
+            raw_weight_sum = item_weights.sum()
+            weight_sum = raw_weight_sum.clamp_min(1.0)
             assignment_fraction = (
                 assignments * item_weights[:, None, None]
             ).sum(dim=(0, 1)) / (weight_sum * self.top_k)
+            if store_assignment_load:
+                assignment_weight = raw_weight_sum * self.top_k
             probability_fraction = (
                 router_probs * item_weights[:, None]
             ).sum(dim=0) / weight_sum
         load_balance_loss = self.num_experts * torch.sum(
             assignment_fraction * probability_fraction
         )
-        if self.collect_load_stats:
+        if store_assignment_load:
             self.last_assignment_fraction.copy_(assignment_fraction.detach())
-        if self.training and self.balance_bias_update_rate > 0.0:
+            self.last_assignment_weight.copy_(assignment_weight.detach())
+        if (
+            self.training
+            and self.balance_bias_update_rate > 0.0
+            and not self.defer_balance_bias_update
+        ):
             with torch.no_grad():
                 target_fraction = 1.0 / self.num_experts
                 self.router_selection_bias.add_(
@@ -2822,6 +2845,7 @@ class Model(torch.nn.Module):
         router_jitter_noise: float = 0.0,
         balance_bias_update_rate: float = 0.0,
         load_balance_loss_scale: Optional[float] = None,
+        defer_balance_bias_update: bool = False,
     ):
         assert batched_experts_per_group >= 0
         assert 0.0 <= router_jitter_noise < 1.0
@@ -2840,6 +2864,60 @@ class Model(torch.nn.Module):
                 module.collect_load_stats = collect_load_stats
                 module.router_jitter_noise = router_jitter_noise
                 module.balance_bias_update_rate = balance_bias_update_rate
+                module.defer_balance_bias_update = defer_balance_bias_update
+
+    @staticmethod
+    @torch.no_grad()
+    def _synchronize_moe_assignment_load(
+        modules: List[SparseMoE],
+        update_balance_bias: bool,
+    ):
+        """All-reduce all MoE layer loads with one collective operation."""
+        if len(modules) == 0:
+            return
+
+        packed_parts = []
+        for module in modules:
+            packed_parts.append(
+                module.last_assignment_fraction * module.last_assignment_weight
+            )
+            packed_parts.append(module.last_assignment_weight.reshape(1))
+        packed_load = torch.cat(packed_parts)
+        torch.distributed.all_reduce(packed_load, op=torch.distributed.ReduceOp.SUM)
+
+        offset = 0
+        for module in modules:
+            assignment_counts = packed_load[offset:offset + module.num_experts]
+            offset += module.num_experts
+            assignment_weight = packed_load[offset]
+            offset += 1
+            assignment_fraction = assignment_counts / assignment_weight.clamp_min(1.0)
+            module.last_assignment_fraction.copy_(assignment_fraction)
+            module.last_assignment_weight.copy_(assignment_weight)
+            if update_balance_bias and module.balance_bias_update_rate > 0.0:
+                target_fraction = 1.0 / module.num_experts
+                module.router_selection_bias.add_(
+                    module.balance_bias_update_rate
+                    * torch.sign(target_fraction - assignment_fraction)
+                )
+                module.router_selection_bias.sub_(
+                    module.router_selection_bias.mean()
+                )
+
+    def synchronize_moe_assignment_load(self, update_balance_bias: bool):
+        modules = [
+            module
+            for module in self.modules()
+            if isinstance(module, SparseMoE)
+            and (
+                module.collect_load_stats
+                or (
+                    update_balance_bias
+                    and module.balance_bias_update_rate > 0.0
+                )
+            )
+        ]
+        self._synchronize_moe_assignment_load(modules, update_balance_bias)
 
     def get_moe_load_stats(self):
         stats = {}

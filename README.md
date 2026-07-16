@@ -32,6 +32,8 @@ MoE is enabled by adding these fields to a model config:
 
 Reference model names are `b14c192h6tflrsmoet-bng-silu` (token routing, 8 experts, Top-2) and `b14c192h6tflrsmoeb-bng-silu` (board routing, 8 experts, Top-1). The Switch-style load-balancing loss is averaged across MoE layers and reported as `moeloadbal` and `moeloss`.
 
+`train_muon_ki.py` synchronizes hard routing loads under DDP before updating the expert-selection bias. Counts from every MoE layer are packed into one all-reduce per batch, weighted by the number of valid routed items, and `moe_load_stats.jsonl` therefore reports global rather than rank-local load in DDP runs. Single-GPU routing and bias updates retain their original execution path.
+
 **Source Code**: `TransformerRoPEGQABlock` class in `./train/model_pytorch.py`.
 
 **Configurations**:

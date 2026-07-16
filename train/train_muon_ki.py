@@ -730,6 +730,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 router_jitter_noise=moe_router_jitter_noise,
                 balance_bias_update_rate=moe_balance_bias_update_rate,
                 load_balance_loss_scale=moe_load_balance_loss_scale,
+                defer_balance_bias_update=world_size > 1,
             )
             
             if qat_int8:
@@ -799,6 +800,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 router_jitter_noise=moe_router_jitter_noise,
                 balance_bias_update_rate=moe_balance_bias_update_rate,
                 load_balance_loss_scale=moe_load_balance_loss_scale,
+                defer_balance_bias_update=world_size > 1,
             )
 
             train_state = {}
@@ -1515,6 +1517,14 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 else:
                     loss.backward()
 
+                if world_size > 1 and moe_balance_bias_update_rate > 0.0:
+                    # Routing load is local to each DDP rank. Aggregate all MoE
+                    # layers with one collective, then apply the same bias update
+                    # on every rank before the next forward pass.
+                    raw_model.synchronize_moe_assignment_load(
+                        update_balance_bias=True
+                    )
+
                 if model_config["norm_kind"] == "fixup" or model_config["norm_kind"] == "fixscale" or model_config["norm_kind"] == "fixscaleonenorm":
                     gnorm_cap = 20000.0 * (1.0 if gnorm_clip_scale is None else gnorm_clip_scale)
                 elif model_config["norm_kind"] == "bnorm" or model_config["norm_kind"] == "brenorm" or model_config["norm_kind"] == "fixbrenorm":
@@ -1563,6 +1573,10 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     moe_load_stats_out is not None
                     and batch_count_this_epoch % moe_load_stats_every == 0
                 ):
+                    if world_size > 1 and moe_balance_bias_update_rate <= 0.0:
+                        raw_model.synchronize_moe_assignment_load(
+                            update_balance_bias=False
+                        )
                     layer_stats = raw_model.get_moe_load_stats()
                     max_mean_values = [
                         layer["max_mean"] for layer in layer_stats.values()

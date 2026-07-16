@@ -1,8 +1,61 @@
+import os
+import socket
 import unittest
+from unittest import mock
 
 import torch
 
-from model_pytorch import SparseMoE, TransformerRoPEGQABlock
+from model_pytorch import Model, SparseMoE, TransformerRoPEGQABlock
+
+
+def _run_moe_ddp_worker(rank: int, world_size: int, master_port: int):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(master_port)
+    torch.distributed.init_process_group(
+        "gloo", rank=rank, world_size=world_size
+    )
+    try:
+        torch.manual_seed(0)
+        moe = SparseMoE(
+            c_main=2,
+            ffn_dim=4,
+            num_experts=4,
+            top_k=1,
+            routing_mode=SparseMoE.BOARD_ROUTING,
+            activation="silu",
+            use_swiglu=True,
+        )
+        moe.balance_bias_update_rate = 0.001
+        moe.defer_balance_bias_update = True
+        with torch.no_grad():
+            moe.router.weight.copy_(torch.tensor([
+                [1.0, 0.0],
+                [-1.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ]))
+        ddp_moe = torch.nn.parallel.DistributedDataParallel(moe)
+        direction = 1.0 if rank == 0 else -1.0
+        x = torch.tensor([[[direction, 0.0], [direction, 0.0]]])
+        output, load_balance_loss = ddp_moe(x, torch.ones(1, 2))
+        (output.square().mean() + 0.01 * load_balance_loss).backward()
+
+        Model._synchronize_moe_assignment_load([moe], True)
+
+        torch.testing.assert_close(
+            moe.last_assignment_fraction,
+            torch.tensor([0.5, 0.5, 0.0, 0.0]),
+        )
+        torch.testing.assert_close(
+            moe.router_selection_bias,
+            torch.tensor([-0.001, -0.001, 0.001, 0.001]),
+        )
+        gathered_biases = [torch.empty_like(moe.router_selection_bias) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered_biases, moe.router_selection_bias)
+        for bias in gathered_biases[1:]:
+            torch.testing.assert_close(bias, gathered_biases[0])
+    finally:
+        torch.distributed.destroy_process_group()
 
 
 class SparseMoETest(unittest.TestCase):
@@ -109,10 +162,72 @@ class SparseMoETest(unittest.TestCase):
             moe.router.weight.zero_()
 
         first_indices, _, _ = moe._route(torch.zeros(16, 8))
+        first_assignment_fraction = torch.nn.functional.one_hot(
+            first_indices, num_classes=moe.num_experts
+        ).float().mean(dim=(0, 1))
+        expected_bias = 0.001 * torch.sign(
+            1.0 / moe.num_experts - first_assignment_fraction
+        )
+        expected_bias = expected_bias - expected_bias.mean()
+        torch.testing.assert_close(moe.router_selection_bias, expected_bias)
+
         second_indices, _, _ = moe._route(torch.zeros(16, 8))
 
         self.assertFalse(torch.equal(first_indices, second_indices))
         self.assertAlmostEqual(moe.router_selection_bias.sum().item(), 0.0, places=6)
+
+    def test_deferred_selection_bias_uses_globally_weighted_ddp_load(self):
+        moe = SparseMoE(
+            c_main=8,
+            ffn_dim=16,
+            num_experts=4,
+            top_k=1,
+            routing_mode=SparseMoE.BOARD_ROUTING,
+            activation="silu",
+            use_swiglu=True,
+        )
+        moe.balance_bias_update_rate = 0.001
+        moe.defer_balance_bias_update = True
+        moe.last_assignment_fraction.copy_(torch.tensor([1.0, 0.0, 0.0, 0.0]))
+        moe.last_assignment_weight.fill_(2.0)
+
+        # Simulate another rank with six assignments, all routed to expert 1.
+        other_rank_packed_load = torch.tensor([0.0, 6.0, 0.0, 0.0, 6.0])
+
+        def add_other_rank_load(packed_load, op):
+            self.assertIs(op, torch.distributed.ReduceOp.SUM)
+            packed_load.add_(other_rank_packed_load)
+
+        with mock.patch(
+            "torch.distributed.all_reduce", side_effect=add_other_rank_load
+        ) as all_reduce:
+            Model._synchronize_moe_assignment_load([moe], True)
+
+        all_reduce.assert_called_once()
+        torch.testing.assert_close(
+            moe.last_assignment_fraction,
+            torch.tensor([0.25, 0.75, 0.0, 0.0]),
+        )
+        torch.testing.assert_close(
+            moe.router_selection_bias,
+            torch.tensor([-0.00025, -0.00125, 0.00075, 0.00075]),
+        )
+        self.assertAlmostEqual(moe.router_selection_bias.sum().item(), 0.0, places=7)
+
+    @unittest.skipIf(
+        os.name == "nt",
+        "This PyTorch Windows build cannot create a Gloo process-group device",
+    )
+    def test_two_rank_ddp_forward_backward_and_bias_sync(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            master_port = sock.getsockname()[1]
+        torch.multiprocessing.spawn(
+            _run_moe_ddp_worker,
+            args=(2, master_port),
+            nprocs=2,
+            join=True,
+        )
 
     def test_old_checkpoint_without_selection_bias_loads_strictly(self):
         moe = SparseMoE(
