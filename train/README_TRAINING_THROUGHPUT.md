@@ -50,6 +50,9 @@ gradient communication remains FP32.
 
 ## Full-board mask-free training
 
+See `README_FULL_BOARD_MASKLESS_BENCHMARK.md` for the complete implementation,
+correctness, SDPA microbenchmark, and end-to-end measurement record.
+
 When every sample uses the complete `pos_len` by `pos_len` board, the model and
 loss can omit spatial masks. This lets CUDA SDPA select an unmasked fused
 attention kernel and removes redundant mask operations from normalization,
