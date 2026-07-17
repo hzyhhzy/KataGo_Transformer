@@ -1,4 +1,5 @@
 import math
+import os
 import numpy as np
 import torch
 import torch.nn
@@ -29,6 +30,21 @@ ERROR_MSG = (
 assert parse(current_version) >= parse(MIN_VERSION), ERROR_MSG
 
 EXTRA_SCORE_DISTR_RADIUS = 60
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Cast only the batch-sized rotation tables under AMP. Set the environment
+# variable to 0 for a full-FP32 rotation regression comparison.
+LEARNED_ROPE_CAST_TO_INPUT_DTYPE = _env_flag(
+    "KATAGO_LEARNED_ROPE_CAST_TO_INPUT_DTYPE", default=True
+)
+
 
 class ExtraOutputs:
     def __init__(self, requested: List[str]):
@@ -1090,6 +1106,11 @@ def apply_learnable_rotary_emb(
         if cos.dim() == 3:
             cos = cos.unsqueeze(0)
             sin = sin.unsqueeze(0)
+        if LEARNED_ROPE_CAST_TO_INPUT_DTYPE:
+            # The trigonometric functions remain FP32, but avoid promoting the
+            # batch-sized Q/K rotation intermediates back to FP32 under AMP.
+            cos = cos.to(dtype=x.dtype)
+            sin = sin.to(dtype=x.dtype)
         out = torch.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], dim=-1)
         return out.reshape(batch_size, seq_len, num_heads, head_dim).type_as(x)
 

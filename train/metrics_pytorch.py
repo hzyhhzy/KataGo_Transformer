@@ -1,11 +1,24 @@
 from typing import Any, Dict, List
 import math
+import os
 
 from model_pytorch import EXTRA_SCORE_DISTR_RADIUS, Model, compute_gain, ExtraOutputs, MetadataEncoder
 
 import torch
 import torch.nn
 import torch.nn.functional
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    value = value.strip().lower()
+    if value in ("", "0", "false", "no", "off"):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(f"Invalid boolean value for {name}: {value!r}")
 
 def cross_entropy(pred_logits, target_probs, dim):
     return -torch.sum(target_probs * torch.nn.functional.log_softmax(pred_logits, dim=dim), dim=dim)
@@ -37,6 +50,17 @@ class Metrics:
         self.score_belief_offset_vector = raw_model.value_head.score_belief_offset_vector
         self.moving_unowned_proportion_sum = 0.0
         self.moving_unowned_proportion_weight = 0.0
+        self.seki_ema_on_device = _env_flag(
+            "KATAGO_SEKI_EMA_ON_DEVICE", default=True
+        )
+        if self.seki_ema_on_device:
+            metric_device = self.score_belief_offset_vector.device
+            self.moving_unowned_proportion_sum = torch.zeros(
+                [], device=metric_device, dtype=torch.float32
+            )
+            self.moving_unowned_proportion_weight = torch.zeros(
+                [], device=metric_device, dtype=torch.float32
+            )
 
     def state_dict(self):
         return dict(
@@ -45,10 +69,36 @@ class Metrics:
         )
     def load_state_dict(self, state_dict: Dict[str,Any]):
         if isinstance(state_dict["moving_unowned_proportion_sum"],torch.Tensor):
-            self.moving_unowned_proportion_sum = state_dict["moving_unowned_proportion_sum"].item()
+            if self.seki_ema_on_device:
+                self.moving_unowned_proportion_sum = state_dict["moving_unowned_proportion_sum"].detach().to(
+                    device=self.moving_unowned_proportion_sum.device,
+                    dtype=self.moving_unowned_proportion_sum.dtype,
+                )
+            else:
+                self.moving_unowned_proportion_sum = state_dict["moving_unowned_proportion_sum"].item()
         else:
-            self.moving_unowned_proportion_sum = state_dict["moving_unowned_proportion_sum"]
-        self.moving_unowned_proportion_weight = state_dict["moving_unowned_proportion_weight"]
+            if self.seki_ema_on_device:
+                self.moving_unowned_proportion_sum.fill_(
+                    state_dict["moving_unowned_proportion_sum"]
+                )
+            else:
+                self.moving_unowned_proportion_sum = state_dict["moving_unowned_proportion_sum"]
+        if self.seki_ema_on_device:
+            moving_weight = state_dict["moving_unowned_proportion_weight"]
+            if isinstance(moving_weight, torch.Tensor):
+                self.moving_unowned_proportion_weight = moving_weight.detach().to(
+                    device=self.moving_unowned_proportion_sum.device,
+                    dtype=self.moving_unowned_proportion_sum.dtype,
+                )
+            else:
+                self.moving_unowned_proportion_weight.fill_(moving_weight)
+        else:
+            moving_weight = state_dict["moving_unowned_proportion_weight"]
+            self.moving_unowned_proportion_weight = (
+                moving_weight.item()
+                if isinstance(moving_weight, torch.Tensor)
+                else moving_weight
+            )
 
     def loss_policy_player_samplewise(self, pred_logits, target_probs, weight, global_weight):
         assert pred_logits.shape == (self.n, self.policy_len)
@@ -148,10 +198,39 @@ class Metrics:
         unowned_proportion = torch.mean(unowned_proportion * weight)
         if is_training:
             if not skip_moving_update:
-                self.moving_unowned_proportion_sum *= 0.998
-                self.moving_unowned_proportion_weight *= 0.998
-                self.moving_unowned_proportion_sum += unowned_proportion.item()
-                self.moving_unowned_proportion_weight += 1.0
+                if self.seki_ema_on_device:
+                    if not isinstance(self.moving_unowned_proportion_sum, torch.Tensor):
+                        self.moving_unowned_proportion_sum = unowned_proportion.detach().new_tensor(
+                            self.moving_unowned_proportion_sum
+                        )
+                    elif (
+                        self.moving_unowned_proportion_sum.device != unowned_proportion.device
+                        or self.moving_unowned_proportion_sum.dtype != unowned_proportion.dtype
+                    ):
+                        self.moving_unowned_proportion_sum = self.moving_unowned_proportion_sum.detach().to(
+                            device=unowned_proportion.device,
+                            dtype=unowned_proportion.dtype,
+                        )
+                    if not isinstance(self.moving_unowned_proportion_weight, torch.Tensor):
+                        self.moving_unowned_proportion_weight = unowned_proportion.detach().new_tensor(
+                            self.moving_unowned_proportion_weight
+                        )
+                    elif (
+                        self.moving_unowned_proportion_weight.device != unowned_proportion.device
+                        or self.moving_unowned_proportion_weight.dtype != unowned_proportion.dtype
+                    ):
+                        self.moving_unowned_proportion_weight = self.moving_unowned_proportion_weight.detach().to(
+                            device=unowned_proportion.device,
+                            dtype=unowned_proportion.dtype,
+                        )
+                    with torch.no_grad():
+                        self.moving_unowned_proportion_sum.mul_(0.998).add_(unowned_proportion.detach())
+                        self.moving_unowned_proportion_weight.mul_(0.998).add_(1.0)
+                else:
+                    self.moving_unowned_proportion_sum *= 0.998
+                    self.moving_unowned_proportion_weight *= 0.998
+                    self.moving_unowned_proportion_sum += unowned_proportion.item()
+                    self.moving_unowned_proportion_weight += 1.0
             moving_unowned_proportion = self.moving_unowned_proportion_sum / self.moving_unowned_proportion_weight
             seki_weight_scale = 8.0 * 0.005 / (0.005 + moving_unowned_proportion)
         else:
@@ -305,6 +384,26 @@ class Metrics:
         modelnorm_output_noreg *= 0.5
         return (modelnorm_normal, modelnorm_normal_gamma,  modelnorm_normal_attn, modelnorm_output, modelnorm_noreg, modelnorm_output_noreg)
 
+    @staticmethod
+    @torch.no_grad()
+    def get_model_norm_metrics(raw_model):
+        (
+            modelnorm_normal,
+            modelnorm_normal_gamma,
+            modelnorm_normal_attn,
+            modelnorm_output,
+            modelnorm_noreg,
+            modelnorm_output_noreg,
+        ) = Metrics.get_model_norms(raw_model)
+        return {
+            "norm_normal_batch": modelnorm_normal,
+            "norm_normal_gamma_batch": modelnorm_normal_gamma,
+            "norm_normal_attn_batch": modelnorm_normal_attn,
+            "norm_output_batch": modelnorm_output,
+            "norm_noreg_batch": modelnorm_noreg,
+            "norm_output_noreg_batch": modelnorm_output_noreg,
+        }
+
     def get_specific_norms_and_gradient_stats(self,raw_model):
         with torch.no_grad():
             params = {}
@@ -387,6 +486,7 @@ class Metrics:
         variance_time_loss_scale,
         main_loss_scale,
         intermediate_loss_scale,
+        include_model_norms=True,
     ):
         results = self.metrics_dict_batchwise_single_heads_output(
             raw_model,
@@ -401,6 +501,7 @@ class Metrics:
             seki_loss_scale=seki_loss_scale,
             variance_time_loss_scale=variance_time_loss_scale,
             is_intermediate=False,
+            include_model_norms=include_model_norms,
         )
         if main_loss_scale is not None:
             results["loss_sum"] = main_loss_scale * results["loss_sum"]
@@ -427,12 +528,19 @@ class Metrics:
                     seki_loss_scale=seki_loss_scale,
                     variance_time_loss_scale=variance_time_loss_scale,
                     is_intermediate=True,
+                    include_model_norms=False,
                 )
                 for key,value in iresults.items():
                     if key != "loss_sum":
                         results["I"+key] = value
                 results["loss_sum"] = results["loss_sum"] + intermediate_loss_scale * iresults["loss_sum"]
 
+        # Only the aggregate loss participates in backward. Keeping every
+        # logging component attached makes AOTAutograd treat dozens of metrics
+        # as differentiable outputs and retains their graphs until logging.
+        for key, value in results.items():
+            if key != "loss_sum" and isinstance(value, torch.Tensor):
+                results[key] = value.detach()
         return results
 
     def metrics_dict_batchwise_single_heads_output(
@@ -449,6 +557,7 @@ class Metrics:
         seki_loss_scale,
         variance_time_loss_scale,
         is_intermediate,
+        include_model_norms=True,
     ):
         (
             policy_logits,
@@ -842,21 +951,15 @@ class Metrics:
                 global_weight,
             )
 
-            (modelnorm_normal, modelnorm_normal_gamma, modelnorm_normal_attn, modelnorm_output, modelnorm_noreg, modelnorm_output_noreg) = self.get_model_norms(raw_model)
-
             extra_results = {
                 "wsum": weight * self.world_size,
                 "nsamp": nsamples * self.world_size,
                 "ptentr_sum": policy_target_entropy,
                 "ptsoftentr_sum": soft_policy_target_entropy,
                 "sekiweightscale_sum": seki_weight_scale * weight,
-                "norm_normal_batch": modelnorm_normal,
-                "norm_normal_gamma_batch": modelnorm_normal_gamma,
-                "norm_normal_attn_batch": modelnorm_normal_attn,
-                "norm_output_batch": modelnorm_output,
-                "norm_noreg_batch": modelnorm_noreg,
-                "norm_output_noreg_batch": modelnorm_output_noreg,
             }
+            if include_model_norms:
+                extra_results.update(self.get_model_norm_metrics(raw_model))
             for key,value in extra_results.items():
                 results[key] = value
             return results

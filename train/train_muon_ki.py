@@ -31,7 +31,6 @@ import torch.distributed
 import torch.multiprocessing
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim.swa_utils import AveragedModel
-from torch.cuda.amp import GradScaler, autocast
 #torch.autograd.set_detect_anomaly(True) # Should set GradScaler(init_scale=2.0)
 
 import modelconfigs
@@ -42,6 +41,59 @@ import data_processing_pytorch
 from metrics_logging import accumulate_metrics, log_metrics, clear_metric_nonfinite
 from muon_kissin import MuonWithAuxAdamKimi
 torch.set_float32_matmul_precision('high')
+
+
+def add_amp_arguments(argument_container):
+    """Add mutually exclusive mixed-precision command-line options."""
+    amp_args = argument_container.add_mutually_exclusive_group()
+    amp_args.add_argument(
+        '-use-fp16', help='Use FP16 AMP training', required=False, action='store_true'
+    )
+    amp_args.add_argument(
+        '-use-bf16', help='Use BF16 AMP training', required=False, action='store_true'
+    )
+
+
+def validate_amp_qat_options(use_fp16: bool, use_bf16: bool, qat_int8: bool):
+    if use_fp16 and use_bf16:
+        raise ValueError("FP16 AMP and BF16 AMP are mutually exclusive")
+    if qat_int8:
+        assert not use_fp16, "QAT INT8 enabled. FP16/AMP is not supported. Remove this if it not report any error."
+        assert not use_bf16, "QAT INT8 enabled. BF16/AMP is not supported. Remove this if it not report any error."
+
+
+def amp_autocast_context(use_fp16: bool, use_bf16: bool):
+    """Return the requested CUDA autocast context without changing legacy defaults."""
+    if use_fp16:
+        return torch.amp.autocast(device_type='cuda')
+    if use_bf16:
+        return torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
+def create_grad_scaler(use_fp16: bool, use_bf16: bool):
+    """Grad scaling is needed for FP16 only; BF16 uses unscaled gradients."""
+    if use_fp16 and use_bf16:
+        raise ValueError("FP16 AMP and BF16 AMP are mutually exclusive")
+    return torch.amp.GradScaler("cuda") if use_fp16 else None
+
+
+def backward_and_unscale(loss, optimizer, scaler):
+    if scaler is None:
+        loss.backward()
+    else:
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+
+
+def optimizer_step(optimizer, scaler):
+    if scaler is None:
+        optimizer.step()
+    else:
+        scaler.step(optimizer)
+        scaler.update()
+
+
 # HANDLE COMMAND AND ARGS -------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -88,7 +140,7 @@ if __name__ == "__main__":
     optional_args.add_argument('-swa-scales', help='Number of samples to average in expectation together for SWA', type=str, required=False)
 
     optional_args.add_argument('-multi-gpus', help='Use multiple gpus, comma-separated device ids', required=False)
-    optional_args.add_argument('-use-fp16', help='Use fp16 training', required=False, action='store_true')
+    add_amp_arguments(optional_args)
     optional_args.add_argument('-qat-int8', help='Enable INT8 QAT', required=False, action='store_true')    
     optional_args.add_argument('-master-port', help='Localhost port', default=23456, type=int, required=False)
     optional_args.add_argument('-no-compile', help='Do not torch.compile', required=False, action='store_true')
@@ -157,6 +209,220 @@ def multiprocessing_setup(rank: int, world_size: int, master_port: int):
 
 def multiprocessing_cleanup():
     torch.distributed.destroy_process_group()
+
+
+_DDP_STATIC_GRAPH_ENV = "KATAGO_DDP_STATIC_GRAPH"
+_DDP_GRADIENT_AS_BUCKET_VIEW_ENV = "KATAGO_DDP_GRADIENT_AS_BUCKET_VIEW"
+_DDP_BROADCAST_BUFFERS_ENV = "KATAGO_DDP_BROADCAST_BUFFERS"
+_DDP_ALIGN_CONV1X1_WEIGHT_STRIDES_ENV = "KATAGO_DDP_ALIGN_CONV1X1_WEIGHT_STRIDES"
+_COMPILE_MODE_ENV = "KATAGO_COMPILE_MODE"
+_ALLOWED_COMPILE_MODES = (
+    "default",
+    "max-autotune-no-cudagraphs",
+    "max-autotune",
+)
+
+_RANK0_ACTION_PROCEED = 0
+_RANK0_ACTION_RETRY = 1
+_RANK0_ACTION_STOP = 2
+
+
+def _get_strict_env_bool(name: str, default: bool = False) -> bool:
+    """Read a boolean environment flag, accepting only the exact values 0 and 1."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    if value == "0":
+        return False
+    if value == "1":
+        return True
+    raise ValueError(
+        f"Environment variable {name} must be exactly '0' or '1', got {value!r}"
+    )
+
+
+def _get_compile_mode() -> str:
+    mode = os.environ.get(_COMPILE_MODE_ENV, "default")
+    if mode in _ALLOWED_COMPILE_MODES:
+        return mode
+    allowed = "|".join(_ALLOWED_COMPILE_MODES)
+    raise ValueError(
+        f"Environment variable {_COMPILE_MODE_ENV} must be one of {allowed}, got {mode!r}"
+    )
+
+
+def resolve_compile_training_loss(
+    requested: bool,
+    no_compile: bool,
+    qat_int8: bool,
+) -> bool:
+    """Honor global compile/QAT constraints for the separately compiled loss."""
+    return requested and not no_compile and not qat_int8
+
+
+def set_snapshot_metrics(metric_sums, metric_weights, metrics, keys):
+    """Store point-in-time metrics without depending on moving-average weight."""
+    for key in keys:
+        metric_sums[key] = metrics[key]
+        metric_weights[key] = 1.0
+
+
+def broadcast_rank0_action(local_action, rank: int, world_size: int, device) -> int:
+    """Broadcast a low-frequency control-flow decision made by rank 0."""
+    if world_size <= 1:
+        if local_action is None:
+            raise ValueError("rank 0 action must be provided for single-process training")
+        return int(local_action)
+
+    action_value = int(local_action) if rank == 0 else _RANK0_ACTION_PROCEED
+    action_tensor = torch.tensor(
+        [action_value],
+        dtype=torch.int32,
+        device=device,
+    )
+    torch.distributed.broadcast(action_tensor, src=0)
+    return int(action_tensor.item())
+
+
+def get_local_validation_model(training_model, raw_model, world_size: int):
+    """Return a local forward module that cannot initiate DDP collectives."""
+    if world_size <= 1:
+        return training_model
+
+    current = training_model
+    visited = set()
+    while id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, DistributedDataParallel):
+            # The common compile-before-DDP path preserves the compiled local
+            # module here, while bypassing DDP's forward-time buffer broadcast.
+            return current.module
+        original_module = getattr(current, "_orig_mod", None)
+        if original_module is None or original_module is current:
+            break
+        current = original_module
+
+    # Unknown wrappers are not safe to call from rank 0 alone.
+    return raw_model
+
+
+@torch.no_grad()
+def align_conv1x1_weight_strides_for_ddp(raw_model) -> int:
+    """Match the layout produced by convolution backward for 1x1 weights.
+
+    CUDA convolution backward commonly returns a logically contiguous
+    ``[out, in, 1, 1]`` gradient with strides ``[in, 1, in, in]``. PyTorch's
+    default parameter allocation uses ``[in, 1, 1, 1]`` instead. Both layouts
+    address exactly the same storage because the last dimensions have size 1,
+    but DDP otherwise warns and copies into a differently-strided bucket view.
+    """
+    aligned_count = 0
+    for module in raw_model.modules():
+        if not isinstance(module, torch.nn.Conv2d):
+            continue
+        weight = module.weight
+        if (
+            weight is None
+            or weight.ndim != 4
+            or tuple(weight.shape[2:]) != (1, 1)
+        ):
+            continue
+        in_channels_per_group = weight.shape[1]
+        desired_stride = (
+            in_channels_per_group,
+            1,
+            in_channels_per_group,
+            in_channels_per_group,
+        )
+        if weight.stride() == desired_stride:
+            continue
+        aligned_weight = torch.empty_strided(
+            weight.shape,
+            desired_stride,
+            dtype=weight.dtype,
+            device=weight.device,
+        )
+        aligned_weight.copy_(weight)
+        module.weight = torch.nn.Parameter(
+            aligned_weight,
+            requires_grad=weight.requires_grad,
+        )
+        aligned_count += 1
+    return aligned_count
+
+
+def wrap_model_for_training(
+    raw_model,
+    device,
+    world_size: int,
+    no_compile: bool,
+    qat_int8: bool = False,
+):
+    """Apply torch.compile and DDP without changing ownership of ``raw_model``."""
+    compile_mode = None if no_compile else _get_compile_mode()
+    if world_size <= 1:
+        logging.info(
+            "Training model wrapper: single GPU, compile=%s, compile_mode=%s; "
+            "DDP environment flags ignored",
+            not no_compile,
+            compile_mode,
+        )
+        if no_compile:
+            return raw_model
+        return torch.compile(raw_model, mode=compile_mode)
+
+    static_graph = _get_strict_env_bool(_DDP_STATIC_GRAPH_ENV, default=True)
+    gradient_as_bucket_view = _get_strict_env_bool(
+        _DDP_GRADIENT_AS_BUCKET_VIEW_ENV, default=True
+    )
+    align_conv1x1_weight_strides = _get_strict_env_bool(
+        _DDP_ALIGN_CONV1X1_WEIGHT_STRIDES_ENV, default=True
+    )
+    aligned_conv1x1_count = (
+        align_conv1x1_weight_strides_for_ddp(raw_model)
+        if align_conv1x1_weight_strides
+        else 0
+    )
+    # Plain batch norm uses the current batch during training, so synchronizing
+    # its running statistics before every forward does not affect gradients or
+    # rank 0's checkpointed statistics. Batch renorm does consume its running
+    # statistics in the training forward and therefore keeps DDP's behavior.
+    # QAT also keeps broadcasts because observer/FakeQuant buffers affect
+    # later forwards.
+    norm_kind = raw_model.get_norm_kind()
+    broadcast_buffers = _get_strict_env_bool(
+        _DDP_BROADCAST_BUFFERS_ENV,
+        default=qat_int8 or norm_kind in ("brenorm", "fixbrenorm"),
+    )
+    logging.info(
+        "Training model wrapper: DDP world_size=%d, compile=%s, "
+        "compile_mode=%s, static_graph=%s, gradient_as_bucket_view=%s, "
+        "broadcast_buffers=%s, aligned_conv1x1_weights=%d",
+        world_size,
+        not no_compile,
+        compile_mode,
+        static_graph,
+        gradient_as_bucket_view,
+        broadcast_buffers,
+        aligned_conv1x1_count,
+    )
+
+    ddp_kwargs = {
+        "device_ids": [device],
+        "broadcast_buffers": broadcast_buffers,
+    }
+    if static_graph:
+        ddp_kwargs["static_graph"] = True
+    if gradient_as_bucket_view:
+        ddp_kwargs["gradient_as_bucket_view"] = True
+
+    if no_compile:
+        return DistributedDataParallel(raw_model, **ddp_kwargs)
+
+    compiled_model = torch.compile(raw_model, mode=compile_mode)
+    return DistributedDataParallel(compiled_model, **ddp_kwargs)
+
+
 import torch
 import torch.nn as nn
 from torch.nn.modules.batchnorm import _BatchNorm  # 覆盖所有 BatchNorm 类型
@@ -253,6 +519,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     history_matrices_type = args["history_matrices_type"]
 
     use_fp16 = args["use_fp16"]
+    use_bf16 = args["use_bf16"]
     master_port = args["master_port"]
     no_compile = args["no_compile"]
     
@@ -272,11 +539,28 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     quit_if_no_data = args["quit_if_no_data"]
     qat_int8 = args["qat_int8"]
 
+    validate_amp_qat_options(use_fp16, use_bf16, qat_int8)
     if qat_int8:
         assert no_compile, "QAT INT8 enabled. Compilation is not supported. Remove this if it not report any error."
-        assert not use_fp16, "QAT INT8 enabled. FP16/AMP is not supported. Remove this if it not report any error."
 
     gnorm_stats_debug = args["gnorm_stats_debug"]
+    model_norms_only_at_print = _get_strict_env_bool(
+        "KATAGO_MODEL_NORMS_ONLY_AT_PRINT", default=True
+    )
+    compile_training_loss_requested = _get_strict_env_bool(
+        "KATAGO_COMPILE_TRAINING_LOSS", default=True
+    )
+    compile_training_loss = resolve_compile_training_loss(
+        compile_training_loss_requested,
+        no_compile,
+        qat_int8,
+    )
+    if compile_training_loss_requested and not compile_training_loss:
+        logging.info(
+            "Disabling compiled training loss because no_compile=%s and qat_int8=%s",
+            no_compile,
+            qat_int8,
+        )
 
     brenorm_target_rmax = args["brenorm_target_rmax"]
     brenorm_target_dmax = args["brenorm_target_dmax"]
@@ -675,19 +959,13 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
             raw_model.to(device)
             #raw_model_compiled=torch.compile(raw_model,mode="max-autotune-no-cudagraphs")
-            if not no_compile:
-                raw_model_compiled=torch.compile(raw_model,mode="default")
-                #raw_model_compiled=torch.compile(raw_model,mode="max-autotune-no-cudagraphs")
-                #raw_model_compiled=torch.compile(raw_model,mode="max-autotune")
-                if world_size > 1:
-                    ddp_model = torch.nn.parallel.DistributedDataParallel(raw_model_compiled, device_ids=[device])
-                else:
-                    ddp_model = raw_model_compiled
-            else:
-                if world_size > 1:
-                    ddp_model = torch.nn.parallel.DistributedDataParallel(raw_model, device_ids=[device])
-                else:
-                    ddp_model = raw_model
+            ddp_model = wrap_model_for_training(
+                raw_model,
+                device,
+                world_size,
+                no_compile,
+                qat_int8=qat_int8,
+            )
 
             swa_models = []
             if rank == 0 and len(swa_scales)>0:
@@ -780,19 +1058,13 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             
             raw_model.to(device)
             #raw_model_compiled=torch.compile(raw_model,mode="max-autotune-no-cudagraphs")
-            if not no_compile:
-                raw_model_compiled=torch.compile(raw_model,mode="default")
-                #raw_model_compiled=torch.compile(raw_model,mode="max-autotune-no-cudagraphs")
-                #raw_model_compiled=torch.compile(raw_model,mode="max-autotune")
-                if world_size > 1:
-                    ddp_model = torch.nn.parallel.DistributedDataParallel(raw_model_compiled, device_ids=[device])
-                else:
-                    ddp_model = raw_model_compiled
-            else:
-                if world_size > 1:
-                    ddp_model = torch.nn.parallel.DistributedDataParallel(raw_model, device_ids=[device])
-                else:
-                    ddp_model = raw_model                   
+            ddp_model = wrap_model_for_training(
+                raw_model,
+                device,
+                world_size,
+                no_compile,
+                qat_int8=qat_int8,
+            )
                 
             swa_models = []
             if rank == 0 and len(swa_scales)>0:
@@ -897,6 +1169,27 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     logging.info(f"variance_time_loss_scale {variance_time_loss_scale}")
     logging.info(f"main_loss_scale {main_loss_scale}")
     logging.info(f"intermediate_loss_scale {intermediate_loss_scale}")
+    logging.info(f"model_norms_only_at_print {model_norms_only_at_print}")
+    logging.info(f"compile_training_loss {compile_training_loss}")
+
+    training_metrics_fn = metrics_obj.metrics_dict_batchwise
+    if compile_training_loss:
+        if not model_norms_only_at_print:
+            raise ValueError(
+                "KATAGO_COMPILE_TRAINING_LOSS=1 requires "
+                "KATAGO_MODEL_NORMS_ONLY_AT_PRINT=1 so the compiled result structure is fixed"
+            )
+        if not metrics_obj.seki_ema_on_device:
+            raise ValueError(
+                "KATAGO_COMPILE_TRAINING_LOSS=1 requires KATAGO_SEKI_EMA_ON_DEVICE=1 "
+                "to avoid a per-step Python scalar guard"
+            )
+        loss_compile_mode = _get_compile_mode()
+        training_metrics_fn = torch.compile(
+            training_metrics_fn,
+            mode=loss_compile_mode,
+            dynamic=False,
+        )
 
     # Print all model parameters just to get a summary
     total_num_params = 0
@@ -1251,6 +1544,14 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     last_longterm_checkpoint_save_time = datetime.datetime.now()
     num_epochs_this_instance = 0
     print_train_loss_every_batches = 100 if not gnorm_stats_debug else 1000
+    model_norm_metric_keys = (
+        "norm_normal_batch",
+        "norm_normal_gamma_batch",
+        "norm_normal_attn_batch",
+        "norm_output_batch",
+        "norm_noreg_batch",
+        "norm_output_noreg_batch",
+    )
 
     if "sums" not in running_metrics:
         running_metrics["sums"] = defaultdict(float)
@@ -1263,9 +1564,11 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
     torch.backends.cudnn.benchmark = True
 
+    scaler = create_grad_scaler(use_fp16, use_bf16)
     if use_fp16:
         logging.info("Training in FP16! Creating scaler")
-        scaler = GradScaler()
+    elif use_bf16:
+        logging.info("Training in BF16 AMP without gradient scaling.")
     else:
         logging.info("Training in FP32.")
 
@@ -1283,6 +1586,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             logging.info("Hit max training samples, done")
             break
 
+        epoch_action = _RANK0_ACTION_PROCEED
         if rank == 0:
             maybe_reload_training_data()
 
@@ -1298,14 +1602,29 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                             "Exceeding train bucket, not enough new data rows, terminating (current level %f)" %
                             train_state["train_bucket_level"]
                         )
-                        break
+                        epoch_action = _RANK0_ACTION_STOP
                     else:
                         logging.info(
                             "Exceeding train bucket, not enough new data rows, waiting 5m and retrying (current level %f)" %
                             train_state["train_bucket_level"]
                         )
-                        time.sleep(300)
-                        continue
+                        epoch_action = _RANK0_ACTION_RETRY
+
+        epoch_action = broadcast_rank0_action(
+            epoch_action if rank == 0 else None,
+            rank,
+            world_size,
+            device,
+        )
+        if epoch_action == _RANK0_ACTION_STOP:
+            break
+        if epoch_action == _RANK0_ACTION_RETRY:
+            # Complete the collective before waiting so NCCL cannot time out
+            # while rank 0 sleeps for new data.
+            time.sleep(300)
+            continue
+        if epoch_action != _RANK0_ACTION_PROCEED:
+            raise RuntimeError(f"Unknown rank 0 epoch action: {epoch_action}")
 
         # DDP need to wait on the main process after reloading data and/or training bucket waiting
         if barrier is not None:
@@ -1332,21 +1651,46 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
         # SUB EPOCH LOOP -----------
         batch_count_this_epoch = 0
         last_train_stats_time = time.perf_counter()
+        quit_due_to_no_data = False
         for i in range(sub_epochs):
+            data_attempt = 0
+            while True:
+                no_data_action = _RANK0_ACTION_PROCEED
+                if rank == 0:
+                    if i != 0 or data_attempt > 0:
+                        maybe_reload_training_data()
+                    train_files_to_use = get_files_for_subepoch()
+                    if train_files_to_use is None or len(train_files_to_use) <= 0:
+                        if quit_if_no_data:
+                            logging.info("Not enough data files to fill a subepoch! Quitting.")
+                            no_data_action = _RANK0_ACTION_STOP
+                        else:
+                            logging.info("Not enough data files to fill a subepoch! Waiting 5m before retrying.")
+                            no_data_action = _RANK0_ACTION_RETRY
+
+                no_data_action = broadcast_rank0_action(
+                    no_data_action if rank == 0 else None,
+                    rank,
+                    world_size,
+                    device,
+                )
+                if no_data_action == _RANK0_ACTION_RETRY:
+                    # All ranks leave the collective before sleeping, avoiding
+                    # a process-group timeout during an arbitrarily long wait.
+                    time.sleep(300)
+                    data_attempt += 1
+                    continue
+                if no_data_action == _RANK0_ACTION_STOP:
+                    quit_due_to_no_data = True
+                    break
+                if no_data_action != _RANK0_ACTION_PROCEED:
+                    raise RuntimeError(f"Unknown rank 0 no-data action: {no_data_action}")
+                break
+
+            if quit_due_to_no_data:
+                break
 
             if rank == 0:
-                if i != 0:
-                    maybe_reload_training_data()
-                train_files_to_use = get_files_for_subepoch()
-                while train_files_to_use is None or len(train_files_to_use) <= 0:
-                    if quit_if_no_data:
-                        logging.info("Not enough data files to fill a subepoch! Quitting.")
-                        sys.exit(0)
-                    logging.info("Not enough data files to fill a subepoch! Waiting 5m before retrying.")
-                    time.sleep(300)
-                    maybe_reload_training_data()
-                    train_files_to_use = get_files_for_subepoch()
-
                 if barrier is not None:
                     barrier.wait()
                 for wpipe in writepipes:
@@ -1383,8 +1727,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 # if raw_model.get_has_metadata_encoder():
                 #     extra_outputs = ExtraOutputs([MetadataEncoder.OUTMEAN_KEY,MetadataEncoder.OUTLOGVAR_KEY])
 
-                if use_fp16:
-                    with torch.amp.autocast(device_type='cuda'):
+                if use_fp16 or use_bf16:
+                    with amp_autocast_context(use_fp16, use_bf16):
                         model_outputs = ddp_model(
                             batch["binaryInputNCHW"],
                             batch["globalInputNC"],
@@ -1401,7 +1745,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     )
 
                 postprocessed = raw_model.postprocess_output(model_outputs)
-                metrics = metrics_obj.metrics_dict_batchwise(
+                metrics = training_metrics_fn(
                     raw_model,
                     postprocessed,
                     extra_outputs,
@@ -1416,17 +1760,19 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     variance_time_loss_scale=variance_time_loss_scale,
                     main_loss_scale=main_loss_scale,
                     intermediate_loss_scale=intermediate_loss_scale,
+                    include_model_norms=not model_norms_only_at_print,
                 )
+                if (
+                    model_norms_only_at_print
+                    and (batch_count_this_epoch + 1) % print_train_loss_every_batches == 0
+                ):
+                    metrics.update(metrics_obj.get_model_norm_metrics(raw_model))
 
                 # DDP averages loss across instances, so to preserve LR as per-sample lr, we scale by world size.
                 loss = metrics["loss_sum"] * world_size
 
                 # Reduce gradients across DDP
-                if use_fp16:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                else:
-                    loss.backward()
+                backward_and_unscale(loss, optimizer, scaler)
 
                 if model_config["norm_kind"] == "fixup" or model_config["norm_kind"] == "fixscale" or model_config["norm_kind"] == "fixscaleonenorm":
                     gnorm_cap = 20000.0 * (1.0 if gnorm_clip_scale is None else gnorm_clip_scale)
@@ -1462,17 +1808,21 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 metrics["batch_size_batch"] = batch_size * world_size
                 metrics["world_size_batch"] = world_size
 
-                if use_fp16:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
+                optimizer_step(optimizer, scaler)
 
                 batch_count_this_epoch += 1
                 train_state["train_steps_since_last_reload"] += batch_size * world_size
                 train_state["global_step_samples"] += batch_size * world_size
 
                 metrics = detensorify_metrics(metrics)
+
+                if model_norms_only_at_print and batch_count_this_epoch % print_train_loss_every_batches == 0:
+                    missing_model_norm_metrics = [key for key in model_norm_metric_keys if key not in metrics]
+                    if missing_model_norm_metrics:
+                        raise RuntimeError(
+                            "Model norm metrics were requested for logging but are missing: "
+                            + ", ".join(missing_model_norm_metrics)
+                        )
 
                 if lookahead_k is not None and lookahead_print:
                     # Only accumulate metrics when lookahead is synced if lookahead_print is True
@@ -1485,6 +1835,18 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
 
                 if batch_count_this_epoch % print_train_loss_every_batches == 0:
+
+                    if model_norms_only_at_print:
+                        # Norms are computed only for this print batch. Treat
+                        # them as a snapshot, including when lookahead_print
+                        # gives the surrounding metrics zero accumulation
+                        # weight, so logging cannot divide 0 by 0.
+                        set_snapshot_metrics(
+                            running_metrics["sums"],
+                            running_metrics["weights"],
+                            metrics,
+                            model_norm_metric_keys,
+                        )
 
                     if model_config["norm_kind"] == "brenorm" or model_config["norm_kind"] == "fixbrenorm":
                         metrics["brn_rmax"] = train_state["brenorm_rmax"]
@@ -1548,6 +1910,9 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
         # END SUB EPOCH LOOP ------------
 
+        if quit_due_to_no_data:
+            break
+
         # Discard the gradient updates from the leftover batches in the sub epoch from lookahead.
         # This wastes a very tiny bit, but makes it so that we can be in sync and deterministic on ends of subepochs/epochs.
         if lookahead_k is not None:
@@ -1577,8 +1942,13 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             if len(val_files) == 0:
                 logging.info("No validation files, skipping validation step")
             else:
+                validation_model = get_local_validation_model(
+                    ddp_model,
+                    raw_model,
+                    world_size,
+                )
                 with torch.no_grad():
-                    ddp_model.eval()
+                    validation_model.eval()
                     val_metric_sums = defaultdict(float)
                     val_metric_weights = defaultdict(float)
                     val_samples = 0
@@ -1595,7 +1965,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                         history_matrices_type=history_matrices_type,
                         model_config=model_config
                     ):
-                        model_outputs = ddp_model(
+                        model_outputs = validation_model(
                             batch["binaryInputNCHW"],
                             batch["globalInputNC"],
                             input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
@@ -1632,7 +2002,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     log_metrics(val_metric_sums, val_metric_weights, metrics, val_metrics_out, exportprefix)
                     t1 = time.perf_counter()
                     logging.info(f"Validation took {t1-t0} seconds")
-                    ddp_model.train()
+                    validation_model.train()
 
                 for swa_idx in range(len(swa_models)):
                     swa_model=swa_models[swa_idx]
@@ -1745,6 +2115,12 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 last_longterm_checkpoint_save_time = now
                 dated_name = datetime.datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
                 save(raw_model, swa_models, optimizer, metrics_obj, running_metrics, train_state, last_val_metrics, path=os.path.join(longterm_checkpoints_dir,f"{dated_name}.ckpt"), skip_optimizer=True)
+
+        # Rank 0 performs validation and export locally. Keep peers alive until
+        # that work is complete, including when the next loop iteration exits
+        # immediately due to an epoch/sample limit.
+        if barrier is not None:
+            barrier.wait()
 
     train_metrics_out.close()
     val_metrics_out.close()
