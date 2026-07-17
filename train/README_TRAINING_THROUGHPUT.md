@@ -36,8 +36,9 @@ fixed memory target.
 | `b24c256h8tflrs-bng-silu-v102` | 384 | about 2,315 | 416 | about 2,800 | about 21% |
 | `b40c384h12tflrs-bng-silu-v102` | 160 | about 760 | 172 | about 947 | about 25% |
 
-The batch-416 b24 run used about 23.4 GiB per card; batch-172 b40 peaked near
-24.0 GiB. Batch 168 was only about 0.5% slower and leaves more headroom. These
+The final batch-416 b24 smoke run used about 22.9 GiB per card; batch-172 b40
+peaked near 23.4 GiB. Batch 168 was only about 0.5% slower and leaves more
+headroom. These
 are benchmark-specific starting points, not universal defaults:
 allocator state, validation, checkpointing, drivers, and other processes can
 require a smaller batch.
