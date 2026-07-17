@@ -14,13 +14,18 @@ effect of removing masks and changing the training activation layout.
 - 15x15 Gomoku data;
 - default `torch.compile` mode;
 - model compilation, loss compilation, DDP, Muon, and all other runtime
-  optimizations held constant between each masked/maskless comparison;
+  optimizations held constant within the historical mask-effect decomposition
+  and the fixed optimized-masked versus optimized-maskless comparison;
 - the first 100-step timing interval excluded because it includes compilation.
 
-The two representative models were:
+The two representative models in the initial maximum-throughput sweep were:
 
 - `b24c256h8tflrs-bng-silu-v102`, batch 416 per GPU;
 - `b40c384h12tflrs-bng-silu-v102`, batch 172 per GPU.
+
+A later fixed-batch comparison used batch 384 for b24 and batch 160 for b40.
+Those batches leave about 1.5 GiB more headroom than 416 and 172 on the
+measured cards.
 
 ## Full-board dataset
 
@@ -141,6 +146,8 @@ end-to-end gain because attention is only one part of a training step.
 
 ## End-to-end DDP results
 
+### Historical effect-decomposition sweep
+
 All rates below are stable intervals after excluding the first compilation
 interval. "Model-only maskless" predates the maskless loss specialization and
 is included to separate the two effects.
@@ -164,12 +171,46 @@ channels-last runs. The controlled conclusions are:
 - the complete maskless path is 24.3% to 25.6% faster than the masked control.
 
 Batch 424 was 0.4% slower than batch 416 for b24 and used about 0.65 GiB more
-memory, so batch 416 is preferred. An earlier maskless-NCHW batch-432 attempt ran
-out of memory by approximately 72 MiB; channels-last batch 432 was not tested.
+memory, so batch 416 was preferred within this peak-throughput sweep. The later
+headroom-oriented recommendation is batch 384. An earlier maskless-NCHW
+batch-432 attempt ran out of memory by approximately 72 MiB; channels-last batch
+432 was not tested.
 For b40, batch 172 was stable; a batch-176 attempt reached approximately 24.05
 GiB on one rank but encountered a shape-specific Inductor compilation long tail
 and was stopped after 12 minutes without producing a training interval. It is
 not counted as a throughput result.
+
+### Fixed-batch three-way comparison
+
+This second protocol compares exactly the three requested configurations at a
+fixed per-GPU batch: masked training from unmodified `main` commit `6c8f0c8`,
+masked training after the generic optimizations on this branch, and optimized
+maskless channels-last training. All runs use the same filtered full15 data,
+FP16, default compile mode, and physical GPUs 0 and 3. Each row is the mean of
+timing windows 3 through 15 (13 stable 100-step windows); the first two windows
+are excluded to remove compilation and warm-up effects.
+
+| Model | Path | Batch/GPU | Mean / median interval | CV | Samples/s | Versus exact `main` |
+|---|---|---:|---:|---:|---:|---:|
+| b24 | exact `main`, masked NCHW | 384 | 33.455 / 33.340 s | 2.00% | 2,295.6 | baseline |
+| b24 | optimized, masked NCHW | 384 | 27.855 / 27.770 s | 0.74% | 2,757.1 | +20.10% |
+| b24 | optimized, maskless channels-last | 384 | 22.240 / 22.130 s | 1.36% | 3,453.2 | +50.43% |
+| b40 | exact `main`, masked NCHW | 160 | 42.030 / 42.000 s | 1.61% | 761.4 | baseline |
+| b40 | optimized, masked NCHW | 160 | 34.347 / 34.290 s | 0.65% | 931.7 | +22.37% |
+| b40 | optimized, maskless channels-last | 160 | 27.983 / 28.000 s | 0.99% | 1,143.5 | +50.20% |
+
+At a fixed batch, the maskless channels-last path is another 25.25% faster
+than the optimized masked b24 path and 22.74% faster for b40. The larger total
+gain versus exact `main` also includes the generic compiler, DDP, loss, layout,
+and optimizer work described in `README_TRAINING_THROUGHPUT.md`; it must not be
+attributed to mask removal alone.
+
+For b24, the final batch-384 rate is only 0.64% below a later batch-416 repeat
+(3,475.4 samples/s), and 1.40% below the earlier 3,502.4 measurement in the
+effect-decomposition table. Both are well inside the 5% criterion. For b40,
+batch 160 is 2.33% below batch 172 (1,143.5 versus 1,170.9 samples/s). Batches
+384 and 160 are therefore the recommended headroom-oriented starting points;
+416 and 172 remain historical maximum-throughput choices.
 
 ## Correctness and integration checks
 
@@ -195,9 +236,11 @@ not counted as a throughput result.
 ## Recommendation and limitations
 
 Use `-disable-mask` for a training tree that is guaranteed to contain only full
-boards. Recommended starting batches for the measured 24 GiB cards are 416 for
-b24 and 172 for b40. Use `KATAGO_INPUT_CHANNELS_LAST=0` only for regression
-comparison or if a previously untested custom block has a layout constraint.
+boards. Recommended starting batches for the measured 24 GiB cards are 384 for
+b24 and 160 for b40. They trade at most 1.40% and 2.33% of the measured peak
+throughput for about 1.5 GiB of additional memory headroom. Use
+`KATAGO_INPUT_CHANNELS_LAST=0` only for regression comparison or if a previously
+untested custom block has a layout constraint.
 
 The measurements are specific to two RTX 4090 D cards, PyTorch 2.12.1, FP16,
 15x15 sequence length 225, and the listed model shapes. They do not establish
@@ -205,5 +248,6 @@ the same percentage on another GPU generation or sequence length. Randomly
 initialized benchmark runs were used for throughput, so their loss curves are
 not model-quality comparisons; no long-convergence or final-playing-strength
 A/B test was performed. The third-party `flash-attn` package and Transformer
-Engine/FP8 were not tested here. All masked/maskless timing comparisons held
-the Muon optimizer implementation and its settings constant.
+Engine/FP8 were not tested here. The isolated mask-effect comparisons held the
+Muon implementation and settings constant; the exact-`main` to final total gain
+deliberately includes the optimizer and all other generic changes.

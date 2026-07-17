@@ -25,28 +25,79 @@ same collective control flow.
 
 ## Measured result
 
-The following numbers were measured on two RTX 4090 D cards with PyTorch
-2.12.1, 15x15 Gomoku data, and physical GPUs 0 and 3. Each number excludes the
-first 100-step interval, which includes model/loss/optimizer compilation.
-Batch size is per GPU and was selected for maximum samples/s rather than for a
-fixed memory target.
+The following controlled comparison was measured on two RTX 4090 D cards with
+PyTorch 2.12.1, the same filtered full15 Gomoku data, FP16, and physical GPUs 0
+and 3. Batch size is fixed within each model. Every rate uses timing windows 3
+through 15 (13 stable 100-step windows), excluding two compilation and warm-up
+windows. The baseline is an exact copy of `main` commit `6c8f0c8`.
 
-| Model | Baseline batch | Baseline samples/s | Optimized batch | Optimized samples/s | Gain |
+| Model | Batch/GPU | Exact `main`, masked | Optimized, masked | Generic gain | Optimized, maskless CL | Maskless CL over optimized masked | Total over `main` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `b24c256h8tflrs-bng-silu-v102` | 384 | 2,295.6 samples/s | 2,757.1 samples/s | +20.10% | 3,453.2 samples/s | +25.25% | +50.43% |
+| `b40c384h12tflrs-bng-silu-v102` | 160 | 761.4 samples/s | 931.7 samples/s | +22.37% | 1,143.5 samples/s | +22.74% | +50.20% |
+
+The maskless gain column includes both removal of masks and the channels-last
+activation layout. The total column also includes all generic training and
+optimizer changes; these percentages must not be added to one another again.
+
+The highest observed throughput used more aggressive batches, but the fixed
+batches leave about 1.5 GiB more memory headroom and are better long-run
+starting points:
+
+| Model | Recommended batch | Samples/s | Best observed batch | Samples/s | Throughput cost |
 |---|---:|---:|---:|---:|---:|
-| `b24c256h8tflrs-bng-silu-v102` | 384 | about 2,315 | 416 | about 2,800 | about 21% |
-| `b40c384h12tflrs-bng-silu-v102` | 160 | about 760 | 172 | about 947 | about 25% |
+| b24 | 384 | 3,453.2 | 416 | 3,502.4 | -1.40% |
+| b40 | 160 | 1,143.5 | 172 | 1,170.9 | -2.33% |
 
-The final batch-416 b24 smoke run used about 22.9 GiB per card; batch-172 b40
-peaked near 23.4 GiB. Batch 168 was only about 0.5% slower and leaves more
-headroom. These
-are benchmark-specific starting points, not universal defaults:
-allocator state, validation, checkpointing, drivers, and other processes can
-require a smaller batch.
+The b24 batch-416 and b40 batch-172 runs used about 22.9 and 23.4 GiB per card.
+A later b24 batch-416 repeat using the final Muon A/B/C protocol reached 3,475.4
+samples/s, against which batch 384 is only 0.64% slower. Both comparisons remain
+well inside the requested 5% threshold. These are benchmark-specific starting
+points, not universal defaults: allocator state, validation, checkpointing,
+drivers, and other processes can require a smaller batch.
 
 BF16 AMP and BF16 DDP gradient compression were also measured. BF16 AMP was
 effectively tied with FP16; BF16 gradient compression improved b40 by only about
 0.3% while changing reduction precision. FP16 remains the script default and
 gradient communication remains FP32.
+
+## Muon before/after benchmark
+
+The optimizer was isolated with the same maskless channels-last model, data,
+batch, compile mode, and two-GPU setup. As above, each rate is aggregate samples
+divided by aggregate time over timing windows 3 through 15. The variants are:
+
+- A: the `main` Muon file, with scalar Newton--Schulz, scalar auxiliary Adam,
+  and the old owner-round synchronization (one `all_gather` per round, with at
+  most one parameter owned by each rank in a round);
+- B: reusable flat DDP synchronization, with batched Newton--Schulz and foreach
+  Adam explicitly disabled;
+- C: the current defaults, adding batched Newton--Schulz (groups of at most 32)
+  and foreach auxiliary Adam to B.
+
+| Model | A: old | B: flat + scalar kernels | C: current | B/A | C/B | C/A |
+|---|---:|---:|---:|---:|---:|---:|
+| b24, batch 384 | 2,912.6 | 2,964.4 | 3,453.2 | +1.78% | +16.49% | +18.56% |
+| b40, batch 160 | 963.0 | 930.9 | 1,143.5 | -3.34% | +22.85% | +18.74% |
+
+The flat implementation is designed and unit-tested for arbitrary world sizes,
+different parameter shapes, and parameters crossing bucket boundaries, but is
+not by itself a universal speedup: it helped b24 slightly and hurt b40 in this
+test. The defensible performance conclusion is that the complete current Muon
+path is about 18.6% to 18.7% faster than the old implementation on both
+representative models. Variant C is the same observation as the final maskless
+row in the fixed-batch table, so its gain is not additive with the total
+training gain.
+
+The update equations and checkpoint state schema are retained, but batched
+Newton--Schulz and foreach Adam change floating-point operation order and are
+not bitwise identical to their scalar versions. Unit tests cover scalar/default
+checkpoint continuation in both directions, world-size 2/3 redistribution,
+empty owners, heterogeneous shapes, and cross-bucket parameters. A real
+two-process NCCL integration test isolating scalar flat synchronization also
+completed six buckets successfully. Independent random initialization makes the
+short-run losses useful only for detecting NaNs or crashes, not for comparing
+training quality.
 
 ## Full-board mask-free training
 
@@ -86,12 +137,12 @@ targets, validation, and SWA validation keep their existing layouts. Set
 setting it to `1` also enables the layout for masked training, but that mode has
 not been performance-tuned.
 
-The following two-card RTX 4090 D results use the same filtered data, FP16,
-default compile mode, and per-GPU batches 416 (b24) or 172 (b40). The masked
-control still computes full-one masks. Each rate excludes the first 100-step
-compilation interval.
+The following historical effect-decomposition sweep uses the same filtered
+data, FP16, default compile mode, and per-GPU batches 416 (b24) or 172 (b40).
+The masked control still computes full-one masks. Each rate excludes the first
+100-step compilation interval.
 
-| Model | Masked NCHW | Mask-free NCHW | Mask-free channels-last | Total gain |
+| Model | Masked NCHW | Mask-free NCHW | Mask-free channels-last | Versus optimized masked |
 |---|---:|---:|---:|---:|
 | `b24c256h8tflrs-bng-silu-v102` | 2,787.7 samples/s | 3,034.9 samples/s | 3,502.4 samples/s | 25.6% |
 | `b40c384h12tflrs-bng-silu-v102` | 942.0 samples/s | 1,028.0 samples/s | 1,170.9 samples/s | 24.3% |
@@ -100,7 +151,47 @@ Removing model and loss masks contributed about 9%; channels-last added another
 13.9--15.4% over mask-free NCHW. With a true `attn_mask=None`, PyTorch `auto`
 selected Flash SDPA on both models; forcing another backend was slower. For b24,
 batch 424 was 0.4% slower than batch 416 while using about 0.65 GiB more memory,
-so 416 is the measured throughput optimum with useful headroom.
+so 416 was the peak-throughput choice in that sweep. Batch 384 is the current
+recommendation when retaining about 1.5 GiB of memory headroom matters.
+
+## Learned RoPE layout benchmark
+
+The current learned and fixed RoPE implementations use adjacent pairs:
+channels `(0,1)`, `(2,3)`, and so on. A half-split layout pairs the first half
+of each head with the second half. The layouts are related by a channel
+permutation and have the same representational capacity, but may compile to
+different rotation kernels.
+
+One RTX 4090 D measured compiled FP16 forward plus backward for both the full
+learned-RoPE chain and a complete production-shaped maskless Transformer block.
+The effective batches match the recommended training batches. Medians are over
+seven alternating trials for the chain and five for the block.
+
+| Model | RoPE chain: adjacent / half | Half throughput gain | Full block: adjacent / half | Half throughput gain |
+|---|---:|---:|---:|---:|
+| b24, batch 384 | 1.2431 / 1.1254 ms | +10.45% | 7.8895 / 7.8531 ms | +0.46% |
+| b40, batch 160 | 1.2767 / 1.2202 ms | +4.62% | 5.6146 / 5.5548 ms | +1.08% |
+
+The b40 chain trials drifted substantially, so its isolated 4.62% number is not
+a stable end-to-end claim. Both models passed FP32 output, input-gradient,
+frequency-gradient, and all full-block parameter-gradient equivalence checks
+after permuting Q/K projection rows; full-block peak allocated memory was
+identical between layouts. The isolated kernel benefit shrinks to 0.46%--1.08%
+in one block and is expected to be diluted further in complete training with
+heads, loss, DDP, and Muon. Half-split is therefore not enabled in production.
+
+Changing an existing model would also require an explicit layout field and a
+per-head row permutation for every Q/K projection in the raw model, SWA/EMA,
+and optimizer momentum, followed by ONNX re-export and TensorRT engine rebuild.
+Old checkpoints must continue to default to adjacent layout; silently changing
+the pairing would change attention despite identical tensor shapes. RoPE
+frequencies, V projections, and output projections do not require conversion.
+
+A separate short b24 control found that retaining angle/`sin`/`cos` computation
+in FP32 but casting the small table before rotating the batch-sized FP16 Q/K
+tensors improved end-to-end throughput by about 1.04%. That estimate has only
+two stable baseline windows, so it is supporting evidence rather than a precise
+standalone speedup. This table cast remains enabled by default.
 
 ## Runtime controls
 
@@ -131,15 +222,18 @@ on-device seki average is disabled, set `KATAGO_COMPILE_TRAINING_LOSS=0` as
 well.
 
 `KATAGO_COMPILE_MODE` accepts `default`, `max-autotune-no-cudagraphs`, or
-`max-autotune`. The main table uses `default`. On b24 batch 416,
+`max-autotune`. The main table uses `default`. On an earlier masked-NCHW b24
+batch-416 path,
 `max-autotune-no-cudagraphs` took about 757 seconds for the first 100-step
 interval, then sustained about 2,990--3,023 samples/s (roughly another 8% over
-the default compiler mode). At the measured rates it breaks even after roughly
-27 million samples, so it is useful for a long uninterrupted run but is not the
-global default. The CUDA-Graph-enabled `max-autotune` mode was also attempted,
-but Inductor skipped graph capture because the training graph mutates running
-state; use `max-autotune-no-cudagraphs` for these models. Autotune modes should
-be measured on the exact model and batch.
+the default compiler mode). It has not been remeasured on the current maskless
+channels-last path and should not be applied as an extra 8% to the final table.
+At the old measured rates it breaks even after roughly 27 million samples, so
+it is useful for a long uninterrupted run but is not the global default. The
+CUDA-Graph-enabled `max-autotune` mode was also attempted, but Inductor skipped
+graph capture because the training graph mutates running state; use
+`max-autotune-no-cudagraphs` for these models. Autotune modes should be measured
+on the exact model and batch.
 
 The batched Muon and foreach Adam paths implement the same update equations but
 are not bitwise identical to the scalar-launch implementations. The RoPE cast
