@@ -62,7 +62,9 @@ python filter_full_board_npz.py --verify-only /path/to/shuffled_full15 \
 
 The loader independently validates every NPZ before transferring its first
 batch. If any row is not full-board, `-disable-mask` fails with the filename,
-invalid-row count, and first invalid row index.
+invalid-row count, and first invalid row index. This strict behavior remains the
+default. Adding `-filter-full-board-on-load` explicitly discards those rows;
+files retaining fewer than one global batch log a warning and yield no batches.
 
 ## Implementation
 

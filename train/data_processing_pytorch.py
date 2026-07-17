@@ -55,7 +55,13 @@ def read_npz_training_data(
     model_config: modelconfigs.ModelConfig,
     require_full_board: bool = False,
     binary_input_channels_last: bool = False,
+    filter_full_board_on_load: bool = False,
 ):
+    if filter_full_board_on_load and not require_full_board:
+        raise ValueError(
+            "filter_full_board_on_load requires require_full_board=True"
+        )
+
     rand = np.random.default_rng(seed=list(os.urandom(12)))
     num_bin_features = modelconfigs.get_num_bin_input_features(model_config)
     num_global_features = modelconfigs.get_num_global_input_features(model_config)
@@ -75,28 +81,84 @@ def read_npz_training_data(
         with np.load(npz_file) as npz:
             binaryInputNCHWPacked = npz["binaryInputNCHWPacked"]
             globalInputNC = npz["globalInputNC"]
-            policyTargetsNCMove = npz["policyTargetsNCMove"].astype(np.float32)
+            policyTargetsNCMove = npz["policyTargetsNCMove"]
             globalTargetsNC = npz["globalTargetsNC"]
-            scoreDistrN = npz["scoreDistrN"].astype(np.float32)
-            valueTargetsNCHW = npz["valueTargetsNCHW"].astype(np.float32)
+            scoreDistrN = npz["scoreDistrN"]
+            valueTargetsNCHW = npz["valueTargetsNCHW"]
             if include_meta:
-                metadataInputNC = npz["metadataInputNC"].astype(np.float32)
+                metadataInputNC = npz["metadataInputNC"]
             else:
                 metadataInputNC = None
             if include_qvalues:
-                qValueTargetsNCMove = npz["qValueTargetsNCMove"].astype(np.float32)
+                qValueTargetsNCMove = npz["qValueTargetsNCMove"]
             else:
                 qValueTargetsNCMove = None
         del npz
 
         if require_full_board:
             full_board_rows = packed_full_board_rows(binaryInputNCHWPacked, pos_len)
-            if not np.all(full_board_rows):
+            if filter_full_board_on_load:
+                source_num_samples = binaryInputNCHWPacked.shape[0]
+                retained_num_samples = int(np.count_nonzero(full_board_rows))
+
+                def filter_aligned_rows(name, array):
+                    if array is None:
+                        return None
+                    if array.shape[0] != source_num_samples:
+                        raise ValueError(
+                            f"{npz_file} field {name} has {array.shape[0]} rows, "
+                            f"expected {source_num_samples}"
+                        )
+                    if retained_num_samples == source_num_samples:
+                        return array
+                    return array[full_board_rows]
+
+                binaryInputNCHWPacked = filter_aligned_rows(
+                    "binaryInputNCHWPacked", binaryInputNCHWPacked
+                )
+                globalInputNC = filter_aligned_rows("globalInputNC", globalInputNC)
+                policyTargetsNCMove = filter_aligned_rows(
+                    "policyTargetsNCMove", policyTargetsNCMove
+                )
+                globalTargetsNC = filter_aligned_rows("globalTargetsNC", globalTargetsNC)
+                scoreDistrN = filter_aligned_rows("scoreDistrN", scoreDistrN)
+                valueTargetsNCHW = filter_aligned_rows(
+                    "valueTargetsNCHW", valueTargetsNCHW
+                )
+                metadataInputNC = filter_aligned_rows(
+                    "metadataInputNC", metadataInputNC
+                )
+                qValueTargetsNCMove = filter_aligned_rows(
+                    "qValueTargetsNCMove", qValueTargetsNCMove
+                )
+
+                global_batch_size = batch_size * world_size
+                if rank == 0 and retained_num_samples < global_batch_size:
+                    logging.warning(
+                        "%s full-board on-load filter retained %d/%d rows, fewer than "
+                        "one global batch (%d = batch_size %d * world_size %d); "
+                        "this file will yield no training batches",
+                        npz_file,
+                        retained_num_samples,
+                        source_num_samples,
+                        global_batch_size,
+                        batch_size,
+                        world_size,
+                    )
+            elif not np.all(full_board_rows):
                 invalid_rows = np.flatnonzero(~full_board_rows)
                 raise ValueError(
                     f"{npz_file} contains {invalid_rows.size} non-full-board rows "
                     f"(first row index {int(invalid_rows[0])}); -disable-mask is unsafe"
                 )
+
+        policyTargetsNCMove = policyTargetsNCMove.astype(np.float32)
+        scoreDistrN = scoreDistrN.astype(np.float32)
+        valueTargetsNCHW = valueTargetsNCHW.astype(np.float32)
+        if metadataInputNC is not None:
+            metadataInputNC = metadataInputNC.astype(np.float32)
+        if qValueTargetsNCMove is not None:
+            qValueTargetsNCMove = qValueTargetsNCMove.astype(np.float32)
 
         binaryInputNCHW = np.unpackbits(binaryInputNCHWPacked,axis=2)
         assert len(binaryInputNCHW.shape) == 3

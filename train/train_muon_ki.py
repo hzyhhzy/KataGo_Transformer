@@ -62,6 +62,16 @@ def validate_amp_qat_options(use_fp16: bool, use_bf16: bool, qat_int8: bool):
         assert not use_bf16, "QAT INT8 enabled. BF16/AMP is not supported. Remove this if it not report any error."
 
 
+def validate_full_board_filter_options(
+    disable_mask: bool, filter_full_board_on_load: bool
+):
+    if filter_full_board_on_load and not disable_mask:
+        raise ValueError(
+            "-filter-full-board-on-load requires -disable-mask because filtering "
+            "is only needed for the mask-free training path"
+        )
+
+
 def amp_autocast_context(use_fp16: bool, use_bf16: bool):
     """Return the requested CUDA autocast context without changing legacy defaults."""
     if use_fp16:
@@ -153,6 +163,15 @@ if __name__ == "__main__":
         required=False,
         action='store_true',
     )
+    optional_args.add_argument(
+        '-filter-full-board-on-load',
+        help=(
+            'With -disable-mask, discard non-full-board training rows while loading '
+            'instead of rejecting the entire NPZ file'
+        ),
+        required=False,
+        action='store_true',
+    )
 
     optional_args.add_argument('-epochs-per-export', help='Export model once every this many epochs', type=int, required=False)
     optional_args.add_argument('-export-prob', help='Export model with this probablity', type=float, required=False)
@@ -191,6 +210,12 @@ if __name__ == "__main__":
     optional_args.add_argument('-intermediate-loss-scale', type=float, help='Loss factor scale for intermediate head', required=False)
 
     args = vars(parser.parse_args())
+    try:
+        validate_full_board_filter_options(
+            args["disable_mask"], args["filter_full_board_on_load"]
+        )
+    except ValueError as error:
+        parser.error(str(error))
 
 
 def get_longterm_checkpoints_dir(traindir):
@@ -567,6 +592,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     master_port = args["master_port"]
     no_compile = args["no_compile"]
     disable_mask = args["disable_mask"]
+    filter_full_board_on_load = args["filter_full_board_on_load"]
+    validate_full_board_filter_options(disable_mask, filter_full_board_on_load)
     input_channels_last = resolve_input_channels_last(disable_mask)
     
     epochs_per_export = args["epochs_per_export"]
@@ -1221,6 +1248,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     logging.info(f"model_norms_only_at_print {model_norms_only_at_print}")
     logging.info(f"compile_training_loss {compile_training_loss}")
     logging.info(f"disable_mask {disable_mask}")
+    logging.info(f"filter_full_board_on_load {filter_full_board_on_load}")
     logging.info(f"input_channels_last {input_channels_last}")
 
     training_metrics_fn = metrics_obj.metrics_dict_batchwise
@@ -1773,6 +1801,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 history_matrices_type=history_matrices_type,
                 model_config=model_config,
                 require_full_board=disable_mask,
+                filter_full_board_on_load=filter_full_board_on_load,
                 binary_input_channels_last=input_channels_last,
             ):
                 optimizer.zero_grad(set_to_none=True)

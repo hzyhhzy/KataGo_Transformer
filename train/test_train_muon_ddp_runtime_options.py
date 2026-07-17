@@ -233,6 +233,17 @@ class DdpRuntimeOptionsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "KATAGO_INPUT_CHANNELS_LAST"):
                 train_muon_ki.resolve_input_channels_last(disable_mask=True)
 
+    def test_on_load_full_board_filter_requires_maskless_training(self):
+        train_muon_ki.validate_full_board_filter_options(
+            disable_mask=True,
+            filter_full_board_on_load=True,
+        )
+        with self.assertRaisesRegex(ValueError, "requires -disable-mask"):
+            train_muon_ki.validate_full_board_filter_options(
+                disable_mask=False,
+                filter_full_board_on_load=True,
+            )
+
     def test_batch_renorm_keeps_buffer_broadcast_by_default(self):
         raw_model = self._raw_model("brenorm")
         events, compile_patch, ddp_patch = self._mock_wrappers()

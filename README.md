@@ -75,6 +75,9 @@ Parameters can be modified in `./train/train_muon_ki.sh` or passed as arguments 
     every file before use. The measured channels-last input layout is enabled
     automatically for this path. See `train/README_TRAINING_THROUGHPUT.md` for
     the full-board filtering command and runtime tuning controls.
+*   `-filter-full-board-on-load`: With `-disable-mask`, discard non-full-board
+    training rows while loading instead of rejecting a mixed NPZ file. Files
+    retaining fewer than one global batch produce a warning and no batches.
 
 ### Model Type Settings
 *   **Model Structure**: `b14c192h6tfrs` is a pre-defined structure in `./train/modelconfigs.py`. You can modify this file to define custom architectures.

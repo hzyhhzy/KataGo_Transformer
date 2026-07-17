@@ -151,6 +151,14 @@ normal masked path, allowing an unfiltered validation set. Full-one masks and no
 masks are mathematically equivalent, but fused attention and reduction order
 mean AMP results are not bitwise identical.
 
+As a convenience for a mixed source tree, add `-filter-full-board-on-load`
+alongside `-disable-mask` to discard non-full-board training rows in memory.
+Filtering is deterministic and applies the same row selection to every NPZ
+field. Batching remains file-local: if a file retains fewer than
+`batch_size * world_size` rows, rank 0 logs a warning and that file yields no
+training batches. Offline filtering remains preferable when data-loading
+throughput matters because it avoids repeatedly reading discarded rows.
+
 Mask-free training automatically stores the binary spatial input in
 channels-last format. This makes the BSC view used by every Transformer block
 contiguous in its channel dimension; model parameters, optimizer tensors,
