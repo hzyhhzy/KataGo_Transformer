@@ -198,9 +198,37 @@ The b40 chain trials drifted substantially, so its isolated 4.62% number is not
 a stable end-to-end claim. Both models passed FP32 output, input-gradient,
 frequency-gradient, and all full-block parameter-gradient equivalence checks
 after permuting Q/K projection rows; full-block peak allocated memory was
-identical between layouts. The isolated kernel benefit shrinks to 0.46%--1.08%
-in one block and is expected to be diluted further in complete training with
-heads, loss, DDP, and Muon. Half-split is therefore not enabled in production.
+identical between layouts.
+
+An end-to-end b24 check then measured the complete mask-free, channels-last,
+FP16 Muon training loop with two RTX 4090 D GPUs, DDP, and batch 384 per GPU.
+Eight independent runs used the balanced order `AB|BA|BA|AB`, where A was the
+adjacent layout and B was half-split. Each run produced 56 logging windows of
+100 steps; the first eight were discarded and the remaining 48 represented
+3,686,400 samples. Functionally equivalent initial checkpoints differed only
+by a per-head permutation of Q/K projection rows.
+
+| Pair | Half-split throughput change |
+|---:|---:|
+| 1 (`AB`) | +0.1026% |
+| 2 (`BA`) | -0.0821% |
+| 3 (`BA`) | +0.1736% |
+| 4 (`AB`) | +0.0512% |
+
+The paired geometric mean was +0.0613%, with a two-sided 95% confidence
+interval of -0.1104% to +0.2333%. Pooling all measured time gave 3,479.53
+samples/s for adjacent and 3,481.66 samples/s for half-split, while GPU clocks,
+power, temperature, and utilization were closely matched. A shorter fixed-RoPE
+b24 ABBA check estimated +0.3300%, but its two-pair interval was likewise
+inconclusive (-3.6625% to +4.4879%). The b40 end-to-end suite was not run after
+the b24 result met the rejection criterion.
+
+The layout conversion itself remained numerically sound: per-layer FP32 RMS
+differences grew smoothly from floating-point dot-product reduction order, and
+learned/fixed, MHA/GQA, masked/unmasked FP64 output and gradient checks had a
+global maximum error of 2.66e-15. The issue is solely that the isolated kernel
+gain is lost in complete training. Half-split is therefore not enabled in
+production and no model-config switch is added.
 
 Changing an existing model would also require an explicit layout field and a
 per-head row permutation for every Q/K projection in the raw model, SWA/EMA,
