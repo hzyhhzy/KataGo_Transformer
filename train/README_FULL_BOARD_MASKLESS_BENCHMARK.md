@@ -212,6 +212,25 @@ batch 160 is 2.33% below batch 172 (1,143.5 versus 1,170.9 samples/s). Batches
 384 and 160 are therefore the recommended headroom-oriented starting points;
 416 and 172 remain historical maximum-throughput choices.
 
+### Single-GPU scaling
+
+The final maskless channels-last path was repeated without `-multi-gpus`,
+process-group initialization, or a DDP wrapper. The model, data, per-GPU batch,
+and runtime flags match the fixed two-GPU comparison; global-batch-dependent
+training scalars naturally change with world size. The same 13-window
+aggregation is used. A 100-step single-GPU window contains 38,400 b24 or 16,000
+b40 samples.
+
+| Model | Batch/GPU | Single GPU | Two-GPU total | Speedup | Two-GPU efficiency | Peak `nvidia-smi` memory |
+|---|---:|---:|---:|---:|---:|---:|
+| b24 | 384 | 1,823.0 samples/s | 3,453.2 samples/s | 1.894x | 94.71% | 21,627 MiB |
+| b40 | 160 | 637.2 samples/s | 1,143.5 samples/s | 1.795x | 89.73% | 21,821 MiB |
+
+Both requested batches fit without adjustment. This is end-to-end training
+scaling, not a pure measurement of DDP communication: distributed Muon shards
+matrix updates across ranks before synchronizing parameters, whereas the
+single process updates every Muon matrix.
+
 ## Correctness and integration checks
 
 - 81 local unit tests passed.

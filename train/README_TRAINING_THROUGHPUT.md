@@ -56,6 +56,28 @@ well inside the requested 5% threshold. These are benchmark-specific starting
 points, not universal defaults: allocator state, validation, checkpointing,
 drivers, and other processes can require a smaller batch.
 
+### Single-GPU versus two-GPU scaling
+
+The final maskless channels-last configuration was also measured with an
+ordinary single process: no `-multi-gpus`, no process group, and no DDP wrapper.
+The model, data, per-GPU batch, and runtime flags match the fixed-batch two-GPU
+runs; global-batch-dependent training scalars naturally change with world size.
+Rates again aggregate timing windows 3 through 15; a 100-step single-GPU window
+contains 38,400 b24 or 16,000 b40 samples.
+
+| Model | Batch/GPU | Single GPU | Two-GPU total | Speedup | Two-GPU efficiency | Peak `nvidia-smi` memory |
+|---|---:|---:|---:|---:|---:|---:|
+| b24 | 384 | 1,823.0 samples/s | 3,453.2 samples/s | 1.894x | 94.71% | 21,627 MiB |
+| b40 | 160 | 637.2 samples/s | 1,143.5 samples/s | 1.795x | 89.73% | 21,821 MiB |
+
+Both requested batches fit without adjustment. The two-GPU per-card throughput
+penalty relative to single GPU is 5.29% for b24 and 10.27% for b40. This is
+whole-training scaling rather than a pure DDP communication measurement: in
+DDP, each rank computes only its assigned share of Muon matrix updates before
+flat parameter synchronization, while a single process updates every Muon
+matrix. DDP-only hooks, gradient buckets, and 1x1-convolution stride alignment
+also change the execution path.
+
 BF16 AMP and BF16 DDP gradient compression were also measured. BF16 AMP was
 effectively tied with FP16; BF16 gradient compression improved b40 by only about
 0.3% while changing reduction precision. FP16 remains the script default and
