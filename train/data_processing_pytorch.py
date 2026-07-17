@@ -9,6 +9,39 @@ import torch.nn.functional
 
 import modelconfigs
 
+
+def packed_full_board_rows(binary_input_nchw_packed: np.ndarray, pos_len: int) -> np.ndarray:
+    """Return which rows have every on-board bit set in spatial feature 0."""
+    if pos_len <= 0:
+        raise ValueError(f"pos_len must be positive, got {pos_len}")
+    if binary_input_nchw_packed.dtype != np.uint8:
+        raise ValueError(
+            "binaryInputNCHWPacked must have dtype uint8, got "
+            f"{binary_input_nchw_packed.dtype}"
+        )
+    if binary_input_nchw_packed.ndim != 3 or binary_input_nchw_packed.shape[1] < 1:
+        raise ValueError(
+            "binaryInputNCHWPacked must have shape [N,C,packed_hw] with C >= 1, got "
+            f"{binary_input_nchw_packed.shape}"
+        )
+    area = pos_len * pos_len
+    full_bytes, remaining_bits = divmod(area, 8)
+    required_bytes = full_bytes + (1 if remaining_bits else 0)
+    if binary_input_nchw_packed.shape[2] != required_bytes:
+        raise ValueError(
+            f"Packed spatial input has {binary_input_nchw_packed.shape[2]} bytes, "
+            f"but pos_len={pos_len} requires exactly {required_bytes}"
+        )
+
+    packed_mask = binary_input_nchw_packed[:, 0, :]
+    rows = np.ones(packed_mask.shape[0], dtype=np.bool_)
+    if full_bytes:
+        rows &= np.all(packed_mask[:, :full_bytes] == np.uint8(0xFF), axis=1)
+    if remaining_bits:
+        high_bits_mask = np.uint8(((1 << remaining_bits) - 1) << (8 - remaining_bits))
+        rows &= (packed_mask[:, full_bytes] & high_bits_mask) == high_bits_mask
+    return rows
+
 def read_npz_training_data(
     npz_files,
     batch_size: int,
@@ -20,6 +53,8 @@ def read_npz_training_data(
     include_meta: bool,
     history_matrices_type: str,
     model_config: modelconfigs.ModelConfig,
+    require_full_board: bool = False,
+    binary_input_channels_last: bool = False,
 ):
     rand = np.random.default_rng(seed=list(os.urandom(12)))
     num_bin_features = modelconfigs.get_num_bin_input_features(model_config)
@@ -53,6 +88,15 @@ def read_npz_training_data(
             else:
                 qValueTargetsNCMove = None
         del npz
+
+        if require_full_board:
+            full_board_rows = packed_full_board_rows(binaryInputNCHWPacked, pos_len)
+            if not np.all(full_board_rows):
+                invalid_rows = np.flatnonzero(~full_board_rows)
+                raise ValueError(
+                    f"{npz_file} contains {invalid_rows.size} non-full-board rows "
+                    f"(first row index {int(invalid_rows[0])}); -disable-mask is unsafe"
+                )
 
         binaryInputNCHW = np.unpackbits(binaryInputNCHWPacked,axis=2)
         assert len(binaryInputNCHW.shape) == 3
@@ -135,7 +179,12 @@ def read_npz_training_data(
                     if include_qvalues:
                         batch_qValueTargetsNCMove = apply_symmetry_policy(batch_qValueTargetsNCMove, symm, pos_len)
 
-                batch_binaryInputNCHW = batch_binaryInputNCHW.contiguous()
+                if binary_input_channels_last:
+                    batch_binaryInputNCHW = batch_binaryInputNCHW.contiguous(
+                        memory_format=torch.channels_last
+                    )
+                else:
+                    batch_binaryInputNCHW = batch_binaryInputNCHW.contiguous()
                 batch_policyTargetsNCMove = batch_policyTargetsNCMove.contiguous()
                 batch_valueTargetsNCHW = batch_valueTargetsNCHW.contiguous()
                 if include_qvalues:

@@ -144,6 +144,15 @@ if __name__ == "__main__":
     optional_args.add_argument('-qat-int8', help='Enable INT8 QAT', required=False, action='store_true')    
     optional_args.add_argument('-master-port', help='Localhost port', default=23456, type=int, required=False)
     optional_args.add_argument('-no-compile', help='Do not torch.compile', required=False, action='store_true')
+    optional_args.add_argument(
+        '-disable-mask',
+        help=(
+            'Assume every training sample uses the full pos-len by pos-len board, '
+            'validate that assumption while loading, and omit model masks'
+        ),
+        required=False,
+        action='store_true',
+    )
 
     optional_args.add_argument('-epochs-per-export', help='Export model once every this many epochs', type=int, required=False)
     optional_args.add_argument('-export-prob', help='Export model with this probablity', type=float, required=False)
@@ -216,6 +225,8 @@ _DDP_GRADIENT_AS_BUCKET_VIEW_ENV = "KATAGO_DDP_GRADIENT_AS_BUCKET_VIEW"
 _DDP_BROADCAST_BUFFERS_ENV = "KATAGO_DDP_BROADCAST_BUFFERS"
 _DDP_ALIGN_CONV1X1_WEIGHT_STRIDES_ENV = "KATAGO_DDP_ALIGN_CONV1X1_WEIGHT_STRIDES"
 _COMPILE_MODE_ENV = "KATAGO_COMPILE_MODE"
+_SDPA_BACKEND_ENV = "KATAGO_SDPA_BACKEND"
+_INPUT_CHANNELS_LAST_ENV = "KATAGO_INPUT_CHANNELS_LAST"
 _ALLOWED_COMPILE_MODES = (
     "default",
     "max-autotune-no-cudagraphs",
@@ -241,6 +252,13 @@ def _get_strict_env_bool(name: str, default: bool = False) -> bool:
     )
 
 
+def resolve_input_channels_last(disable_mask: bool) -> bool:
+    """Use channels-last automatically for the measured full-board fast path."""
+    return _get_strict_env_bool(
+        _INPUT_CHANNELS_LAST_ENV, default=disable_mask
+    )
+
+
 def _get_compile_mode() -> str:
     mode = os.environ.get(_COMPILE_MODE_ENV, "default")
     if mode in _ALLOWED_COMPILE_MODES:
@@ -249,6 +267,32 @@ def _get_compile_mode() -> str:
     raise ValueError(
         f"Environment variable {_COMPILE_MODE_ENV} must be one of {allowed}, got {mode!r}"
     )
+
+
+def configure_sdpa_backend_from_env() -> str:
+    """Optionally force one CUDA SDPA backend for repeatable benchmarks."""
+    backend = os.environ.get(_SDPA_BACKEND_ENV)
+    if backend is None:
+        return "auto"
+    backend = backend.strip().lower().replace("-", "_")
+    aliases = {
+        "mem_efficient": "efficient",
+        "memory_efficient": "efficient",
+    }
+    backend = aliases.get(backend, backend)
+    allowed = ("auto", "flash", "cudnn", "efficient", "math")
+    if backend not in allowed:
+        raise ValueError(
+            f"Environment variable {_SDPA_BACKEND_ENV} must be one of "
+            f"{'|'.join(allowed)}, got {backend!r}"
+        )
+
+    enabled = set(allowed[1:]) if backend == "auto" else {backend}
+    torch.backends.cuda.enable_flash_sdp("flash" in enabled)
+    torch.backends.cuda.enable_cudnn_sdp("cudnn" in enabled)
+    torch.backends.cuda.enable_mem_efficient_sdp("efficient" in enabled)
+    torch.backends.cuda.enable_math_sdp("math" in enabled)
+    return backend
 
 
 def resolve_compile_training_loss(
@@ -522,6 +566,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     use_bf16 = args["use_bf16"]
     master_port = args["master_port"]
     no_compile = args["no_compile"]
+    disable_mask = args["disable_mask"]
+    input_channels_last = resolve_input_channels_last(disable_mask)
     
     epochs_per_export = args["epochs_per_export"]
     export_prob = args["export_prob"]
@@ -647,6 +693,9 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     else:
         logging.warning("WARNING: No GPU, using CPU")
         device = torch.device("cpu")
+
+    sdpa_backend = configure_sdpa_backend_from_env()
+    logging.info(f"SDPA backend selection: {sdpa_backend}")
 
     seed = int.from_bytes(os.urandom(7), sys.byteorder)
     logging.info(f"Seeding torch with {seed}")
@@ -1171,6 +1220,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     logging.info(f"intermediate_loss_scale {intermediate_loss_scale}")
     logging.info(f"model_norms_only_at_print {model_norms_only_at_print}")
     logging.info(f"compile_training_loss {compile_training_loss}")
+    logging.info(f"disable_mask {disable_mask}")
+    logging.info(f"input_channels_last {input_channels_last}")
 
     training_metrics_fn = metrics_obj.metrics_dict_batchwise
     if compile_training_loss:
@@ -1720,7 +1771,9 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 symmetry_type=symmetry_type,
                 include_meta=raw_model.get_has_metadata_encoder(),
                 history_matrices_type=history_matrices_type,
-                model_config=model_config
+                model_config=model_config,
+                require_full_board=disable_mask,
+                binary_input_channels_last=input_channels_last,
             ):
                 optimizer.zero_grad(set_to_none=True)
                 extra_outputs = None
@@ -1734,6 +1787,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                             batch["globalInputNC"],
                             input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
                             extra_outputs=extra_outputs,
+                            disable_mask=disable_mask,
                         )
                     model_outputs = raw_model.float32ify_output(model_outputs)
                 else:
@@ -1742,6 +1796,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                         batch["globalInputNC"],
                         input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
                         extra_outputs=extra_outputs,
+                        disable_mask=disable_mask,
                     )
 
                 postprocessed = raw_model.postprocess_output(model_outputs)
@@ -1761,6 +1816,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     main_loss_scale=main_loss_scale,
                     intermediate_loss_scale=intermediate_loss_scale,
                     include_model_norms=not model_norms_only_at_print,
+                    assume_full_board=disable_mask,
                 )
                 if (
                     model_norms_only_at_print
@@ -1963,7 +2019,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                         symmetry_type=symmetry_type,
                         include_meta=raw_model.get_has_metadata_encoder(),
                         history_matrices_type=history_matrices_type,
-                        model_config=model_config
+                        model_config=model_config,
                     ):
                         model_outputs = validation_model(
                             batch["binaryInputNCHW"],
@@ -2028,7 +2084,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                             symmetry_type=symmetry_type,
                             include_meta=raw_model.get_has_metadata_encoder(),
                             history_matrices_type=history_matrices_type,
-                            model_config=model_config
+                            model_config=model_config,
                         ):
                             model_outputs = swa_model(
                                 batch["binaryInputNCHW"],

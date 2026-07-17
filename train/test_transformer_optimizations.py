@@ -1,3 +1,4 @@
+import copy
 import os
 import sys
 import unittest
@@ -7,6 +8,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
 import model_pytorch
+import modelconfigs
 
 
 class TransformerOptimizationTests(unittest.TestCase):
@@ -59,6 +61,237 @@ class TransformerOptimizationTests(unittest.TestCase):
             self.assertTrue(torch.isfinite(new_value).all())
             torch.testing.assert_close(
                 new_value, old_value, rtol=3e-2, atol=2e-2
+            )
+
+    def test_full_mask_and_no_mask_transformer_outputs_and_gradients_match(self):
+        torch.manual_seed(1234)
+        config = {
+            "transformer_ffn_channels": 24,
+            "transformer_heads": 2,
+            "transformer_kv_heads": 2,
+            "learnable_rope": True,
+        }
+        block_with_mask = model_pytorch.TransformerRoPEGQABlock(
+            "test", 16, config, "mish", pos_len=3, use_swiglu=True
+        )
+        block_without_mask = model_pytorch.TransformerRoPEGQABlock(
+            "test", 16, config, "mish", pos_len=3, use_swiglu=True
+        )
+        block_without_mask.load_state_dict(block_with_mask.state_dict())
+
+        x_with_mask = torch.randn(2, 16, 3, 3, requires_grad=True)
+        x_without_mask = x_with_mask.detach().clone().requires_grad_(True)
+        mask = torch.ones(2, 1, 3, 3)
+
+        output_with_mask = block_with_mask(
+            x_with_mask,
+            mask=mask,
+            mask_sum_hw=mask.sum(dim=(2, 3), keepdim=True),
+            mask_sum=mask.sum(),
+        )
+        output_without_mask = block_without_mask(
+            x_without_mask,
+            mask=None,
+            mask_sum_hw=None,
+            mask_sum=None,
+        )
+        torch.testing.assert_close(output_without_mask, output_with_mask)
+
+        output_with_mask.square().mean().backward()
+        output_without_mask.square().mean().backward()
+        torch.testing.assert_close(x_without_mask.grad, x_with_mask.grad)
+        for parameter_with_mask, parameter_without_mask in zip(
+            block_with_mask.parameters(), block_without_mask.parameters()
+        ):
+            torch.testing.assert_close(
+                parameter_without_mask.grad, parameter_with_mask.grad
+            )
+
+    def test_transformer_preserves_channels_last_without_changing_values(self):
+        torch.manual_seed(4321)
+        config = {
+            "transformer_ffn_channels": 24,
+            "transformer_heads": 2,
+            "transformer_kv_heads": 2,
+            "learnable_rope": True,
+        }
+        nchw_block = model_pytorch.TransformerRoPEGQABlock(
+            "test", 16, config, "mish", pos_len=3, use_swiglu=True
+        )
+        channels_last_block = model_pytorch.TransformerRoPEGQABlock(
+            "test", 16, config, "mish", pos_len=3, use_swiglu=True
+        )
+        channels_last_block.load_state_dict(nchw_block.state_dict())
+
+        base = torch.randn(2, 16, 3, 3)
+        nchw_input = base.detach().clone().contiguous().requires_grad_(True)
+        channels_last_input = (
+            base.detach()
+            .clone()
+            .contiguous(memory_format=torch.channels_last)
+            .requires_grad_(True)
+        )
+        nchw_output = nchw_block(
+            nchw_input, mask=None, mask_sum_hw=None, mask_sum=None
+        )
+        channels_last_output = channels_last_block(
+            channels_last_input, mask=None, mask_sum_hw=None, mask_sum=None
+        )
+
+        self.assertTrue(nchw_output.is_contiguous())
+        self.assertTrue(
+            channels_last_output.is_contiguous(memory_format=torch.channels_last)
+        )
+        torch.testing.assert_close(channels_last_output, nchw_output)
+
+        nchw_output.square().mean().backward()
+        channels_last_output.square().mean().backward()
+        torch.testing.assert_close(channels_last_input.grad, nchw_input.grad)
+        for nchw_parameter, channels_last_parameter in zip(
+            nchw_block.parameters(), channels_last_block.parameters()
+        ):
+            torch.testing.assert_close(
+                channels_last_parameter.grad, nchw_parameter.grad
+            )
+
+    def test_small_full_model_channels_last_outputs_and_gradients_match(self):
+        config = copy.deepcopy(modelconfigs.config_of_name["b11c96h4tflrs-bng-silu"])
+        config.update(
+            {
+                "trunk_num_channels": 16,
+                "mid_num_channels": 16,
+                "gpool_num_channels": 8,
+                "transformer_ffn_channels": 24,
+                "transformer_heads": 2,
+                "transformer_kv_heads": 2,
+                "num_attention_pool_heads": 2,
+                "block_kind": [["rconv1", "transformerropesg"]],
+                "p1_num_channels": 8,
+                "g1_num_channels": 8,
+                "v1_num_channels": 8,
+                "sbv2_num_channels": 8,
+                "v2_size": 16,
+            }
+        )
+
+        def flatten_tensors(value):
+            if isinstance(value, torch.Tensor):
+                return [value]
+            tensors = []
+            for item in value:
+                tensors.extend(flatten_tensors(item))
+            return tensors
+
+        for disable_mask in (False, True):
+            with self.subTest(disable_mask=disable_mask):
+                torch.manual_seed(2468)
+                nchw_model = model_pytorch.Model(config, pos_len=3).eval()
+                channels_last_model = model_pytorch.Model(config, pos_len=3).eval()
+                channels_last_model.load_state_dict(nchw_model.state_dict())
+
+                base_spatial = torch.randn(2, 22, 3, 3)
+                base_spatial[:, 0, :, :] = 1.0
+                nchw_spatial = base_spatial.clone().contiguous().requires_grad_(True)
+                channels_last_spatial = (
+                    base_spatial.clone()
+                    .contiguous(memory_format=torch.channels_last)
+                    .requires_grad_(True)
+                )
+                base_global = torch.randn(2, 19)
+                nchw_global = base_global.clone().requires_grad_(True)
+                channels_last_global = base_global.clone().requires_grad_(True)
+
+                nchw_outputs = nchw_model(
+                    nchw_spatial, nchw_global, disable_mask=disable_mask
+                )
+                channels_last_outputs = channels_last_model(
+                    channels_last_spatial,
+                    channels_last_global,
+                    disable_mask=disable_mask,
+                )
+                nchw_tensors = flatten_tensors(nchw_outputs)
+                channels_last_tensors = flatten_tensors(channels_last_outputs)
+                self.assertEqual(len(channels_last_tensors), len(nchw_tensors))
+                for channels_last_tensor, nchw_tensor in zip(
+                    channels_last_tensors, nchw_tensors
+                ):
+                    torch.testing.assert_close(
+                        channels_last_tensor, nchw_tensor, rtol=2e-5, atol=2e-6
+                    )
+
+                sum(tensor.float().square().mean() for tensor in nchw_tensors).backward()
+                sum(
+                    tensor.float().square().mean()
+                    for tensor in channels_last_tensors
+                ).backward()
+                torch.testing.assert_close(
+                    channels_last_spatial.grad,
+                    nchw_spatial.grad,
+                    rtol=3e-5,
+                    atol=3e-6,
+                )
+                torch.testing.assert_close(
+                    channels_last_global.grad,
+                    nchw_global.grad,
+                    rtol=3e-5,
+                    atol=3e-6,
+                )
+                for channels_last_parameter, nchw_parameter in zip(
+                    channels_last_model.parameters(), nchw_model.parameters()
+                ):
+                    if nchw_parameter.grad is None:
+                        self.assertIsNone(channels_last_parameter.grad)
+                    else:
+                        torch.testing.assert_close(
+                            channels_last_parameter.grad,
+                            nchw_parameter.grad,
+                            rtol=3e-5,
+                            atol=3e-6,
+                        )
+
+    def test_attention_pool_accepts_channels_last_maskless_input(self):
+        torch.manual_seed(9753)
+        config = copy.deepcopy(modelconfigs.b1c6nbt)
+        config["num_attention_pool_heads"] = 2
+        nchw_pool = model_pytorch.KataConvAndAttentionPool(
+            "test", c_in=8, c_out=6, c_gpool=4, config=config, activation="mish"
+        ).eval()
+        channels_last_pool = model_pytorch.KataConvAndAttentionPool(
+            "test", c_in=8, c_out=6, c_gpool=4, config=config, activation="mish"
+        ).eval()
+        channels_last_pool.load_state_dict(nchw_pool.state_dict())
+
+        base = torch.randn(2, 8, 3, 3)
+        nchw_input = base.clone().contiguous().requires_grad_(True)
+        channels_last_input = (
+            base.clone()
+            .contiguous(memory_format=torch.channels_last)
+            .requires_grad_(True)
+        )
+        nchw_output = nchw_pool(
+            nchw_input,
+            mask=None,
+            mask_sum_hw=None,
+            mask_sum=None,
+            extra_outputs=None,
+        )
+        channels_last_output = channels_last_pool(
+            channels_last_input,
+            mask=None,
+            mask_sum_hw=None,
+            mask_sum=None,
+            extra_outputs=None,
+        )
+        torch.testing.assert_close(channels_last_output, nchw_output)
+
+        nchw_output.square().mean().backward()
+        channels_last_output.square().mean().backward()
+        torch.testing.assert_close(channels_last_input.grad, nchw_input.grad)
+        for channels_last_parameter, nchw_parameter in zip(
+            channels_last_pool.parameters(), nchw_pool.parameters()
+        ):
+            torch.testing.assert_close(
+                channels_last_parameter.grad, nchw_parameter.grad
             )
 
 

@@ -70,6 +70,11 @@ Parameters can be modified in `./train/train_muon_ki.sh` or passed as arguments 
     *   `x`: 2-fold symmetry (x-flip). Suitable for chess-like games.
     *   `x+y`: Simultaneous x and y flip (2-fold symmetry). Suitable for Hex.
     *   `none`: No symmetry.
+*   `-disable-mask`: Use the mask-free model and loss path. Training data must
+    contain only complete `pos-len` by `pos-len` boards; the loader verifies
+    every file before use. The measured channels-last input layout is enabled
+    automatically for this path. See `train/README_TRAINING_THROUGHPUT.md` for
+    the full-board filtering command and runtime tuning controls.
 
 ### Model Type Settings
 *   **Model Structure**: `b14c192h6tfrs` is a pre-defined structure in `./train/modelconfigs.py`. You can modify this file to define custom architectures.

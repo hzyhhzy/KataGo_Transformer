@@ -14,7 +14,11 @@ _DDP_ENV_NAMES = (
     "KATAGO_DDP_BROADCAST_BUFFERS",
     "KATAGO_DDP_ALIGN_CONV1X1_WEIGHT_STRIDES",
 )
-_ENV_NAMES = _DDP_ENV_NAMES + ("KATAGO_COMPILE_MODE",)
+_ENV_NAMES = _DDP_ENV_NAMES + (
+    "KATAGO_COMPILE_MODE",
+    "KATAGO_SDPA_BACKEND",
+    "KATAGO_INPUT_CHANNELS_LAST",
+)
 
 
 class DdpRuntimeOptionsTests(unittest.TestCase):
@@ -164,6 +168,70 @@ class DdpRuntimeOptionsTests(unittest.TestCase):
 
         self.assertIs(result, raw_model)
         self.assertEqual(events, [])
+
+    def test_sdpa_backend_can_be_forced_for_benchmarks(self):
+        backend_calls = {}
+        patches = []
+        for name in ("flash", "cudnn", "mem_efficient", "math"):
+            patcher = mock.patch.object(
+                train_muon_ki.torch.backends.cuda,
+                f"enable_{name}_sdp",
+                side_effect=lambda enabled, name=name: backend_calls.__setitem__(
+                    name, enabled
+                ),
+            )
+            patches.append(patcher)
+
+        with self._clean_env(), mock.patch.dict(
+            os.environ, {"KATAGO_SDPA_BACKEND": "cudnn"}
+        ):
+            for patcher in patches:
+                patcher.start()
+            try:
+                selected = train_muon_ki.configure_sdpa_backend_from_env()
+            finally:
+                for patcher in reversed(patches):
+                    patcher.stop()
+
+        self.assertEqual(selected, "cudnn")
+        self.assertEqual(
+            backend_calls,
+            {"flash": False, "cudnn": True, "mem_efficient": False, "math": False},
+        )
+
+    def test_invalid_sdpa_backend_is_rejected(self):
+        with self._clean_env(), mock.patch.dict(
+            os.environ, {"KATAGO_SDPA_BACKEND": "unknown"}
+        ):
+            with self.assertRaisesRegex(ValueError, "KATAGO_SDPA_BACKEND"):
+                train_muon_ki.configure_sdpa_backend_from_env()
+
+    def test_channels_last_defaults_to_maskless_training_and_allows_override(self):
+        cases = (
+            (False, None, False),
+            (True, None, True),
+            (False, "0", False),
+            (True, "0", False),
+            (False, "1", True),
+            (True, "1", True),
+        )
+        for disable_mask, env_value, expected in cases:
+            with self.subTest(disable_mask=disable_mask, env_value=env_value):
+                environment = {}
+                if env_value is not None:
+                    environment["KATAGO_INPUT_CHANNELS_LAST"] = env_value
+                with self._clean_env(), mock.patch.dict(os.environ, environment):
+                    self.assertEqual(
+                        train_muon_ki.resolve_input_channels_last(disable_mask),
+                        expected,
+                    )
+
+    def test_invalid_channels_last_override_is_rejected(self):
+        with self._clean_env(), mock.patch.dict(
+            os.environ, {"KATAGO_INPUT_CHANNELS_LAST": "auto"}
+        ):
+            with self.assertRaisesRegex(ValueError, "KATAGO_INPUT_CHANNELS_LAST"):
+                train_muon_ki.resolve_input_channels_last(disable_mask=True)
 
     def test_batch_renorm_keeps_buffer_broadcast_by_default(self):
         raw_model = self._raw_model("brenorm")

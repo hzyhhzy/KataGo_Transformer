@@ -642,24 +642,30 @@ class KataConvAndAttentionPool(torch.nn.Module):
         out = x
         outr = self.conv1r(out)
         outg = self.conv1g(out)
-        outk = self.conv1k(out).view(n*self.c_apheads, self.c_gpool//self.c_apheads, h*w)
-        outq = self.conv1q(out).view(n*self.c_apheads, self.c_gpool//self.c_apheads, h*w)
+        # reshape is a view for the historical NCHW path and makes the required
+        # compact copy for channels-last, where batch and split-head dimensions
+        # cannot be merged by view.
+        outk = self.conv1k(out).reshape(n*self.c_apheads, self.c_gpool//self.c_apheads, h*w)
+        outq = self.conv1q(out).reshape(n*self.c_apheads, self.c_gpool//self.c_apheads, h*w)
         attention_logits = torch.bmm(torch.transpose(outk,1,2), outq) # n*heads, src h*w, dst h*w
         attention_logits = attention_logits.view(n, self.c_apheads, h*w, h*w)
-        attention_logits = attention_logits - (self.t_1 - mask.view(n,1,h*w,1)) * self.t_6000
+        if mask is not None:
+            attention_logits = attention_logits - (self.t_1 - mask.view(n,1,h*w,1)) * self.t_6000
         attention_logits = attention_logits.view(n * self.c_apheads, h*w, h*w)
         attention = torch.nn.functional.softmax(attention_logits, dim=1)
         attention_scale = self.t_0_1 / torch.sqrt(torch.sum(torch.square(attention), dim=1, keepdim=True)) # n*heads, 1, h*w
 
         outg = self.normg(outg, mask=mask, mask_sum=mask_sum)
-        outg = self.actg(outg).view(n*self.c_apheads, self.c_gpool//self.c_apheads, h*w)
+        outg = self.actg(outg).reshape(n*self.c_apheads, self.c_gpool//self.c_apheads, h*w)
 
         out_pool1 = torch.bmm(outg, attention)
         out_pool2 = out_pool1 * attention_scale
         out_pool1 = out_pool1.view(n, self.c_gpool, h*w)
         out_pool2 = out_pool2.view(n, self.c_gpool, h*w)
 
-        outg = torch.cat((out_pool1, out_pool2), dim=1).view(n, 2 * self.c_gpool, h, w) * mask
+        outg = torch.cat((out_pool1, out_pool2), dim=1).view(n, 2 * self.c_gpool, h, w)
+        if mask is not None:
+            outg = outg * mask
         outg = self.conv_mix(outg)
         out = outr + outg
         return out
@@ -978,11 +984,14 @@ class TransformerBlock(torch.nn.Module):
         x1 = self.norm1(x)
         
         # Convert mask from N1HW to N(H*W)
-        mask1 = mask.view(batch_size, -1)  # (N, H*W)
+        key_padding_mask = None
+        if mask is not None:
+            mask1 = mask.view(batch_size, -1)  # (N, H*W)
+            key_padding_mask = mask1 == 0
         # Self-attention
         attn_output, _ = self.attention(
             x1, x1, x1,
-            key_padding_mask=(mask1==0)
+            key_padding_mask=key_padding_mask
         )
         x = x + attn_output
         x = self.norm2(x)

@@ -48,6 +48,57 @@ effectively tied with FP16; BF16 gradient compression improved b40 by only about
 0.3% while changing reduction precision. FP16 remains the script default and
 gradient communication remains FP32.
 
+## Full-board mask-free training
+
+When every sample uses the complete `pos_len` by `pos_len` board, the model and
+loss can omit spatial masks. This lets CUDA SDPA select an unmasked fused
+attention kernel and removes redundant mask operations from normalization,
+pooling, heads, and spatial losses. Filter shuffled data into a separate tree:
+
+```bash
+python filter_full_board_npz.py /path/to/shuffled /path/to/shuffled_full15 \
+  --pos-len 15 --workers 2
+python filter_full_board_npz.py --verify-only /path/to/shuffled_full15 --pos-len 15
+```
+
+The filter reads the source only, applies the same row selection to every NPZ
+field, ignores packed padding bits after the board, verifies the completed
+staging tree, and atomically publishes the destination. It also updates training
+sidecars and writes `full_board_filter_manifest.json`. In the benchmark dataset,
+2,703,710 of 3,013,632 rows were full 15x15 boards (89.716%).
+
+Pass `-disable-mask` when training on the filtered tree. Every NPZ is checked on
+the CPU before its first batch is transferred; a single non-full-board row makes
+the run fail with the filename and first bad row. The flag is fixed for the
+whole training run so `torch.compile` sees one static graph. Validation keeps the
+normal masked path, allowing an unfiltered validation set. Full-one masks and no
+masks are mathematically equivalent, but fused attention and reduction order
+mean AMP results are not bitwise identical.
+
+Mask-free training automatically stores the binary spatial input in
+channels-last format. This makes the BSC view used by every Transformer block
+contiguous in its channel dimension; model parameters, optimizer tensors,
+targets, validation, and SWA validation keep their existing layouts. Set
+`KATAGO_INPUT_CHANNELS_LAST=0` for an NCHW regression comparison. Explicitly
+setting it to `1` also enables the layout for masked training, but that mode has
+not been performance-tuned.
+
+The following two-card RTX 4090 D results use the same filtered data, FP16,
+default compile mode, and per-GPU batches 416 (b24) or 172 (b40). The masked
+control still computes full-one masks. Each rate excludes the first 100-step
+compilation interval.
+
+| Model | Masked NCHW | Mask-free NCHW | Mask-free channels-last | Total gain |
+|---|---:|---:|---:|---:|
+| `b24c256h8tflrs-bng-silu-v102` | 2,787.7 samples/s | 3,034.9 samples/s | 3,502.4 samples/s | 25.6% |
+| `b40c384h12tflrs-bng-silu-v102` | 942.0 samples/s | 1,028.0 samples/s | 1,170.9 samples/s | 24.3% |
+
+Removing model and loss masks contributed about 9%; channels-last added another
+13.9--15.4% over mask-free NCHW. With a true `attn_mask=None`, PyTorch `auto`
+selected Flash SDPA on both models; forcing another backend was slower. For b24,
+batch 424 was 0.4% slower than batch 416 while using about 0.65 GiB more memory,
+so 416 is the measured throughput optimum with useful headroom.
+
 ## Runtime controls
 
 The optimized settings are on by default. Set an environment variable to `0`
@@ -66,6 +117,8 @@ to disable an individual optimization for debugging or regression comparison:
 | `KATAGO_DDP_GRADIENT_AS_BUCKET_VIEW` | `1` | Make gradients views of DDP buckets |
 | `KATAGO_DDP_BROADCAST_BUFFERS` | norm-dependent | Disabled for ordinary batch norm; enabled for batch renorm and QAT |
 | `KATAGO_DDP_ALIGN_CONV1X1_WEIGHT_STRIDES` | `1` | Match 1x1 convolution parameter and backward-gradient strides under DDP |
+| `KATAGO_SDPA_BACKEND` | `auto` | Optionally force `flash`, `cudnn`, `efficient`, or `math` for benchmarking |
+| `KATAGO_INPUT_CHANNELS_LAST` | mask-dependent | Defaults to `1` with `-disable-mask`, otherwise `0`; explicit `0` or `1` overrides the training-input layout |
 
 `-no-compile` disables both model and loss compilation. QAT also disables the
 compiled loss. Muon's Newton-Schulz kernel retains its existing local

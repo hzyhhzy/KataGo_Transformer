@@ -145,21 +145,30 @@ class Metrics:
         # Not unlike the way that policy and value loss are also equal-weighted by batch element.
         assert pred_pretanh.shape == (self.n, 1, self.pos_len, self.pos_len)
         assert target.shape == (self.n, self.pos_len, self.pos_len)
-        assert mask.shape == (self.n, self.pos_len, self.pos_len)
-        assert mask_sum_hw.shape == (self.n,)
         pred_logits = torch.cat((pred_pretanh, -pred_pretanh), dim=1).view(self.n,2,self.pos_area)
         target_probs = torch.stack(((1.0 + target) / 2.0, (1.0 - target) / 2.0), dim=1).view(self.n,2,self.pos_area)
-        loss = torch.sum(cross_entropy(pred_logits, target_probs, dim=1) * mask.view(self.n,self.pos_area), dim=1) / mask_sum_hw
+        pointwise_loss = cross_entropy(pred_logits, target_probs, dim=1)
+        if mask is None:
+            assert mask_sum_hw is None
+            loss = torch.sum(pointwise_loss, dim=1) / self.pos_area
+        else:
+            assert mask.shape == (self.n, self.pos_len, self.pos_len)
+            assert mask_sum_hw.shape == (self.n,)
+            loss = torch.sum(pointwise_loss * mask.view(self.n,self.pos_area), dim=1) / mask_sum_hw
         return 1.5 * global_weight * weight * loss
 
 
     def loss_scoring_samplewise(self, pred_scoring, target, weight, mask, mask_sum_hw, global_weight):
         assert pred_scoring.shape == (self.n, 1, self.pos_len, self.pos_len)
         assert target.shape == (self.n, self.pos_len, self.pos_len)
-        assert mask.shape == (self.n, self.pos_len, self.pos_len)
-        assert mask_sum_hw.shape == (self.n,)
-
-        loss = torch.sum(torch.square(pred_scoring.squeeze(1) - target) * mask, dim=(1,2)) / mask_sum_hw
+        pointwise_loss = torch.square(pred_scoring.squeeze(1) - target)
+        if mask is None:
+            assert mask_sum_hw is None
+            loss = torch.sum(pointwise_loss, dim=(1,2)) / self.pos_area
+        else:
+            assert mask.shape == (self.n, self.pos_len, self.pos_len)
+            assert mask_sum_hw.shape == (self.n,)
+            loss = torch.sum(pointwise_loss * mask, dim=(1,2)) / mask_sum_hw
         # Simple huberlike transform to reduce crazy values
         loss = 4.0 * (torch.sqrt(loss * 0.5 + 1.0) - 1.0)
         return global_weight * weight * loss
@@ -176,11 +185,17 @@ class Metrics:
         # due to simply being farther in the future, so multiply by [1,0.25].
         assert pred_pretanh.shape == (self.n, self.num_futurepos_values, self.pos_len, self.pos_len)
         assert target.shape == (self.n, self.num_futurepos_values, self.pos_len, self.pos_len)
-        assert mask.shape == (self.n, self.pos_len, self.pos_len)
-        assert mask_sum_hw.shape == (self.n,)
-        loss = torch.square(torch.tanh(pred_pretanh) - target) * mask.unsqueeze(1)
+        loss = torch.square(torch.tanh(pred_pretanh) - target)
+        if mask is None:
+            assert mask_sum_hw is None
+            loss_scale = math.sqrt(self.pos_area)
+        else:
+            assert mask.shape == (self.n, self.pos_len, self.pos_len)
+            assert mask_sum_hw.shape == (self.n,)
+            loss = loss * mask.unsqueeze(1)
+            loss_scale = torch.sqrt(mask_sum_hw)
         loss = loss * constant_like([1.0,0.25], loss).view(1,2,1,1)
-        loss = torch.sum(loss, dim=(1, 2, 3)) / torch.sqrt(mask_sum_hw)
+        loss = torch.sum(loss, dim=(1, 2, 3)) / loss_scale
         return 0.25 * global_weight * weight * loss
 
 
@@ -189,12 +204,16 @@ class Metrics:
         assert pred_logits.shape == (self.n, self.num_seki_logits, self.pos_len, self.pos_len)
         assert target.shape == (self.n, self.pos_len, self.pos_len)
         assert target_ownership.shape == (self.n, self.pos_len, self.pos_len)
-        assert mask.shape == (self.n, self.pos_len, self.pos_len)
-        assert mask_sum_hw.shape == (self.n,)
 
         owned_target = torch.square(target_ownership)
         unowned_target = 1.0 - owned_target
-        unowned_proportion = torch.sum(unowned_target * mask, dim=(1, 2)) / (1.0 + mask_sum_hw)
+        if mask is None:
+            assert mask_sum_hw is None
+            unowned_proportion = torch.sum(unowned_target, dim=(1, 2)) / (1.0 + self.pos_area)
+        else:
+            assert mask.shape == (self.n, self.pos_len, self.pos_len)
+            assert mask_sum_hw.shape == (self.n,)
+            unowned_proportion = torch.sum(unowned_target * mask, dim=(1, 2)) / (1.0 + mask_sum_hw)
         unowned_proportion = torch.mean(unowned_proportion * weight)
         if is_training:
             if not skip_moving_update:
@@ -246,17 +265,23 @@ class Metrics:
             ),
             dim=1,
         )
-        loss_sign = torch.sum(cross_entropy(sign_pred, sign_target, dim=1) * mask, dim=(1, 2))
+        loss_sign = cross_entropy(sign_pred, sign_target, dim=1)
+        if mask is not None:
+            loss_sign = loss_sign * mask
+        loss_sign = torch.sum(loss_sign, dim=(1, 2))
 
         # Loss for generally predicting points that nobody will own
         neutral_pred = torch.stack(
             (pred_logits[:, 3, :, :], torch.zeros_like(target_ownership)), dim=1
         )
         neutral_target = torch.stack((unowned_target, owned_target), dim=1)
-        loss_neutral = torch.sum(cross_entropy(neutral_pred, neutral_target, dim=1) * mask, dim=(1, 2))
+        loss_neutral = cross_entropy(neutral_pred, neutral_target, dim=1)
+        if mask is not None:
+            loss_neutral = loss_neutral * mask
+        loss_neutral = torch.sum(loss_neutral, dim=(1, 2))
 
         loss = loss_sign + 0.5 * loss_neutral
-        loss = loss / mask_sum_hw
+        loss = loss / (self.pos_area if mask is None else mask_sum_hw)
         return (global_weight * seki_weight_scale * weight * loss, seki_weight_scale)
 
 
@@ -487,6 +512,7 @@ class Metrics:
         main_loss_scale,
         intermediate_loss_scale,
         include_model_norms=True,
+        assume_full_board=False,
     ):
         results = self.metrics_dict_batchwise_single_heads_output(
             raw_model,
@@ -502,6 +528,7 @@ class Metrics:
             variance_time_loss_scale=variance_time_loss_scale,
             is_intermediate=False,
             include_model_norms=include_model_norms,
+            assume_full_board=assume_full_board,
         )
         if main_loss_scale is not None:
             results["loss_sum"] = main_loss_scale * results["loss_sum"]
@@ -529,6 +556,7 @@ class Metrics:
                     variance_time_loss_scale=variance_time_loss_scale,
                     is_intermediate=True,
                     include_model_norms=False,
+                    assume_full_board=assume_full_board,
                 )
                 for key,value in iresults.items():
                     if key != "loss_sum":
@@ -558,6 +586,7 @@ class Metrics:
         variance_time_loss_scale,
         is_intermediate,
         include_model_norms=True,
+        assume_full_board=False,
     ):
         (
             policy_logits,
@@ -585,23 +614,32 @@ class Metrics:
         score_distribution_ns = batch["scoreDistrN"]
         target_value_nchw = batch["valueTargetsNCHW"]
 
-        mask = input_binary_nchw[:, 0, :, :].contiguous()
-        mask_sum_hw = torch.sum(mask,dim=(1,2))
-
         n = input_binary_nchw.shape[0]
         h = input_binary_nchw.shape[2]
         w = input_binary_nchw.shape[3]
 
-        policymask = torch.cat((mask.view(n,h*w),mask.new_ones((n,1))),dim=1)
+        # Keep this a Python-level specialization for torch.compile. The data
+        # loader is responsible for validating the full-board precondition.
+        if assume_full_board:
+            mask = None
+            mask_sum_hw = None
+        else:
+            mask = input_binary_nchw[:, 0, :, :].contiguous()
+            mask_sum_hw = torch.sum(mask,dim=(1,2))
+            policymask = torch.cat((mask.view(n,h*w),mask.new_ones((n,1))),dim=1)
 
         target_policy_player = target_policy_ncmove[:, 0, :]
         target_policy_player = target_policy_player / torch.sum(target_policy_player, dim=1, keepdim=True)
         target_policy_opponent = target_policy_ncmove[:, 1, :]
         target_policy_opponent = target_policy_opponent / torch.sum(target_policy_opponent, dim=1, keepdim=True)
-        target_policy_player_soft = (target_policy_player + 1e-7) * policymask
+        target_policy_player_soft = target_policy_player + 1e-7
+        if not assume_full_board:
+            target_policy_player_soft = target_policy_player_soft * policymask
         target_policy_player_soft = torch.pow(target_policy_player_soft, 0.25)
         target_policy_player_soft /= torch.sum(target_policy_player_soft, dim=1, keepdim=True)
-        target_policy_opponent_soft = (target_policy_opponent + 1e-7) * policymask
+        target_policy_opponent_soft = target_policy_opponent + 1e-7
+        if not assume_full_board:
+            target_policy_opponent_soft = target_policy_opponent_soft * policymask
         target_policy_opponent_soft = torch.pow(target_policy_opponent_soft, 0.25)
         target_policy_opponent_soft /= torch.sum(target_policy_opponent_soft, dim=1, keepdim=True)
 
