@@ -25,6 +25,28 @@ FlexAttention recovered about 49.5% of the b24 mask-related throughput gap and
 47.1% of the b40 gap. It also used slightly less peak memory than masked SDPA:
 about 22.45 GiB/GPU versus 22.53 GiB/GPU for b40 at batch 160.
 
+## cuDNN SDPA comparison
+
+cuDNN SDPA supports this FP16 additive-mask shape, so it was also tested as an
+alternative dense masked backend. `KATAGO_SDPA_BACKEND=cudnn` disabled Flash,
+Efficient and Math SDPA on every rank; completing forward and backward therefore
+confirmed that the runs used cuDNN rather than silently falling back. The server
+used PyTorch 2.12.1+cu130 and cuDNN 9.20.0.
+
+| Model | Default masked SDPA (Efficient) | Forced cuDNN SDPA | cuDNN throughput change |
+|---|---:|---:|---:|
+| b24c256h8 | 27.695 s / 5,546 samples/s | 28.935 s / 5,308 samples/s | -4.3% |
+| b40c384h12 | 33.895 s / 1,888 samples/s | 35.010 s / 1,828 samples/s | -3.2% |
+
+An attention-only FP16 forward-plus-backward benchmark with the same additive
+mask and projection-output strides agreed with the full runs. For b24,
+Efficient/cuDNN took 2.645/3.301 ms; for b40 they took 1.647/1.961 ms. Forced
+Flash rejected the explicit mask. cuDNN treats this as dense attention with an
+additive bias and does not skip invalid board positions, so its general support
+does not imply a speedup for these short `S=225, D=32` shapes. Keep automatic
+SDPA selection as the production default; the existing backend environment
+switch remains useful for retesting future PyTorch, cuDNN, or GPU versions.
+
 ## Kept implementation
 
 - `-use-flex-attention` is a runtime training flag, not a ModelConfig field and
