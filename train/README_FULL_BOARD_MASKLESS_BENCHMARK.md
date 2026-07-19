@@ -233,6 +233,35 @@ scaling, not a pure measurement of DDP communication: distributed Muon shards
 matrix updates across ranks before synchronizing parameters, whereas the
 single process updates every Muon matrix.
 
+### Four-GPU CNN regression
+
+A separate regression used the pure-CNN `b28c512nbt-bng-mish-v102` model on
+four RTX 4090 D GPUs. The per-GPU batch was fixed at 320 (global batch 1,280),
+FP16 and the default compile mode were used, and every timing interval covered
+100 steps or 128,000 samples. The first compilation interval was excluded and
+the reported rate is derived from the median of the next six intervals. The
+masked runs consumed the mixed-board source directly; the maskless runs used
+`-filter-full-board-on-load -disable-mask` on that same source tree.
+
+The exact pre-optimization control was exported from commit `6c8f0c8` into an
+isolated server directory, without checking out or modifying the working
+`main` branch.
+
+| Code and path | Median interval | Samples/s | Versus pre-optimization control |
+|---|---:|---:|---:|
+| `6c8f0c8`, masked NCHW | 58.135 s | 2,201.8 | baseline |
+| current, masked NCHW | 54.470 s | 2,349.9 | +6.73% |
+| current, masked NHWC | 50.480 s | 2,535.7 | +15.16% |
+| current, filtered maskless NCHW | 50.840 s | 2,517.7 | +14.35% |
+| current, filtered maskless NHWC | 46.010 s | 2,782.0 | +26.35% |
+
+Within current code, NHWC improved masked throughput by 7.90%. Removing the
+mask improved NCHW by 7.14% and NHWC by 9.72%; NHWC added 10.50% on top of the
+maskless NCHW path. The complete current maskless-NHWC path was 18.39% faster
+than current masked NCHW. All five short runs had finite, consistently falling
+policy and value losses. The old control repeatedly emitted DDP gradient/bucket
+stride mismatch warnings, while the current runs did not.
+
 ## Correctness and integration checks
 
 - 81 local unit tests passed.
