@@ -667,7 +667,7 @@ class KataConvAndAttentionPool(torch.nn.Module):
         outr = self.conv1r(out)
         outg = self.conv1g(out)
         # reshape is a view for the historical NCHW path and makes the required
-        # compact copy for channels-last, where batch and split-head dimensions
+        # compact copy for NHWC, where batch and split-head dimensions
         # cannot be merged by view.
         outk = self.conv1k(out).reshape(n*self.c_apheads, self.c_gpool//self.c_apheads, h*w)
         outq = self.conv1q(out).reshape(n*self.c_apheads, self.c_gpool//self.c_apheads, h*w)

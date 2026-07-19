@@ -28,7 +28,7 @@ about 22.45 GiB/GPU versus 22.53 GiB/GPU for b40 at batch 160.
 ## cuDNN SDPA comparison
 
 cuDNN SDPA supports this FP16 additive-mask shape, so it was also tested as an
-alternative dense masked backend. `KATAGO_SDPA_BACKEND=cudnn` disabled Flash,
+alternative dense masked backend. `-sdpa-backend cudnn` disabled Flash,
 Efficient and Math SDPA on every rank; completing forward and backward therefore
 confirmed that the runs used cuDNN rather than silently falling back. The server
 used PyTorch 2.12.1+cu130 and cuDNN 9.20.0.

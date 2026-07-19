@@ -72,12 +72,17 @@ Parameters can be modified in `./train/train_muon_ki.sh` or passed as arguments 
     *   `none`: No symmetry.
 *   `-disable-mask`: Use the mask-free model and loss path. Training data must
     contain only complete `pos-len` by `pos-len` boards; the loader verifies
-    every file before use. The measured channels-last input layout is enabled
-    automatically for this path. See `train/README_TRAINING_THROUGHPUT.md` for
-    the full-board filtering command and runtime tuning controls.
+    every file before use. See `train/README_TRAINING_THROUGHPUT.md` for the
+    full-board filtering command and runtime tuning controls.
 *   `-filter-full-board-on-load`: With `-disable-mask`, discard non-full-board
     training rows while loading instead of rejecting a mixed NPZ file. Files
     retaining fewer than one global batch produce a warning and no batches.
+*   `-input-memory-format {nhwc,nchw}`: Spatial input memory format. Defaults
+    to `nhwc`; pass `nchw` only for compatibility or regression comparison.
+*   `-compile-mode {default,max-autotune-no-cudagraphs,max-autotune}`: Select
+    the `torch.compile` mode. Defaults to `default`.
+*   `-sdpa-backend {auto,flash,cudnn,efficient,math}`: Select the CUDA SDPA
+    backend. Defaults to `auto`.
 
 ### Model Type Settings
 *   **Model Structure**: `b14c192h6tfrs` is a pre-defined structure in `./train/modelconfigs.py`. You can modify this file to define custom architectures.

@@ -14,11 +14,7 @@ _DDP_ENV_NAMES = (
     "KATAGO_DDP_BROADCAST_BUFFERS",
     "KATAGO_DDP_ALIGN_CONV1X1_WEIGHT_STRIDES",
 )
-_ENV_NAMES = _DDP_ENV_NAMES + (
-    "KATAGO_COMPILE_MODE",
-    "KATAGO_SDPA_BACKEND",
-    "KATAGO_INPUT_CHANNELS_LAST",
-)
+_ENV_NAMES = _DDP_ENV_NAMES
 
 
 class DdpRuntimeOptionsTests(unittest.TestCase):
@@ -136,11 +132,13 @@ class DdpRuntimeOptionsTests(unittest.TestCase):
                 with self.subTest(mode=mode, world_size=world_size):
                     raw_model = self._raw_model()
                     events, compile_patch, ddp_patch = self._mock_wrappers()
-                    with self._clean_env(), mock.patch.dict(
-                        os.environ, {"KATAGO_COMPILE_MODE": mode}
-                    ), compile_patch, ddp_patch:
+                    with self._clean_env(), compile_patch, ddp_patch:
                         train_muon_ki.wrap_model_for_training(
-                            raw_model, object(), world_size=world_size, no_compile=False
+                            raw_model,
+                            object(),
+                            world_size=world_size,
+                            no_compile=False,
+                            compile_mode=mode,
                         )
 
                     compile_events = [event for event in events if event[0] == "compile"]
@@ -148,22 +146,26 @@ class DdpRuntimeOptionsTests(unittest.TestCase):
                     self.assertEqual(compile_events[0][2], {"mode": mode})
 
     def test_invalid_compile_mode_is_rejected(self):
-        with self._clean_env(), mock.patch.dict(
-            os.environ, {"KATAGO_COMPILE_MODE": "reduce-overhead"}
-        ):
-            with self.assertRaisesRegex(ValueError, "KATAGO_COMPILE_MODE"):
+        with self._clean_env():
+            with self.assertRaisesRegex(ValueError, "-compile-mode"):
                 train_muon_ki.wrap_model_for_training(
-                    self._raw_model(), object(), world_size=1, no_compile=False
+                    self._raw_model(),
+                    object(),
+                    world_size=1,
+                    no_compile=False,
+                    compile_mode="reduce-overhead",
                 )
 
     def test_no_compile_ignores_compile_mode(self):
         raw_model = self._raw_model()
         events, compile_patch, ddp_patch = self._mock_wrappers()
-        with self._clean_env(), mock.patch.dict(
-            os.environ, {"KATAGO_COMPILE_MODE": "not-used"}
-        ), compile_patch, ddp_patch:
+        with self._clean_env(), compile_patch, ddp_patch:
             result = train_muon_ki.wrap_model_for_training(
-                raw_model, object(), world_size=1, no_compile=True
+                raw_model,
+                object(),
+                world_size=1,
+                no_compile=True,
+                compile_mode="not-used",
             )
 
         self.assertIs(result, raw_model)
@@ -182,13 +184,11 @@ class DdpRuntimeOptionsTests(unittest.TestCase):
             )
             patches.append(patcher)
 
-        with self._clean_env(), mock.patch.dict(
-            os.environ, {"KATAGO_SDPA_BACKEND": "cudnn"}
-        ):
+        with self._clean_env():
             for patcher in patches:
                 patcher.start()
             try:
-                selected = train_muon_ki.configure_sdpa_backend_from_env()
+                selected = train_muon_ki.configure_sdpa_backend("cudnn")
             finally:
                 for patcher in reversed(patches):
                     patcher.stop()
@@ -200,38 +200,18 @@ class DdpRuntimeOptionsTests(unittest.TestCase):
         )
 
     def test_invalid_sdpa_backend_is_rejected(self):
-        with self._clean_env(), mock.patch.dict(
-            os.environ, {"KATAGO_SDPA_BACKEND": "unknown"}
-        ):
-            with self.assertRaisesRegex(ValueError, "KATAGO_SDPA_BACKEND"):
-                train_muon_ki.configure_sdpa_backend_from_env()
+        with self._clean_env():
+            with self.assertRaisesRegex(ValueError, "-sdpa-backend"):
+                train_muon_ki.configure_sdpa_backend("unknown")
 
-    def test_channels_last_defaults_to_maskless_training_and_allows_override(self):
-        cases = (
-            (False, None, False),
-            (True, None, True),
-            (False, "0", False),
-            (True, "0", False),
-            (False, "1", True),
-            (True, "1", True),
-        )
-        for disable_mask, env_value, expected in cases:
-            with self.subTest(disable_mask=disable_mask, env_value=env_value):
-                environment = {}
-                if env_value is not None:
-                    environment["KATAGO_INPUT_CHANNELS_LAST"] = env_value
-                with self._clean_env(), mock.patch.dict(os.environ, environment):
-                    self.assertEqual(
-                        train_muon_ki.resolve_input_channels_last(disable_mask),
-                        expected,
-                    )
+    def test_input_memory_format_uses_nhwc_by_default_and_allows_nchw(self):
+        self.assertEqual(train_muon_ki._ALLOWED_INPUT_MEMORY_FORMATS[0], "nhwc")
+        self.assertTrue(train_muon_ki.resolve_input_nhwc("nhwc"))
+        self.assertFalse(train_muon_ki.resolve_input_nhwc("nchw"))
 
-    def test_invalid_channels_last_override_is_rejected(self):
-        with self._clean_env(), mock.patch.dict(
-            os.environ, {"KATAGO_INPUT_CHANNELS_LAST": "auto"}
-        ):
-            with self.assertRaisesRegex(ValueError, "KATAGO_INPUT_CHANNELS_LAST"):
-                train_muon_ki.resolve_input_channels_last(disable_mask=True)
+    def test_invalid_input_memory_format_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "-input-memory-format"):
+            train_muon_ki.resolve_input_nhwc("auto")
 
     def test_on_load_full_board_filter_requires_maskless_training(self):
         train_muon_ki.validate_full_board_filter_options(

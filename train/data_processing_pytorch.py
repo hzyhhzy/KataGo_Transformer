@@ -54,7 +54,7 @@ def read_npz_training_data(
     history_matrices_type: str,
     model_config: modelconfigs.ModelConfig,
     require_full_board: bool = False,
-    binary_input_channels_last: bool = False,
+    binary_input_nhwc: bool = False,
     filter_full_board_on_load: bool = False,
 ):
     if filter_full_board_on_load and not require_full_board:
@@ -241,7 +241,7 @@ def read_npz_training_data(
                     if include_qvalues:
                         batch_qValueTargetsNCMove = apply_symmetry_policy(batch_qValueTargetsNCMove, symm, pos_len)
 
-                if binary_input_channels_last:
+                if binary_input_nhwc:
                     batch_binaryInputNCHW = batch_binaryInputNCHW.contiguous(
                         memory_format=torch.channels_last
                     )

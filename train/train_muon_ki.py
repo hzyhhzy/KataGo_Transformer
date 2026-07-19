@@ -43,6 +43,15 @@ from muon_kissin import MuonWithAuxAdamKimi
 torch.set_float32_matmul_precision('high')
 
 
+_ALLOWED_COMPILE_MODES = (
+    "default",
+    "max-autotune-no-cudagraphs",
+    "max-autotune",
+)
+_ALLOWED_SDPA_BACKENDS = ("auto", "flash", "cudnn", "efficient", "math")
+_ALLOWED_INPUT_MEMORY_FORMATS = ("nhwc", "nchw")
+
+
 def add_amp_arguments(argument_container):
     """Add mutually exclusive mixed-precision command-line options."""
     amp_args = argument_container.add_mutually_exclusive_group()
@@ -171,6 +180,27 @@ if __name__ == "__main__":
     optional_args.add_argument('-master-port', help='Localhost port', default=23456, type=int, required=False)
     optional_args.add_argument('-no-compile', help='Do not torch.compile', required=False, action='store_true')
     optional_args.add_argument(
+        '-compile-mode',
+        choices=_ALLOWED_COMPILE_MODES,
+        default='default',
+        help='torch.compile mode (default: default)',
+        required=False,
+    )
+    optional_args.add_argument(
+        '-sdpa-backend',
+        choices=_ALLOWED_SDPA_BACKENDS,
+        default='auto',
+        help='CUDA SDPA backend selection (default: auto)',
+        required=False,
+    )
+    optional_args.add_argument(
+        '-input-memory-format',
+        choices=_ALLOWED_INPUT_MEMORY_FORMATS,
+        default='nhwc',
+        help='Training input memory format: nhwc or nchw (default: nhwc)',
+        required=False,
+    )
+    optional_args.add_argument(
         '-disable-mask',
         help=(
             'Assume every training sample uses the full pos-len by pos-len board, '
@@ -271,14 +301,6 @@ _DDP_STATIC_GRAPH_ENV = "KATAGO_DDP_STATIC_GRAPH"
 _DDP_GRADIENT_AS_BUCKET_VIEW_ENV = "KATAGO_DDP_GRADIENT_AS_BUCKET_VIEW"
 _DDP_BROADCAST_BUFFERS_ENV = "KATAGO_DDP_BROADCAST_BUFFERS"
 _DDP_ALIGN_CONV1X1_WEIGHT_STRIDES_ENV = "KATAGO_DDP_ALIGN_CONV1X1_WEIGHT_STRIDES"
-_COMPILE_MODE_ENV = "KATAGO_COMPILE_MODE"
-_SDPA_BACKEND_ENV = "KATAGO_SDPA_BACKEND"
-_INPUT_CHANNELS_LAST_ENV = "KATAGO_INPUT_CHANNELS_LAST"
-_ALLOWED_COMPILE_MODES = (
-    "default",
-    "max-autotune-no-cudagraphs",
-    "max-autotune",
-)
 
 _RANK0_ACTION_PROCEED = 0
 _RANK0_ACTION_RETRY = 1
@@ -299,42 +321,37 @@ def _get_strict_env_bool(name: str, default: bool = False) -> bool:
     )
 
 
-def resolve_input_channels_last(disable_mask: bool) -> bool:
-    """Use channels-last automatically for the measured full-board fast path."""
-    return _get_strict_env_bool(
-        _INPUT_CHANNELS_LAST_ENV, default=disable_mask
-    )
+def resolve_input_nhwc(input_memory_format: str) -> bool:
+    """Return whether training inputs should use NHWC memory layout."""
+    if input_memory_format not in _ALLOWED_INPUT_MEMORY_FORMATS:
+        allowed = "|".join(_ALLOWED_INPUT_MEMORY_FORMATS)
+        raise ValueError(
+            f"-input-memory-format must be one of {allowed}, "
+            f"got {input_memory_format!r}"
+        )
+    return input_memory_format == "nhwc"
 
 
-def _get_compile_mode() -> str:
-    mode = os.environ.get(_COMPILE_MODE_ENV, "default")
+def validate_compile_mode(mode: str) -> str:
     if mode in _ALLOWED_COMPILE_MODES:
         return mode
     allowed = "|".join(_ALLOWED_COMPILE_MODES)
     raise ValueError(
-        f"Environment variable {_COMPILE_MODE_ENV} must be one of {allowed}, got {mode!r}"
+        f"-compile-mode must be one of {allowed}, got {mode!r}"
     )
 
 
-def configure_sdpa_backend_from_env() -> str:
-    """Optionally force one CUDA SDPA backend for repeatable benchmarks."""
-    backend = os.environ.get(_SDPA_BACKEND_ENV)
-    if backend is None:
-        return "auto"
-    backend = backend.strip().lower().replace("-", "_")
-    aliases = {
-        "mem_efficient": "efficient",
-        "memory_efficient": "efficient",
-    }
-    backend = aliases.get(backend, backend)
-    allowed = ("auto", "flash", "cudnn", "efficient", "math")
-    if backend not in allowed:
+def configure_sdpa_backend(backend: str) -> str:
+    """Select one CUDA SDPA backend, or leave all backends enabled for auto."""
+    if backend not in _ALLOWED_SDPA_BACKENDS:
         raise ValueError(
-            f"Environment variable {_SDPA_BACKEND_ENV} must be one of "
-            f"{'|'.join(allowed)}, got {backend!r}"
+            f"-sdpa-backend must be one of "
+            f"{'|'.join(_ALLOWED_SDPA_BACKENDS)}, got {backend!r}"
         )
 
-    enabled = set(allowed[1:]) if backend == "auto" else {backend}
+    enabled = (
+        set(_ALLOWED_SDPA_BACKENDS[1:]) if backend == "auto" else {backend}
+    )
     torch.backends.cuda.enable_flash_sdp("flash" in enabled)
     torch.backends.cuda.enable_cudnn_sdp("cudnn" in enabled)
     torch.backends.cuda.enable_mem_efficient_sdp("efficient" in enabled)
@@ -447,10 +464,11 @@ def wrap_model_for_training(
     device,
     world_size: int,
     no_compile: bool,
+    compile_mode: str = "default",
     qat_int8: bool = False,
 ):
     """Apply torch.compile and DDP without changing ownership of ``raw_model``."""
-    compile_mode = None if no_compile else _get_compile_mode()
+    compile_mode = None if no_compile else validate_compile_mode(compile_mode)
     if world_size <= 1:
         logging.info(
             "Training model wrapper: single GPU, compile=%s, compile_mode=%s; "
@@ -613,11 +631,14 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     use_bf16 = args["use_bf16"]
     master_port = args["master_port"]
     no_compile = args["no_compile"]
+    compile_mode = args["compile_mode"]
+    sdpa_backend = args["sdpa_backend"]
+    input_memory_format = args["input_memory_format"]
     disable_mask = args["disable_mask"]
     filter_full_board_on_load = args["filter_full_board_on_load"]
     validate_full_board_filter_options(disable_mask, filter_full_board_on_load)
     use_flex_attention = args["use_flex_attention"]
-    input_channels_last = resolve_input_channels_last(disable_mask)
+    input_nhwc = resolve_input_nhwc(input_memory_format)
     
     epochs_per_export = args["epochs_per_export"]
     export_prob = args["export_prob"]
@@ -750,7 +771,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
         logging.warning("WARNING: No GPU, using CPU")
         device = torch.device("cpu")
 
-    sdpa_backend = configure_sdpa_backend_from_env()
+    sdpa_backend = configure_sdpa_backend(sdpa_backend)
     logging.info(f"SDPA backend selection: {sdpa_backend}")
     logging.info("FlexAttention: enabled=%s block_size=128", use_flex_attention)
 
@@ -1088,6 +1109,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 device,
                 world_size,
                 no_compile,
+                compile_mode=compile_mode,
                 qat_int8=qat_int8,
             )
 
@@ -1188,6 +1210,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 device,
                 world_size,
                 no_compile,
+                compile_mode=compile_mode,
                 qat_int8=qat_int8,
             )
                 
@@ -1298,7 +1321,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     logging.info(f"compile_training_loss {compile_training_loss}")
     logging.info(f"disable_mask {disable_mask}")
     logging.info(f"filter_full_board_on_load {filter_full_board_on_load}")
-    logging.info(f"input_channels_last {input_channels_last}")
+    logging.info(f"input_memory_format {input_memory_format}")
 
     training_metrics_fn = metrics_obj.metrics_dict_batchwise
     if compile_training_loss:
@@ -1312,7 +1335,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 "KATAGO_COMPILE_TRAINING_LOSS=1 requires KATAGO_SEKI_EMA_ON_DEVICE=1 "
                 "to avoid a per-step Python scalar guard"
             )
-        loss_compile_mode = _get_compile_mode()
+        loss_compile_mode = validate_compile_mode(compile_mode)
         training_metrics_fn = torch.compile(
             training_metrics_fn,
             mode=loss_compile_mode,
@@ -1851,7 +1874,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 model_config=model_config,
                 require_full_board=disable_mask,
                 filter_full_board_on_load=filter_full_board_on_load,
-                binary_input_channels_last=input_channels_last,
+                binary_input_nhwc=input_nhwc,
             ):
                 optimizer.zero_grad(set_to_none=True)
                 extra_outputs = None

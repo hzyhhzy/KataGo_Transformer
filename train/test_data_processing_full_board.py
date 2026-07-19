@@ -60,7 +60,7 @@ class FullBoardDataValidationTests(unittest.TestCase):
         rank: int = 0,
         require_full_board: bool = True,
         filter_full_board_on_load: bool = False,
-        channels_last: bool = False,
+        nhwc: bool = False,
     ):
         return data_processing_pytorch.read_npz_training_data(
             [str(path)],
@@ -75,7 +75,7 @@ class FullBoardDataValidationTests(unittest.TestCase):
             model_config=self.config,
             require_full_board=require_full_board,
             filter_full_board_on_load=filter_full_board_on_load,
-            binary_input_channels_last=channels_last,
+            binary_input_nhwc=nhwc,
         )
 
     def _read_one(self, path: Path, **kwargs):
@@ -88,11 +88,11 @@ class FullBoardDataValidationTests(unittest.TestCase):
             batch = self._read_one(path)
             self.assertTrue(bool(torch.all(batch["binaryInputNCHW"][:, 0])))
 
-    def test_binary_input_can_use_channels_last_memory_format(self):
+    def test_binary_input_can_use_nhwc_memory_format(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "full.npz"
             self._write_data(path, full_board=True)
-            batch = self._read_one(path, channels_last=True)
+            batch = self._read_one(path, nhwc=True)
             binary_input = batch["binaryInputNCHW"]
             self.assertTrue(
                 binary_input.is_contiguous(memory_format=torch.channels_last)

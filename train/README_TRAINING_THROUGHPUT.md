@@ -36,7 +36,7 @@ windows. The baseline is an exact copy of `main` commit `6c8f0c8`.
 | `b24c256h8tflrs-bng-silu-v102` | 384 | 2,295.6 samples/s | 2,757.1 samples/s | +20.10% | 3,453.2 samples/s | +25.25% | +50.43% |
 | `b40c384h12tflrs-bng-silu-v102` | 160 | 761.4 samples/s | 931.7 samples/s | +22.37% | 1,143.5 samples/s | +22.74% | +50.20% |
 
-The maskless gain column includes both removal of masks and the channels-last
+The maskless gain column includes both removal of masks and the NHWC
 activation layout. The total column also includes all generic training and
 optimizer changes; these percentages must not be added to one another again.
 
@@ -58,7 +58,7 @@ drivers, and other processes can require a smaller batch.
 
 ### Single-GPU versus two-GPU scaling
 
-The final maskless channels-last configuration was also measured with an
+The final maskless NHWC configuration was also measured with an
 ordinary single process: no `-multi-gpus`, no process group, and no DDP wrapper.
 The model, data, per-GPU batch, and runtime flags match the fixed-batch two-GPU
 runs; global-batch-dependent training scalars naturally change with world size.
@@ -85,7 +85,7 @@ gradient communication remains FP32.
 
 ## Muon before/after benchmark
 
-The optimizer was isolated with the same maskless channels-last model, data,
+The optimizer was isolated with the same maskless NHWC model, data,
 batch, compile mode, and two-GPU setup. As above, each rate is aggregate samples
 divided by aggregate time over timing windows 3 through 15. The variants are:
 
@@ -159,25 +159,24 @@ field. Batching remains file-local: if a file retains fewer than
 training batches. Offline filtering remains preferable when data-loading
 throughput matters because it avoids repeatedly reading discarded rows.
 
-Mask-free training automatically stores the binary spatial input in
-channels-last format. This makes the BSC view used by every Transformer block
+Training stores the binary spatial input in NHWC format by default. This makes
+the BSC view used by every Transformer block
 contiguous in its channel dimension; model parameters, optimizer tensors,
 targets, validation, and SWA validation keep their existing layouts. Set
-`KATAGO_INPUT_CHANNELS_LAST=0` for an NCHW regression comparison. Explicitly
-setting it to `1` also enables the layout for masked training, but that mode has
-not been performance-tuned.
+`-input-memory-format nchw` for an NCHW compatibility or regression comparison.
+NHWC applies to both masked and mask-free training.
 
 The following historical effect-decomposition sweep uses the same filtered
 data, FP16, default compile mode, and per-GPU batches 416 (b24) or 172 (b40).
 The masked control still computes full-one masks. Each rate excludes the first
 100-step compilation interval.
 
-| Model | Masked NCHW | Mask-free NCHW | Mask-free channels-last | Versus optimized masked |
+| Model | Masked NCHW | Mask-free NCHW | Mask-free NHWC | Versus optimized masked |
 |---|---:|---:|---:|---:|
 | `b24c256h8tflrs-bng-silu-v102` | 2,787.7 samples/s | 3,034.9 samples/s | 3,502.4 samples/s | 25.6% |
 | `b40c384h12tflrs-bng-silu-v102` | 942.0 samples/s | 1,028.0 samples/s | 1,170.9 samples/s | 24.3% |
 
-Removing model and loss masks contributed about 9%; channels-last added another
+Removing model and loss masks contributed about 9%; NHWC added another
 13.9--15.4% over mask-free NCHW. With a true `attn_mask=None`, PyTorch `auto`
 selected Flash SDPA on both models; forcing another backend was slower. For b24,
 batch 424 was 0.4% slower than batch 416 while using about 0.65 GiB more memory,
@@ -208,7 +207,7 @@ frequency-gradient, and all full-block parameter-gradient equivalence checks
 after permuting Q/K projection rows; full-block peak allocated memory was
 identical between layouts.
 
-An end-to-end b24 check then measured the complete mask-free, channels-last,
+An end-to-end b24 check then measured the complete mask-free, NHWC,
 FP16 Muon training loop with two RTX 4090 D GPUs, DDP, and batch 384 per GPU.
 Eight independent runs used the balanced order `AB|BA|BA|AB`, where A was the
 adjacent layout and B was half-split. Each run produced 56 logging windows of
@@ -254,7 +253,8 @@ standalone speedup. This table cast remains enabled by default.
 ## Runtime controls
 
 The optimized settings are on by default. Set an environment variable to `0`
-to disable an individual optimization for debugging or regression comparison:
+to disable an individual low-level optimization for debugging or regression
+comparison:
 
 | Environment variable | Default | Effect |
 |---|---:|---|
@@ -269,8 +269,14 @@ to disable an individual optimization for debugging or regression comparison:
 | `KATAGO_DDP_GRADIENT_AS_BUCKET_VIEW` | `1` | Make gradients views of DDP buckets |
 | `KATAGO_DDP_BROADCAST_BUFFERS` | norm-dependent | Disabled for ordinary batch norm; enabled for batch renorm and QAT |
 | `KATAGO_DDP_ALIGN_CONV1X1_WEIGHT_STRIDES` | `1` | Match 1x1 convolution parameter and backward-gradient strides under DDP |
-| `KATAGO_SDPA_BACKEND` | `auto` | Optionally force `flash`, `cudnn`, `efficient`, or `math` for benchmarking |
-| `KATAGO_INPUT_CHANNELS_LAST` | mask-dependent | Defaults to `1` with `-disable-mask`, otherwise `0`; explicit `0` or `1` overrides the training-input layout |
+
+The commonly changed runtime choices are command-line arguments:
+
+| Argument | Default | Choices/effect |
+|---|---|---|
+| `-compile-mode` | `default` | `default`, `max-autotune-no-cudagraphs`, or `max-autotune` |
+| `-sdpa-backend` | `auto` | `auto`, `flash`, `cudnn`, `efficient`, or `math` |
+| `-input-memory-format` | `nhwc` | `nhwc` or `nchw`; independent of masking |
 
 `-no-compile` disables both model and loss compilation. QAT also disables the
 compiled loss. Muon's Newton-Schulz kernel retains its existing local
@@ -279,13 +285,13 @@ model rather than that optimizer kernel. If either model-norm deferral or the
 on-device seki average is disabled, set `KATAGO_COMPILE_TRAINING_LOSS=0` as
 well.
 
-`KATAGO_COMPILE_MODE` accepts `default`, `max-autotune-no-cudagraphs`, or
+`-compile-mode` accepts `default`, `max-autotune-no-cudagraphs`, or
 `max-autotune`. The main table uses `default`. On an earlier masked-NCHW b24
 batch-416 path,
 `max-autotune-no-cudagraphs` took about 757 seconds for the first 100-step
 interval, then sustained about 2,990--3,023 samples/s (roughly another 8% over
 the default compiler mode). It has not been remeasured on the current maskless
-channels-last path and should not be applied as an extra 8% to the final table.
+NHWC path and should not be applied as an extra 8% to the final table.
 At the old measured rates it breaks even after roughly 27 million samples, so
 it is useful for a long uninterrupted run but is not the global default. The
 CUDA-Graph-enabled `max-autotune` mode was also attempted, but Inductor skipped
