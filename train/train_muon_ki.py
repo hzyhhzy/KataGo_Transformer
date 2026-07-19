@@ -72,6 +72,22 @@ def validate_full_board_filter_options(
         )
 
 
+def validate_flex_attention_options(
+    enabled: bool,
+    disable_mask: bool,
+    no_compile: bool,
+    qat_int8: bool,
+):
+    if not enabled:
+        return
+    if disable_mask:
+        raise ValueError("-use-flex-attention cannot be combined with -disable-mask")
+    if no_compile:
+        raise ValueError("-use-flex-attention requires torch.compile; remove -no-compile")
+    if qat_int8:
+        raise ValueError("-use-flex-attention is not supported with -qat-int8")
+
+
 def amp_autocast_context(use_fp16: bool, use_bf16: bool):
     """Return the requested CUDA autocast context without changing legacy defaults."""
     if use_fp16:
@@ -169,6 +185,12 @@ if __name__ == "__main__":
             'With -disable-mask, discard non-full-board training rows while loading '
             'instead of rejecting the entire NPZ file'
         ),
+        required=False,
+        action='store_true',
+    )
+    optional_args.add_argument(
+        '-use-flex-attention',
+        help='Use a per-sample FlexAttention BlockMask for masked transformer attention',
         required=False,
         action='store_true',
     )
@@ -594,6 +616,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     disable_mask = args["disable_mask"]
     filter_full_board_on_load = args["filter_full_board_on_load"]
     validate_full_board_filter_options(disable_mask, filter_full_board_on_load)
+    use_flex_attention = args["use_flex_attention"]
     input_channels_last = resolve_input_channels_last(disable_mask)
     
     epochs_per_export = args["epochs_per_export"]
@@ -613,6 +636,12 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     qat_int8 = args["qat_int8"]
 
     validate_amp_qat_options(use_fp16, use_bf16, qat_int8)
+    validate_flex_attention_options(
+        use_flex_attention,
+        disable_mask,
+        no_compile,
+        qat_int8,
+    )
     if qat_int8:
         assert no_compile, "QAT INT8 enabled. Compilation is not supported. Remove this if it not report any error."
 
@@ -723,6 +752,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
     sdpa_backend = configure_sdpa_backend_from_env()
     logging.info(f"SDPA backend selection: {sdpa_backend}")
+    logging.info("FlexAttention: enabled=%s block_size=128", use_flex_attention)
 
     seed = int.from_bytes(os.urandom(7), sys.byteorder)
     logging.info(f"Seeding torch with {seed}")
@@ -995,6 +1025,23 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             return avg_param + factor * (cur_param - avg_param)
         return ema_avg
 
+    def make_swa_model(raw_model, factor):
+        swa_model = AveragedModel(raw_model, avg_fn=make_ema_avg(factor))
+        if use_flex_attention:
+            # AveragedModel is evaluated eagerly rather than through the
+            # compiled DDP training wrapper. Eager FlexAttention materializes
+            # the full score matrix, so use the semantically equivalent fused
+            # SDPA path for SWA validation. This runtime flag is not checkpointed
+            # and does not affect which parameters are averaged or exported.
+            swa_model.module.configure_flex_attention(enabled=False)
+            logging.info(
+                "SWA validation will use masked SDPA instead of eager FlexAttention"
+            )
+        return swa_model
+
+    def configure_raw_model_runtime(raw_model):
+        raw_model.configure_flex_attention(enabled=use_flex_attention)
+
     def load():
         if not os.path.exists(get_checkpoint_path()):
             logging.info("No preexisting checkpoint found at: " + get_checkpoint_path())
@@ -1033,6 +1080,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                 #fix_qat_zero_points(raw_model)
                 logging.info("Model prepared for QAT (inputs and heads excluded).")
 
+            configure_raw_model_runtime(raw_model)
             raw_model.to(device)
             #raw_model_compiled=torch.compile(raw_model,mode="max-autotune-no-cudagraphs")
             ddp_model = wrap_model_for_training(
@@ -1052,7 +1100,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     if qat_int8:
                         swa_models.append(None) # init it when accumulating swa for the first time
                         continue
-                    swa_model = AveragedModel(raw_model, avg_fn=make_ema_avg(new_factor))
+                    swa_model = make_swa_model(raw_model, new_factor)
                     swa_models.append(swa_model)
 
             metrics_obj = Metrics(batch_size,world_size,raw_model)
@@ -1132,6 +1180,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
             if not qat_int8:
                 reset_nan_batchnorm(raw_model, verbose=True)
             
+            configure_raw_model_runtime(raw_model)
             raw_model.to(device)
             #raw_model_compiled=torch.compile(raw_model,mode="max-autotune-no-cudagraphs")
             ddp_model = wrap_model_for_training(
@@ -1152,7 +1201,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     swa_scale=swa_scales[i]
                     new_factor = 1.0 / swa_scale
                     #ema_avg = lambda avg_param, cur_param, num_averaged: avg_param + new_factor * (cur_param - avg_param)
-                    swa_model = AveragedModel(raw_model, avg_fn=make_ema_avg(new_factor))
+                    swa_model = make_swa_model(raw_model, new_factor)
                     swa_model_state_dict = load_model.load_swa_model_state_dict(state_dict,idx=i)
                     if swa_model_state_dict is not None:
                         logging.info(f"Load swa model {i}")
@@ -1988,7 +2037,9 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                             if swa_models[i] is None:
                                 assert(qat_int8)
                                 logging.info(f"Initializing qat swa_model[{i}] with swa_scale={1/swa_scales[i]}")
-                                swa_models[i] = AveragedModel(raw_model, avg_fn=make_ema_avg(1/swa_scales[i]))
+                                swa_models[i] = make_swa_model(
+                                    raw_model, 1 / swa_scales[i]
+                                )
                             swa_models[i].update_parameters(raw_model)
 
             logging.info("Finished training subepoch!")

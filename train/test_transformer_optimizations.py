@@ -2,6 +2,7 @@ import copy
 import os
 import sys
 import unittest
+from unittest import mock
 
 import torch
 
@@ -106,6 +107,88 @@ class TransformerOptimizationTests(unittest.TestCase):
             torch.testing.assert_close(
                 parameter_without_mask.grad, parameter_with_mask.grad
             )
+
+    def test_flex_branch_preserves_existing_kv_only_mask_semantics(self):
+        torch.manual_seed(1357)
+        config = {
+            "transformer_ffn_channels": 24,
+            "transformer_heads": 2,
+            "transformer_kv_heads": 2,
+            "learnable_rope": True,
+        }
+        sdpa_block = model_pytorch.TransformerRoPEGQABlock(
+            "test", 16, config, "mish", pos_len=3, use_swiglu=True
+        )
+        flex_block = model_pytorch.TransformerRoPEGQABlock(
+            "test", 16, config, "mish", pos_len=3, use_swiglu=True
+        )
+        flex_block.load_state_dict(sdpa_block.state_dict())
+
+        mask = torch.ones(2, 1, 3, 3)
+        mask[1, :, 2, :] = 0
+        mask[1, :, :, 2] = 0
+        additive_mask = torch.zeros(2, 1, 1, 9).masked_fill(
+            mask.view(2, 1, 1, 9) == 0, float("-inf")
+        )
+        sentinel_block_mask = object()
+
+        def fake_flex_attention(q, k, v, block_mask):
+            self.assertIs(block_mask, sentinel_block_mask)
+            return torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=additive_mask, dropout_p=0.0
+            )
+
+        sdpa_input = torch.randn(2, 16, 3, 3, requires_grad=True)
+        flex_input = sdpa_input.detach().clone().requires_grad_(True)
+        sdpa_output = sdpa_block(
+            sdpa_input,
+            mask=mask,
+            mask_sum_hw=mask.sum(dim=(2, 3), keepdim=True),
+            mask_sum=mask.sum(),
+        )
+        with mock.patch.object(
+            model_pytorch, "flex_attention", side_effect=fake_flex_attention
+        ):
+            flex_output = flex_block(
+                flex_input,
+                mask=mask,
+                mask_sum_hw=mask.sum(dim=(2, 3), keepdim=True),
+                mask_sum=mask.sum(),
+                attention_block_mask=sentinel_block_mask,
+            )
+
+        # Include off-board query outputs in the loss. This catches an
+        # accidental change from the existing KV-only mask to Q-and-KV masking.
+        torch.testing.assert_close(flex_output, sdpa_output)
+        flex_output.square().mean().backward()
+        sdpa_output.square().mean().backward()
+        torch.testing.assert_close(flex_input.grad, sdpa_input.grad)
+        for flex_parameter, sdpa_parameter in zip(
+            flex_block.parameters(), sdpa_block.parameters()
+        ):
+            torch.testing.assert_close(flex_parameter.grad, sdpa_parameter.grad)
+
+    def test_flex_block_mask_depends_only_on_sample_and_kv_position(self):
+        mask = torch.tensor(
+            [
+                [[[1.0, 1.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 1.0]]],
+                [[[1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 1.0]]],
+            ]
+        )
+        block_mask = model_pytorch.create_kv_flex_attention_block_mask(mask)
+        expected = mask.reshape(2, 9) != 0
+
+        for batch_idx in range(2):
+            for kv_idx in range(9):
+                expected_value = bool(expected[batch_idx, kv_idx].item())
+                for head_idx, query_idx in ((0, 0), (7, 4), (3, 8)):
+                    actual = block_mask.mask_mod(
+                        torch.tensor(batch_idx),
+                        torch.tensor(head_idx),
+                        torch.tensor(query_idx),
+                        torch.tensor(kv_idx),
+                    )
+                    self.assertEqual(bool(actual.item()), expected_value)
 
     def test_transformer_preserves_channels_last_without_changing_values(self):
         torch.manual_seed(4321)

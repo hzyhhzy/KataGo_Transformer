@@ -5,6 +5,7 @@ import torch
 import torch.nn
 import torch.nn.functional
 import torch.nn.init
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import packaging
 import packaging.version
 from typing import List, Dict, Optional, Set
@@ -44,6 +45,29 @@ def _env_flag(name: str, default: bool = False) -> bool:
 LEARNED_ROPE_CAST_TO_INPUT_DTYPE = _env_flag(
     "KATAGO_LEARNED_ROPE_CAST_TO_INPUT_DTYPE", default=True
 )
+
+
+def create_kv_flex_attention_block_mask(mask: torch.Tensor):
+    """Build the per-sample KV mask used by all attention layers in a forward."""
+    batch_size = mask.shape[0]
+    seq_len = mask.shape[2] * mask.shape[3]
+    valid_kv = mask.reshape(batch_size, seq_len) != 0
+
+    # Match the existing SDPA semantics exactly: off-board keys/values are
+    # hidden, while every query row is still evaluated. H=1 broadcasts the
+    # same spatial mask over all attention heads.
+    def mask_mod(b, h, q_idx, kv_idx):
+        return valid_kv[b, kv_idx]
+
+    return create_block_mask(
+        mask_mod,
+        B=batch_size,
+        H=1,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        device=mask.device,
+        BLOCK_SIZE=128,
+    )
 
 
 class ExtraOutputs:
@@ -1231,7 +1255,15 @@ class TransformerRoPEGQABlock(torch.nn.Module):
     def add_brenorm_clippage(self, upper_rclippage, lower_rclippage, dclippage):
         pass
         
-    def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[Dict] = None):
+    def forward(
+        self,
+        x,
+        mask,
+        mask_sum_hw,
+        mask_sum: float,
+        extra_outputs: Optional[Dict] = None,
+        attention_block_mask=None,
+    ):
         batch_size, channels, height, width = x.shape
         x_in = x.view(batch_size, channels, -1).permute(0, 2, 1)
         
@@ -1289,21 +1321,28 @@ class TransformerRoPEGQABlock(torch.nn.Module):
             v = v.unsqueeze(2).expand(batch_size, self.num_kv_heads, self.n_rep, seq_len, self.head_dim)
             v = v.reshape(batch_size, self.num_heads, seq_len, self.head_dim)
         
-        # 2. Handle mask (as above)
-        if mask is not None:
-            mask_flat = mask.view(batch_size, 1, 1, seq_len)
-            attn_mask = torch.zeros_like(mask_flat, dtype=q.dtype)
-            attn_mask.masked_fill_(mask_flat == 0, float('-inf'))
+        if attention_block_mask is not None:
+            attn_output = flex_attention(
+                q,
+                k,
+                v,
+                block_mask=attention_block_mask,
+            )
         else:
-            attn_mask = None
-        
-        # 3. Use SDPA
-        # Now q, k, v all have shape (B, H_q, S, D); CUDA kernels optimize access
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=0.0
-        )
+            # Preserve the existing SDPA paths as controls and as the fastest
+            # implementation when no spatial mask is required.
+            if mask is not None:
+                mask_flat = mask.view(batch_size, 1, 1, seq_len)
+                attn_mask = torch.zeros_like(mask_flat, dtype=q.dtype)
+                attn_mask.masked_fill_(mask_flat == 0, float('-inf'))
+            else:
+                attn_mask = None
+
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=0.0
+            )
         
         # (B, H, S, D) -> (B, S, H, D)
         attn_output = attn_output.permute(0, 2, 1, 3).contiguous()
@@ -1645,7 +1684,15 @@ class NestedBottleneckTransformerBlock(torch.nn.Module):
             block.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
         self.normactconvq.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
 
-    def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[ExtraOutputs]):
+    def forward(
+        self,
+        x,
+        mask,
+        mask_sum_hw,
+        mask_sum: float,
+        extra_outputs: Optional[ExtraOutputs],
+        attention_block_mask=None,
+    ):
         """
         Parameters:
         x: NCHW
@@ -1658,7 +1705,14 @@ class NestedBottleneckTransformerBlock(torch.nn.Module):
         out = x
         out = self.normactconvp(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
         for block in self.blockstack:
-            out = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+            out = block(
+                out,
+                mask=mask,
+                mask_sum_hw=mask_sum_hw,
+                mask_sum=mask_sum,
+                extra_outputs=extra_outputs,
+                attention_block_mask=attention_block_mask,
+            )
         out = self.normactconvq(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
         result = x + out
         if extra_outputs is not None:
@@ -2141,6 +2195,7 @@ class Model(torch.nn.Module):
         self.num_scorebeliefs = config["num_scorebeliefs"]
         self.num_total_blocks = len(self.block_kind)
         self.pos_len = pos_len
+        self.use_flex_attention = False
 
         if config["version"] <= 12 or (config["version"] >= 101 and config["version"] <= 199):
             self.td_score_multiplier = 20.0
@@ -2460,6 +2515,43 @@ class Model(torch.nn.Module):
     def get_has_metadata_encoder(self) -> bool:
         return self.metadata_encoder is not None
 
+    def configure_flex_attention(self, enabled: bool):
+        transformer_blocks = [
+            module
+            for module in self.modules()
+            if isinstance(module, TransformerRoPEGQABlock)
+        ]
+        if enabled and not transformer_blocks:
+            raise ValueError("FlexAttention was enabled for a model with no supported transformer blocks")
+        self.use_flex_attention = enabled
+
+    @staticmethod
+    def _forward_trunk_block(
+        block,
+        out,
+        mask,
+        mask_sum_hw,
+        mask_sum,
+        extra_outputs,
+        attention_block_mask,
+    ):
+        if isinstance(block, (TransformerRoPEGQABlock, NestedBottleneckTransformerBlock)):
+            return block(
+                out,
+                mask=mask,
+                mask_sum_hw=mask_sum_hw,
+                mask_sum=mask_sum,
+                extra_outputs=extra_outputs,
+                attention_block_mask=attention_block_mask,
+            )
+        return block(
+            out,
+            mask=mask,
+            mask_sum_hw=mask_sum_hw,
+            mask_sum=mask_sum,
+            extra_outputs=extra_outputs,
+        )
+
     def add_reg_dict(self, reg_dict:Dict[str,List]):
         reg_dict["normal"] = []
         reg_dict["normal_gamma"] = []
@@ -2529,6 +2621,13 @@ class Model(torch.nn.Module):
             mask_sum_hw = torch.sum(mask,dim=(2,3),keepdim=True)
             mask_sum = torch.sum(mask)
 
+        if self.use_flex_attention:
+            if mask is None:
+                raise ValueError("FlexAttention requires the spatial mask; do not combine it with disable_mask")
+            attention_block_mask = create_kv_flex_attention_block_mask(mask)
+        else:
+            attention_block_mask = None
+
         x_spatial = self.conv_spatial(input_spatial)
         x_global = self.linear_global(input_global).unsqueeze(-1).unsqueeze(-1)
 
@@ -2548,7 +2647,10 @@ class Model(torch.nn.Module):
                 # print("TENSOR BEFORE BLOCK")
                 # print(count)
                 # print(out)
-                out = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+                out = self._forward_trunk_block(
+                    block, out, mask, mask_sum_hw, mask_sum, extra_outputs,
+                    attention_block_mask,
+                )
                 count += 1
                 
             #torch._dynamo.graph_break()
@@ -2578,7 +2680,10 @@ class Model(torch.nn.Module):
                 # print("TENSOR BEFORE BLOCK")
                 # print(count)
                 # print(out)
-                out = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+                out = self._forward_trunk_block(
+                    block, out, mask, mask_sum_hw, mask_sum, extra_outputs,
+                    attention_block_mask,
+                )
                 count += 1
 
         else:
@@ -2587,7 +2692,10 @@ class Model(torch.nn.Module):
                 # print("TENSOR BEFORE BLOCK")
                 # print(count)
                 # print(out)
-                out = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=extra_outputs)
+                out = self._forward_trunk_block(
+                    block, out, mask, mask_sum_hw, mask_sum, extra_outputs,
+                    attention_block_mask,
+                )
                 count += 1
 
         #torch._dynamo.graph_break() # torch.compile sometimes HAVE BUGS

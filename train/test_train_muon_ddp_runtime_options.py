@@ -244,6 +244,31 @@ class DdpRuntimeOptionsTests(unittest.TestCase):
                 filter_full_board_on_load=True,
             )
 
+    def test_flex_attention_options_are_runtime_only_and_validated(self):
+        train_muon_ki.validate_flex_attention_options(
+            enabled=True,
+            disable_mask=False,
+            no_compile=False,
+            qat_int8=False,
+        )
+        invalid_cases = (
+            ({"disable_mask": True}, "disable-mask"),
+            ({"no_compile": True}, "torch.compile"),
+            ({"qat_int8": True}, "qat-int8"),
+        )
+        defaults = dict(
+            enabled=True,
+            disable_mask=False,
+            no_compile=False,
+            qat_int8=False,
+        )
+        for updates, pattern in invalid_cases:
+            with self.subTest(updates=updates):
+                options = dict(defaults)
+                options.update(updates)
+                with self.assertRaisesRegex(ValueError, pattern):
+                    train_muon_ki.validate_flex_attention_options(**options)
+
     def test_batch_renorm_keeps_buffer_broadcast_by_default(self):
         raw_model = self._raw_model("brenorm")
         events, compile_patch, ddp_patch = self._mock_wrappers()
