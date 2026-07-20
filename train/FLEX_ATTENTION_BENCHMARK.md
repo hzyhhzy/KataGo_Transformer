@@ -43,21 +43,24 @@ mask and projection-output strides agreed with the full runs. For b24,
 Efficient/cuDNN took 2.645/3.301 ms; for b40 they took 1.647/1.961 ms. Forced
 Flash rejected the explicit mask. cuDNN treats this as dense attention with an
 additive bias and does not skip invalid board positions, so its general support
-does not imply a speedup for these short `S=225, D=32` shapes. Keep automatic
-SDPA selection as the production default; the existing backend environment
-switch remains useful for retesting future PyTorch, cuDNN, or GPU versions.
+does not imply a speedup for these short `S=225, D=32` shapes. When SDPA is
+selected, keep automatic backend selection as the production default;
+`-sdpa-backend` remains useful for retesting future PyTorch, cuDNN, or GPU
+versions.
 
 ## Kept implementation
 
-- `-use-flex-attention` is a runtime training flag, not a ModelConfig field and
-  not part of a checkpoint.
+- FlexAttention is a runtime training choice, not a ModelConfig field and not
+  part of a checkpoint. Compatible compiled masked Transformer training enables
+  it by default; `-disable-flex-attention` restores masked SDPA.
 - A per-sample, KV-only `BlockMask` exactly preserves the old additive SDPA mask
   semantics, including evaluating off-board query rows. One mask is built per
   model forward and reused by every transformer layer.
 - The mask uses `H=1` so it broadcasts over all heads. Each DDP rank builds it
   from its local batch; no new collective or cross-rank routing is needed.
-- FlexAttention requires `torch.compile` and is rejected with `-no-compile`,
-  `-disable-mask`, or QAT. Without the flag, the old SDPA paths are unchanged.
+- The automatic default falls back for CNN, `-no-compile`, `-disable-mask`, and
+  QAT runs. Explicit `-use-flex-attention` remains available as a force option
+  and is rejected for those incompatible modes.
 - SWA validation deliberately uses masked SDPA. `AveragedModel` is evaluated
   eagerly, where eager FlexAttention materializes the full score matrix; the
   runtime fallback does not alter averaged parameters or checkpoint keys.

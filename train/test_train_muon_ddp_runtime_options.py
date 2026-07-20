@@ -224,20 +224,52 @@ class DdpRuntimeOptionsTests(unittest.TestCase):
                 filter_full_board_on_load=True,
             )
 
-    def test_flex_attention_options_are_runtime_only_and_validated(self):
-        train_muon_ki.validate_flex_attention_options(
-            enabled=True,
+    def test_flex_attention_defaults_on_for_compatible_masked_training(self):
+        self.assertTrue(
+            train_muon_ki.resolve_flex_attention_enabled(
+                requested=None,
+                disable_mask=False,
+                no_compile=False,
+                qat_int8=False,
+            )
+        )
+        self.assertFalse(
+            train_muon_ki.resolve_flex_attention_enabled(
+                requested=False,
+                disable_mask=False,
+                no_compile=False,
+                qat_int8=False,
+            )
+        )
+
+    def test_flex_attention_auto_falls_back_for_incompatible_modes(self):
+        cases = (
+            {"disable_mask": True},
+            {"no_compile": True},
+            {"qat_int8": True},
+        )
+        defaults = dict(
+            requested=None,
             disable_mask=False,
             no_compile=False,
             qat_int8=False,
         )
+        for updates in cases:
+            with self.subTest(updates=updates):
+                options = dict(defaults)
+                options.update(updates)
+                self.assertFalse(
+                    train_muon_ki.resolve_flex_attention_enabled(**options)
+                )
+
+    def test_explicit_flex_attention_is_validated(self):
         invalid_cases = (
             ({"disable_mask": True}, "disable-mask"),
             ({"no_compile": True}, "torch.compile"),
             ({"qat_int8": True}, "qat-int8"),
         )
         defaults = dict(
-            enabled=True,
+            requested=True,
             disable_mask=False,
             no_compile=False,
             qat_int8=False,
@@ -247,7 +279,44 @@ class DdpRuntimeOptionsTests(unittest.TestCase):
                 options = dict(defaults)
                 options.update(updates)
                 with self.assertRaisesRegex(ValueError, pattern):
-                    train_muon_ki.validate_flex_attention_options(**options)
+                    train_muon_ki.resolve_flex_attention_enabled(**options)
+
+    def test_flex_attention_auto_skips_unsupported_cnn_models(self):
+        class FakeModel:
+            def __init__(self, supported):
+                self.supported = supported
+                self.enabled = None
+
+            def supports_flex_attention(self):
+                return self.supported
+
+            def configure_flex_attention(self, enabled):
+                self.enabled = enabled
+
+        cnn_model = FakeModel(supported=False)
+        actual = train_muon_ki.configure_model_flex_attention(
+            cnn_model,
+            requested=None,
+            enabled=True,
+        )
+        self.assertFalse(actual)
+        self.assertFalse(cnn_model.enabled)
+
+        transformer_model = FakeModel(supported=True)
+        actual = train_muon_ki.configure_model_flex_attention(
+            transformer_model,
+            requested=None,
+            enabled=True,
+        )
+        self.assertTrue(actual)
+        self.assertTrue(transformer_model.enabled)
+
+        with self.assertRaisesRegex(ValueError, "no supported transformer"):
+            train_muon_ki.configure_model_flex_attention(
+                cnn_model,
+                requested=True,
+                enabled=True,
+            )
 
     def test_batch_renorm_keeps_buffer_broadcast_by_default(self):
         raw_model = self._raw_model("brenorm")

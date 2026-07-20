@@ -2515,13 +2515,14 @@ class Model(torch.nn.Module):
     def get_has_metadata_encoder(self) -> bool:
         return self.metadata_encoder is not None
 
-    def configure_flex_attention(self, enabled: bool):
-        transformer_blocks = [
-            module
+    def supports_flex_attention(self) -> bool:
+        return any(
+            isinstance(module, TransformerRoPEGQABlock)
             for module in self.modules()
-            if isinstance(module, TransformerRoPEGQABlock)
-        ]
-        if enabled and not transformer_blocks:
+        )
+
+    def configure_flex_attention(self, enabled: bool):
+        if enabled and not self.supports_flex_attention():
             raise ValueError("FlexAttention was enabled for a model with no supported transformer blocks")
         self.use_flex_attention = enabled
 

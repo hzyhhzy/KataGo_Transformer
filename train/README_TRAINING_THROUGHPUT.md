@@ -277,6 +277,7 @@ The commonly changed runtime choices are command-line arguments:
 | `-compile-mode` | `default` | `default`, `max-autotune-no-cudagraphs`, or `max-autotune` |
 | `-sdpa-backend` | `auto` | `auto`, `flash`, `cudnn`, `efficient`, or `math` |
 | `-input-memory-format` | `nhwc` | `nhwc` or `nchw`; independent of masking |
+| `-disable-flex-attention` | absent | Use masked SDPA instead of the default compatible Transformer FlexAttention path |
 
 `-no-compile` disables both model and loss compilation. QAT also disables the
 compiled loss. Muon's Newton-Schulz kernel retains its existing local

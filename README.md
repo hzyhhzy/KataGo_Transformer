@@ -83,6 +83,10 @@ Parameters can be modified in `./train/train_muon_ki.sh` or passed as arguments 
     the `torch.compile` mode. Defaults to `default`.
 *   `-sdpa-backend {auto,flash,cudnn,efficient,math}`: Select the CUDA SDPA
     backend. Defaults to `auto`.
+*   `-disable-flex-attention`: Use masked SDPA instead of FlexAttention.
+    Compatible compiled Transformer training uses FlexAttention by default;
+    CNN, mask-free, non-compiled, and QAT runs automatically keep their
+    compatible existing paths.
 
 ### Model Type Settings
 *   **Model Structure**: `b14c192h6tfrs` is a pre-defined structure in `./train/modelconfigs.py`. You can modify this file to define custom architectures.

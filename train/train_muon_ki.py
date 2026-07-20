@@ -19,7 +19,7 @@ import itertools
 import copy
 import atexit
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 import torch._dynamo
@@ -95,6 +95,41 @@ def validate_flex_attention_options(
         raise ValueError("-use-flex-attention requires torch.compile; remove -no-compile")
     if qat_int8:
         raise ValueError("-use-flex-attention is not supported with -qat-int8")
+
+
+def resolve_flex_attention_enabled(
+    requested: Optional[bool],
+    disable_mask: bool,
+    no_compile: bool,
+    qat_int8: bool,
+) -> bool:
+    """Resolve the default without breaking modes that FlexAttention cannot run."""
+    if requested is not None:
+        validate_flex_attention_options(
+            requested,
+            disable_mask,
+            no_compile,
+            qat_int8,
+        )
+        return requested
+    return not disable_mask and not no_compile and not qat_int8
+
+
+def configure_model_flex_attention(
+    raw_model,
+    requested: Optional[bool],
+    enabled: bool,
+) -> bool:
+    """Apply the resolved mode, falling back for auto-selected non-Transformer models."""
+    if enabled and not raw_model.supports_flex_attention():
+        if requested is True:
+            raise ValueError(
+                "-use-flex-attention was specified for a model with no supported "
+                "transformer blocks"
+            )
+        enabled = False
+    raw_model.configure_flex_attention(enabled=enabled)
+    return enabled
 
 
 def amp_autocast_context(use_fp16: bool, use_bf16: bool):
@@ -218,12 +253,22 @@ if __name__ == "__main__":
         required=False,
         action='store_true',
     )
-    optional_args.add_argument(
+    flex_attention_args = optional_args.add_mutually_exclusive_group()
+    flex_attention_args.add_argument(
         '-use-flex-attention',
-        help='Use a per-sample FlexAttention BlockMask for masked transformer attention',
+        dest='flex_attention',
+        help='Force FlexAttention for masked transformer attention',
         required=False,
         action='store_true',
     )
+    flex_attention_args.add_argument(
+        '-disable-flex-attention',
+        dest='flex_attention',
+        help='Use masked SDPA instead of the default FlexAttention path',
+        required=False,
+        action='store_false',
+    )
+    parser.set_defaults(flex_attention=None)
 
     optional_args.add_argument('-epochs-per-export', help='Export model once every this many epochs', type=int, required=False)
     optional_args.add_argument('-export-prob', help='Export model with this probablity', type=float, required=False)
@@ -637,7 +682,13 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     disable_mask = args["disable_mask"]
     filter_full_board_on_load = args["filter_full_board_on_load"]
     validate_full_board_filter_options(disable_mask, filter_full_board_on_load)
-    use_flex_attention = args["use_flex_attention"]
+    flex_attention_requested = args["flex_attention"]
+    use_flex_attention = resolve_flex_attention_enabled(
+        flex_attention_requested,
+        disable_mask,
+        no_compile,
+        args["qat_int8"],
+    )
     input_nhwc = resolve_input_nhwc(input_memory_format)
     
     epochs_per_export = args["epochs_per_export"]
@@ -657,12 +708,6 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     qat_int8 = args["qat_int8"]
 
     validate_amp_qat_options(use_fp16, use_bf16, qat_int8)
-    validate_flex_attention_options(
-        use_flex_attention,
-        disable_mask,
-        no_compile,
-        qat_int8,
-    )
     if qat_int8:
         assert no_compile, "QAT INT8 enabled. Compilation is not supported. Remove this if it not report any error."
 
@@ -773,7 +818,16 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
     sdpa_backend = configure_sdpa_backend(sdpa_backend)
     logging.info(f"SDPA backend selection: {sdpa_backend}")
-    logging.info("FlexAttention: enabled=%s block_size=128", use_flex_attention)
+    flex_attention_selection = (
+        "auto" if flex_attention_requested is None
+        else "enabled" if flex_attention_requested
+        else "disabled"
+    )
+    logging.info(
+        "FlexAttention selection: %s candidate_enabled=%s block_size=128",
+        flex_attention_selection,
+        use_flex_attention,
+    )
 
     seed = int.from_bytes(os.urandom(7), sys.byteorder)
     logging.info(f"Seeding torch with {seed}")
@@ -1048,7 +1102,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
     def make_swa_model(raw_model, factor):
         swa_model = AveragedModel(raw_model, avg_fn=make_ema_avg(factor))
-        if use_flex_attention:
+        if raw_model.use_flex_attention:
             # AveragedModel is evaluated eagerly rather than through the
             # compiled DDP training wrapper. Eager FlexAttention materializes
             # the full score matrix, so use the semantically equivalent fused
@@ -1061,7 +1115,16 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
         return swa_model
 
     def configure_raw_model_runtime(raw_model):
-        raw_model.configure_flex_attention(enabled=use_flex_attention)
+        actual_enabled = configure_model_flex_attention(
+            raw_model,
+            requested=flex_attention_requested,
+            enabled=use_flex_attention,
+        )
+        logging.info(
+            "FlexAttention runtime: enabled=%s supported=%s",
+            actual_enabled,
+            raw_model.supports_flex_attention(),
+        )
 
     def load():
         if not os.path.exists(get_checkpoint_path()):
