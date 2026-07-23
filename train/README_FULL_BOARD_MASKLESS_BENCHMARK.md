@@ -64,7 +64,9 @@ The loader independently validates every NPZ before transferring its first
 batch. If any row is not full-board, `-disable-mask` fails with the filename,
 invalid-row count, and first invalid row index. This strict behavior remains the
 default. Adding `-filter-full-board-on-load` explicitly discards those rows;
-files retaining fewer than one global batch log a warning and yield no batches.
+the same filtering applies to validation by default. Files retaining fewer than
+one applicable batch log a warning and yield no batches. Add
+`-disable-validation-full-board-filter` to retain mixed validation rows.
 
 ## Implementation
 
@@ -79,9 +81,11 @@ files retaining fewer than one global batch log a warning and yield no batches.
 - uses the fixed board area for ownership, scoring, future-position, and seki
   loss normalization.
 
-Validation remains masked and accepts an unfiltered validation set. Full-one
-masks and no masks implement the same equations, although fused kernels and
-reduction order make AMP results non-bitwise-identical.
+Validation remains masked and NCHW. With `-filter-full-board-on-load`, it uses
+only retained full-board rows by default; add
+`-disable-validation-full-board-filter` to validate on the original mixed rows.
+Full-one masks and no masks implement the same equations, although fused
+kernels and reduction order make AMP results non-bitwise-identical.
 
 ### NHWC training activations
 

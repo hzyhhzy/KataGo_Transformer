@@ -162,7 +162,7 @@ class FullBoardDataValidationTests(unittest.TestCase):
             self.assertEqual(batches, [])
             warning_text = "\n".join(captured.output)
             self.assertIn("retained 0/3 rows", warning_text)
-            self.assertIn("this file will yield no training batches", warning_text)
+            self.assertIn("this file will yield no batches", warning_text)
 
     def test_filter_requires_full_board_mode(self):
         with tempfile.TemporaryDirectory() as temporary:

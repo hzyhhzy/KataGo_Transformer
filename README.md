@@ -75,8 +75,12 @@ Parameters can be modified in `./train/train_muon_ki.sh` or passed as arguments 
     every file before use. See `train/README_TRAINING_THROUGHPUT.md` for the
     full-board filtering command and runtime tuning controls.
 *   `-filter-full-board-on-load`: With `-disable-mask`, discard non-full-board
-    training rows while loading instead of rejecting a mixed NPZ file. Files
-    retaining fewer than one global batch produce a warning and no batches.
+    training and validation rows while loading instead of rejecting a mixed
+    NPZ file. Files retaining fewer than one applicable batch produce a warning
+    and no batches.
+*   `-disable-validation-full-board-filter`: Keep the original mixed validation
+    rows when `-filter-full-board-on-load` is enabled. Validation remains masked
+    and NCHW either way.
 *   `-input-memory-format {nhwc,nchw}`: Spatial input memory format. Defaults
     to `nhwc`; pass `nchw` only for compatibility or regression comparison.
 *   `-compile-mode {default,max-autotune-no-cudagraphs,max-autotune}`: Select

@@ -81,6 +81,17 @@ def validate_full_board_filter_options(
         )
 
 
+def resolve_validation_full_board_filter(
+    filter_full_board_on_load: bool,
+    disable_validation_full_board_filter: bool,
+) -> bool:
+    """Apply the training full-board filter to validation unless opted out."""
+    return (
+        filter_full_board_on_load
+        and not disable_validation_full_board_filter
+    )
+
+
 def validate_flex_attention_options(
     enabled: bool,
     disable_mask: bool,
@@ -249,6 +260,15 @@ if __name__ == "__main__":
         help=(
             'With -disable-mask, discard non-full-board training rows while loading '
             'instead of rejecting the entire NPZ file'
+        ),
+        required=False,
+        action='store_true',
+    )
+    optional_args.add_argument(
+        '-disable-validation-full-board-filter',
+        help=(
+            'Keep mixed-board validation data when '
+            '-filter-full-board-on-load is enabled'
         ),
         required=False,
         action='store_true',
@@ -682,6 +702,10 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     disable_mask = args["disable_mask"]
     filter_full_board_on_load = args["filter_full_board_on_load"]
     validate_full_board_filter_options(disable_mask, filter_full_board_on_load)
+    validation_full_board_filter = resolve_validation_full_board_filter(
+        filter_full_board_on_load,
+        args["disable_validation_full_board_filter"],
+    )
     flex_attention_requested = args["flex_attention"]
     use_flex_attention = resolve_flex_attention_enabled(
         flex_attention_requested,
@@ -1384,6 +1408,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
     logging.info(f"compile_training_loss {compile_training_loss}")
     logging.info(f"disable_mask {disable_mask}")
     logging.info(f"filter_full_board_on_load {filter_full_board_on_load}")
+    logging.info(f"validation_full_board_filter {validation_full_board_filter}")
     logging.info(f"input_memory_format {input_memory_format}")
 
     training_metrics_fn = metrics_obj.metrics_dict_batchwise
@@ -2174,6 +2199,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                     val_metric_sums = defaultdict(float)
                     val_metric_weights = defaultdict(float)
                     val_samples = 0
+                    metrics = None
                     t0 = time.perf_counter()
                     for batch in data_processing_pytorch.read_npz_training_data(
                         val_files,
@@ -2186,6 +2212,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                         include_meta=raw_model.get_has_metadata_encoder(),
                         history_matrices_type=history_matrices_type,
                         model_config=model_config,
+                        require_full_board=validation_full_board_filter,
+                        filter_full_board_on_load=validation_full_board_filter,
                     ):
                         model_outputs = validation_model(
                             batch["binaryInputNCHW"],
@@ -2219,9 +2247,21 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                         val_metric_weights["nsamp_train"] = running_metrics["weights"]["nsamp"]
                         val_metric_sums["wsum_train"] = running_metrics["sums"]["wsum"]
                         val_metric_weights["wsum_train"] = running_metrics["weights"]["wsum"]
-                    last_val_metrics["sums"] = val_metric_sums
-                    last_val_metrics["weights"] = val_metric_weights
-                    log_metrics(val_metric_sums, val_metric_weights, metrics, val_metrics_out, exportprefix)
+                    if val_samples == 0:
+                        logging.warning(
+                            "No complete validation batch was produced; skipping "
+                            "validation metrics"
+                        )
+                    else:
+                        last_val_metrics["sums"] = val_metric_sums
+                        last_val_metrics["weights"] = val_metric_weights
+                        log_metrics(
+                            val_metric_sums,
+                            val_metric_weights,
+                            metrics,
+                            val_metrics_out,
+                            exportprefix,
+                        )
                     t1 = time.perf_counter()
                     logging.info(f"Validation took {t1-t0} seconds")
                     validation_model.train()
@@ -2239,6 +2279,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                         val_metric_sums = defaultdict(float)
                         val_metric_weights = defaultdict(float)
                         val_samples = 0
+                        metrics = None
                         t0 = time.perf_counter()
                         for batch in data_processing_pytorch.read_npz_training_data(
                             val_files,
@@ -2251,6 +2292,8 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                             include_meta=raw_model.get_has_metadata_encoder(),
                             history_matrices_type=history_matrices_type,
                             model_config=model_config,
+                            require_full_board=validation_full_board_filter,
+                            filter_full_board_on_load=validation_full_board_filter,
                         ):
                             model_outputs = swa_model(
                                 batch["binaryInputNCHW"],
@@ -2285,7 +2328,19 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
                             val_metric_sums["wsum_train"] = running_metrics["sums"]["wsum"]
                             val_metric_weights["wsum_train"] = running_metrics["weights"]["wsum"]
                         
-                        log_metrics(val_metric_sums, val_metric_weights, metrics,  val_swa_metrics_outs[swa_idx], exportprefix)
+                        if val_samples == 0:
+                            logging.warning(
+                                "No complete validation batch was produced; skipping "
+                                "SWA validation metrics"
+                            )
+                        else:
+                            log_metrics(
+                                val_metric_sums,
+                                val_metric_weights,
+                                metrics,
+                                val_swa_metrics_outs[swa_idx],
+                                exportprefix,
+                            )
                         t1 = time.perf_counter()
                         logging.info(f"Validation swa took {t1-t0} seconds")
                         swa_model.train()

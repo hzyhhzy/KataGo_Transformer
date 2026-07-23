@@ -224,6 +224,26 @@ class DdpRuntimeOptionsTests(unittest.TestCase):
                 filter_full_board_on_load=True,
             )
 
+    def test_validation_inherits_full_board_filter_unless_disabled(self):
+        self.assertTrue(
+            train_muon_ki.resolve_validation_full_board_filter(
+                filter_full_board_on_load=True,
+                disable_validation_full_board_filter=False,
+            )
+        )
+        self.assertFalse(
+            train_muon_ki.resolve_validation_full_board_filter(
+                filter_full_board_on_load=True,
+                disable_validation_full_board_filter=True,
+            )
+        )
+        self.assertFalse(
+            train_muon_ki.resolve_validation_full_board_filter(
+                filter_full_board_on_load=False,
+                disable_validation_full_board_filter=False,
+            )
+        )
+
     def test_flex_attention_defaults_on_for_compatible_masked_training(self):
         self.assertTrue(
             train_muon_ki.resolve_flex_attention_enabled(

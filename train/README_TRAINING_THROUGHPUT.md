@@ -146,13 +146,16 @@ sidecars and writes `full_board_filter_manifest.json`. In the benchmark dataset,
 Pass `-disable-mask` when training on the filtered tree. Every NPZ is checked on
 the CPU before its first batch is transferred; a single non-full-board row makes
 the run fail with the filename and first bad row. The flag is fixed for the
-whole training run so `torch.compile` sees one static graph. Validation keeps the
-normal masked path, allowing an unfiltered validation set. Full-one masks and no
-masks are mathematically equivalent, but fused attention and reduction order
-mean AMP results are not bitwise identical.
+whole training run so `torch.compile` sees one static graph. Validation keeps
+the normal masked NCHW path. When on-load filtering is enabled, validation uses
+the retained full-board rows by default; add
+`-disable-validation-full-board-filter` to keep the original mixed validation
+set. Full-one masks and no masks are mathematically equivalent, but fused
+attention and reduction order mean AMP results are not bitwise identical.
 
 As a convenience for a mixed source tree, add `-filter-full-board-on-load`
-alongside `-disable-mask` to discard non-full-board training rows in memory.
+alongside `-disable-mask` to discard non-full-board training and validation rows
+in memory.
 Filtering is deterministic and applies the same row selection to every NPZ
 field. Batching remains file-local: if a file retains fewer than
 `batch_size * world_size` rows, rank 0 logs a warning and that file yields no
@@ -278,6 +281,7 @@ The commonly changed runtime choices are command-line arguments:
 | `-sdpa-backend` | `auto` | `auto`, `flash`, `cudnn`, `efficient`, or `math` |
 | `-input-memory-format` | `nhwc` | `nhwc` or `nchw`; independent of masking |
 | `-disable-flex-attention` | absent | Use masked SDPA instead of the default compatible Transformer FlexAttention path |
+| `-disable-validation-full-board-filter` | absent | Keep mixed validation rows when on-load full-board filtering is enabled |
 
 `-no-compile` disables both model and loss compilation. QAT also disables the
 compiled loss. Muon's Newton-Schulz kernel retains its existing local

@@ -137,7 +137,7 @@ def read_npz_training_data(
                     logging.warning(
                         "%s full-board on-load filter retained %d/%d rows, fewer than "
                         "one global batch (%d = batch_size %d * world_size %d); "
-                        "this file will yield no training batches",
+                        "this file will yield no batches",
                         npz_file,
                         retained_num_samples,
                         source_num_samples,
