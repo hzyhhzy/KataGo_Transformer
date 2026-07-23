@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import data_processing_pytorch
 import modelconfigs
 

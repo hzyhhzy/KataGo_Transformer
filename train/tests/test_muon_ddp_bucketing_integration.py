@@ -2,7 +2,7 @@
 
 Run with:
 
-    torchrun --standalone --nproc-per-node=2 train/test_muon_ddp_bucketing_integration.py
+    torchrun --standalone --nproc-per-node=2 train/tests/test_muon_ddp_bucketing_integration.py
 
 Importing this module, including through unittest discovery, does not initialize a
 process group. CUDA/NCCL is preferred; CPU/Gloo is used when two CUDA devices are
@@ -15,6 +15,8 @@ import sys
 
 import torch
 import torch.distributed as dist
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 try:
     from .muon_kissin import MuonWithAuxAdamKimi, muon_update_kimi
@@ -72,7 +74,7 @@ def main():
         print(
             "SKIP: no torchrun rank environment; run with "
             "`torchrun --standalone --nproc-per-node=2 "
-            "train/test_muon_ddp_bucketing_integration.py`"
+            "train/tests/test_muon_ddp_bucketing_integration.py`"
         )
         return 0
 

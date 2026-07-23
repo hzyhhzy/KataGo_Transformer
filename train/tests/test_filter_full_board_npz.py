@@ -9,7 +9,7 @@ import unittest
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from filter_full_board_npz import (
     BINARY_INPUT_KEY,
     DatasetFormatError,

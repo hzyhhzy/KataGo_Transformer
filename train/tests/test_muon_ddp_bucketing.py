@@ -1,10 +1,13 @@
 import io
 import math
 import os
+import sys
 import unittest
 from unittest import mock
 
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 try:
     from . import muon_kissin

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import torch
 
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import metrics_pytorch
 
 

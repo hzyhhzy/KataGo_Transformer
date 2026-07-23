@@ -6,7 +6,7 @@ from unittest import mock
 import torch
 
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import train_muon_ki
 
 
