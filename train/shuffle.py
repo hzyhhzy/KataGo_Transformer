@@ -19,6 +19,10 @@ import gc
 import multiprocessing
 
 import numpy as np
+if __package__:
+    from .numpy_npz_headers import read_numpy_array_header
+else:
+    from numpy_npz_headers import read_numpy_array_header
 
 def assert_keys(npz,include_meta):
     keys = [
@@ -314,7 +318,7 @@ def get_numpy_npz_headers(filename):
                 wasbad = True
                 print("WARNING: bad file, skipping it: %s (bad array %s)" % (filename,subfilename))
             else:
-                (shape, is_fortran, dtype) = np.lib.format._read_array_header(npyfile,version)
+                (shape, is_fortran, dtype) = read_numpy_array_header(npyfile,version)
                 npzheaders[subfilename] = (shape, is_fortran, dtype)
         if wasbad:
             return None
