@@ -280,7 +280,7 @@ The commonly changed runtime choices are command-line arguments:
 | `-compile-mode` | `default` | `default`, `max-autotune-no-cudagraphs`, or `max-autotune` |
 | `-sdpa-backend` | `auto` | `auto`, `flash`, `cudnn`, `efficient`, or `math` |
 | `-input-memory-format` | `nhwc` | `nhwc` or `nchw`; independent of masking |
-| `-disable-flex-attention` | absent | Use masked SDPA instead of the default compatible Transformer FlexAttention path |
+| `-use-flex-attention` | absent | Opt in to potentially faster masked FlexAttention; requires compilation and should be checked for short-run overall convergence, stable model norms, and finite losses on the target shape/mask distribution |
 | `-disable-validation-full-board-filter` | absent | Keep mixed validation rows when on-load full-board filtering is enabled |
 
 `-no-compile` disables both model and loss compilation. QAT also disables the

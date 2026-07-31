@@ -109,29 +109,27 @@ def validate_flex_attention_options(
 
 
 def resolve_flex_attention_enabled(
-    requested: Optional[bool],
+    requested: bool,
     disable_mask: bool,
     no_compile: bool,
     qat_int8: bool,
 ) -> bool:
-    """Resolve the default without breaking modes that FlexAttention cannot run."""
-    if requested is not None:
-        validate_flex_attention_options(
-            requested,
-            disable_mask,
-            no_compile,
-            qat_int8,
-        )
-        return requested
-    return not disable_mask and not no_compile and not qat_int8
+    """Keep masked SDPA as the default and validate explicit FlexAttention use."""
+    validate_flex_attention_options(
+        requested,
+        disable_mask,
+        no_compile,
+        qat_int8,
+    )
+    return requested
 
 
 def configure_model_flex_attention(
     raw_model,
-    requested: Optional[bool],
+    requested: bool,
     enabled: bool,
 ) -> bool:
-    """Apply the resolved mode, falling back for auto-selected non-Transformer models."""
+    """Apply the resolved mode and reject explicit use on unsupported models."""
     if enabled and not raw_model.supports_flex_attention():
         if requested is True:
             raise ValueError(
@@ -273,22 +271,19 @@ if __name__ == "__main__":
         required=False,
         action='store_true',
     )
-    flex_attention_args = optional_args.add_mutually_exclusive_group()
-    flex_attention_args.add_argument(
+    optional_args.add_argument(
         '-use-flex-attention',
         dest='flex_attention',
-        help='Force FlexAttention for masked transformer attention',
+        help=(
+            'Enable FlexAttention for masked transformer attention. It can improve '
+            'throughput and reduce mask overhead, but requires torch.compile and may '
+            'make all losses stall and then rapidly diverge to NaN for some model '
+            'shapes or mixed-board masks; verify short-run overall convergence and '
+            'numerical stability before a long training run'
+        ),
         required=False,
         action='store_true',
     )
-    flex_attention_args.add_argument(
-        '-disable-flex-attention',
-        dest='flex_attention',
-        help='Use masked SDPA instead of the default FlexAttention path',
-        required=False,
-        action='store_false',
-    )
-    parser.set_defaults(flex_attention=None)
 
     optional_args.add_argument('-epochs-per-export', help='Export model once every this many epochs', type=int, required=False)
     optional_args.add_argument('-export-prob', help='Export model with this probablity', type=float, required=False)
@@ -842,11 +837,7 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
 
     sdpa_backend = configure_sdpa_backend(sdpa_backend)
     logging.info(f"SDPA backend selection: {sdpa_backend}")
-    flex_attention_selection = (
-        "auto" if flex_attention_requested is None
-        else "enabled" if flex_attention_requested
-        else "disabled"
-    )
+    flex_attention_selection = "enabled" if flex_attention_requested else "disabled"
     logging.info(
         "FlexAttention selection: %s candidate_enabled=%s block_size=128",
         flex_attention_selection,

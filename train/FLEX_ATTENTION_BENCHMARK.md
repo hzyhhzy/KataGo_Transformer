@@ -25,6 +25,24 @@ FlexAttention recovered about 49.5% of the b24 mask-related throughput gap and
 47.1% of the b40 gap. It also used slightly less peak memory than masked SDPA:
 about 22.45 GiB/GPU versus 22.53 GiB/GPU for b40 at batch 160.
 
+## Reliability caveat and default
+
+A later 19x19 mixed-board FP16 test exposed a convergence and numerical-
+stability failure for `b11c96h3tfrs` (361 tokens, 3 attention heads). With
+FlexAttention, all training objectives stalled and the run subsequently
+diverged rapidly toward NaN; policy loss was still 5.7596 after 716,800 samples
+and was simply the clearest early symptom. With FlexAttention disabled and
+masked SDPA left on automatic backend selection, policy loss fell below 4.0
+after 1,638,400 samples while the other objectives and model norms remained
+stable; forced Efficient and Math SDPA controls also converged normally. An
+isolated forward/backward comparison agreed within expected FP16 rounding, so
+this is not a gross mask-semantics mismatch, but the end-to-end training failure
+makes automatic opt-in unsafe. Masked SDPA is therefore the default;
+FlexAttention remains an explicit throughput experiment via
+`-use-flex-attention` and should be accepted only after checking overall loss
+convergence, model norms, and finite values on the target model shape and
+board-size distribution.
+
 ## cuDNN SDPA comparison
 
 cuDNN SDPA supports this FP16 additive-mask shape, so it was also tested as an
@@ -51,16 +69,15 @@ versions.
 ## Kept implementation
 
 - FlexAttention is a runtime training choice, not a ModelConfig field and not
-  part of a checkpoint. Compatible compiled masked Transformer training enables
-  it by default; `-disable-flex-attention` restores masked SDPA.
+  part of a checkpoint. Masked SDPA is the default; `-use-flex-attention`
+  explicitly enables FlexAttention for a compatible compiled masked Transformer.
 - A per-sample, KV-only `BlockMask` exactly preserves the old additive SDPA mask
   semantics, including evaluating off-board query rows. One mask is built per
   model forward and reused by every transformer layer.
 - The mask uses `H=1` so it broadcasts over all heads. Each DDP rank builds it
   from its local batch; no new collective or cross-rank routing is needed.
-- The automatic default falls back for CNN, `-no-compile`, `-disable-mask`, and
-  QAT runs. Explicit `-use-flex-attention` remains available as a force option
-  and is rejected for those incompatible modes.
+- Explicit `-use-flex-attention` is rejected for CNN, `-no-compile`,
+  `-disable-mask`, and QAT runs.
 - SWA validation deliberately uses masked SDPA. `AveragedModel` is evaluated
   eagerly, where eager FlexAttention materializes the full score matrix; the
   runtime fallback does not alter averaged parameters or checkpoint keys.

@@ -244,15 +244,7 @@ class DdpRuntimeOptionsTests(unittest.TestCase):
             )
         )
 
-    def test_flex_attention_defaults_on_for_compatible_masked_training(self):
-        self.assertTrue(
-            train_muon_ki.resolve_flex_attention_enabled(
-                requested=None,
-                disable_mask=False,
-                no_compile=False,
-                qat_int8=False,
-            )
-        )
+    def test_flex_attention_defaults_off_and_can_be_enabled_explicitly(self):
         self.assertFalse(
             train_muon_ki.resolve_flex_attention_enabled(
                 requested=False,
@@ -261,15 +253,22 @@ class DdpRuntimeOptionsTests(unittest.TestCase):
                 qat_int8=False,
             )
         )
-
-    def test_flex_attention_auto_falls_back_for_incompatible_modes(self):
+        self.assertTrue(
+            train_muon_ki.resolve_flex_attention_enabled(
+                requested=True,
+                disable_mask=False,
+                no_compile=False,
+                qat_int8=False,
+            )
+        )
+    def test_disabled_flex_attention_is_valid_in_incompatible_modes(self):
         cases = (
             {"disable_mask": True},
             {"no_compile": True},
             {"qat_int8": True},
         )
         defaults = dict(
-            requested=None,
+            requested=False,
             disable_mask=False,
             no_compile=False,
             qat_int8=False,
@@ -301,7 +300,7 @@ class DdpRuntimeOptionsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, pattern):
                     train_muon_ki.resolve_flex_attention_enabled(**options)
 
-    def test_flex_attention_auto_skips_unsupported_cnn_models(self):
+    def test_flex_attention_configuration_rejects_unsupported_models(self):
         class FakeModel:
             def __init__(self, supported):
                 self.supported = supported
@@ -316,8 +315,8 @@ class DdpRuntimeOptionsTests(unittest.TestCase):
         cnn_model = FakeModel(supported=False)
         actual = train_muon_ki.configure_model_flex_attention(
             cnn_model,
-            requested=None,
-            enabled=True,
+            requested=False,
+            enabled=False,
         )
         self.assertFalse(actual)
         self.assertFalse(cnn_model.enabled)
@@ -325,7 +324,7 @@ class DdpRuntimeOptionsTests(unittest.TestCase):
         transformer_model = FakeModel(supported=True)
         actual = train_muon_ki.configure_model_flex_attention(
             transformer_model,
-            requested=None,
+            requested=True,
             enabled=True,
         )
         self.assertTrue(actual)
