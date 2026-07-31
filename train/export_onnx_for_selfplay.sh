@@ -5,14 +5,21 @@ set -o pipefail
 #Takes any models in torchmodels_toexport_extra/ and outputs a cuda-runnable model file to models_extra/
 #Should be run periodically.
 
-if [[ $# -ne 3 ]]
-then
-    echo "Usage: $0 NAMEPREFIX BASEDIR USEGATING"
-    echo "Currently expects to be run from within the 'python' directory of the KataGo repo, or otherwise in the same dir as export_model.py."
+function printUsage() {
+    echo "Usage: $0 NAMEPREFIX BASEDIR USEGATING -pos-len N [-simplify] [-non-swa]"
+    echo "Currently expects to be run from within the 'train' directory of the KataGo repo, or otherwise in the same dir as export_onnx.py."
     echo "NAMEPREFIX string prefix for this training run, try to pick something globally unique. Will be displayed to users when KataGo loads the model."
     echo "BASEDIR containing selfplay data and models and related directories"
     echo "USEGATING = 1 to use gatekeeper, 0 to not use gatekeeper and output directly to models/"
-    exit 0
+    echo "-pos-len N is required and sets the exported board edge length"
+    echo "-simplify keeps only the simplified ONNX model and fails if simplification does not produce one"
+    echo "-non-swa exports the ordinary model instead of the SWA model"
+}
+
+if [[ $# -lt 3 ]]
+then
+    printUsage >&2
+    exit 1
 fi
 NAMEPREFIX="$1"
 shift
@@ -20,6 +27,51 @@ BASEDIR="$1"
 shift
 USEGATING="$1"
 shift
+
+POS_LEN=""
+SIMPLIFY=0
+USE_SWA=1
+
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+        -pos-len)
+            if [[ $# -lt 2 ]]
+            then
+                echo "Error: -pos-len requires a value" >&2
+                printUsage >&2
+                exit 1
+            fi
+            POS_LEN="$2"
+            shift 2
+            ;;
+        -simplify)
+            SIMPLIFY=1
+            shift
+            ;;
+        -non-swa)
+            USE_SWA=0
+            shift
+            ;;
+        *)
+            echo "Error: unknown argument: $1" >&2
+            printUsage >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "$POS_LEN" ]]
+then
+    echo "Error: -pos-len is required" >&2
+    printUsage >&2
+    exit 1
+fi
+if [[ ! "$POS_LEN" =~ ^[1-9][0-9]*$ ]]
+then
+    echo "Error: -pos-len must be a positive integer, got: $POS_LEN" >&2
+    exit 1
+fi
 
 #------------------------------------------------------------------------------
 
@@ -66,15 +118,53 @@ function exportStuff() {
                 rm -rf "$TMPDST"
                 mkdir "$TMPDST"
 
+                EXPORT_ARGS=(
+                    -checkpoint "$SRC"/model.ckpt
+                    -export-dir "$TMPDST"
+                    -model-name "$NAMEPREFIX""-""$NAME"
+                    -filename-prefix model
+                    -skip-verification
+                    -pos-len "$POS_LEN"
+                )
+                if [[ "$USE_SWA" -eq 1 ]]
+                then
+                    EXPORT_ARGS+=(-use-swa)
+                fi
+                if [[ "$SIMPLIFY" -eq 1 ]]
+                then
+                    EXPORT_ARGS+=(-simplify)
+                fi
+
                 set -x
-                python ./export_onnx.py \
-                        -checkpoint "$SRC"/model.ckpt \
-                        -export-dir "$TMPDST" \
-                        -model-name "$NAMEPREFIX""-""$NAME" \
-                        -filename-prefix model \
-                        -skip-verification \
-                        -use-swa \
-                        -pos-len 19
+                set +e
+                python ./export_onnx.py "${EXPORT_ARGS[@]}"
+                EXPORT_STATUS=$?
+                set -e
+
+                if [[ "$SIMPLIFY" -eq 1 ]]
+                then
+                    # Never leave the ordinary model behind when simplification
+                    # was requested, even when export_onnx.py fails partway through.
+                    rm -f "$TMPDST"/model.onnx
+                    if [[ "$EXPORT_STATUS" -ne 0 ]]
+                    then
+                        set +x
+                        echo "Error: ONNX export or simplification failed with status $EXPORT_STATUS; ordinary model.onnx was deleted" >&2
+                        return "$EXPORT_STATUS"
+                    fi
+                    if [[ ! -f "$TMPDST"/model_simplified.onnx ]]
+                    then
+                        set +x
+                        echo "Error: simplification did not produce model_simplified.onnx; ordinary model.onnx was deleted" >&2
+                        return 1
+                    fi
+                    mv "$TMPDST"/model_simplified.onnx "$TMPDST"/model.onnx
+                elif [[ "$EXPORT_STATUS" -ne 0 ]]
+                then
+                    set +x
+                    echo "Error: ONNX export failed with status $EXPORT_STATUS" >&2
+                    return "$EXPORT_STATUS"
+                fi
 
                 python ./clean_checkpoint.py \
                         -checkpoint "$SRC"/model.ckpt \
