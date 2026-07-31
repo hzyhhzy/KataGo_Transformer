@@ -1047,6 +1047,47 @@ b11c96h3tfr = {
 }
 
 
+b16c128h4tfrs = {
+    "version":15,
+    "norm_kind":"fixup",
+    "bnorm_epsilon": 1e-4,
+    "bnorm_running_avg_momentum": 0.001,
+    "initial_conv_1x1": False,
+    "trunk_num_channels":128,
+    "mid_num_channels":128,
+    "gpool_num_channels":32,
+    "transformer_ffn_channels":320,
+    "transformer_heads":4,
+    "transformer_kv_heads":4,
+    "use_attention_pool":False,
+    "num_attention_pool_heads":4,
+    "block_kind": [
+        ["rconv1","transformerropesg"],
+        ["rconv2","transformerropesg"],
+        ["rconv3","transformerropesg"],
+        ["rconv4","transformerropesg"],
+        ["rconv5","transformerropesg"],
+        ["rconv6","transformerropesg"],
+        ["rconv7","transformerropesg"],
+        ["rconv8","transformerropesg"],
+        ["rconv9","transformerropesg"],
+        ["rconv10","transformerropesg"],
+        ["rconv11","transformerropesg"],
+        ["rconv12","transformerropesg"],
+        ["rconv13","transformerropesg"],
+        ["rconv14","transformerropesg"],
+        ["rconv15","transformerropesg"],
+        ["rconv16","transformerropesg"],
+    ],
+    "p1_num_channels":32,
+    "g1_num_channels":32,
+    "v1_num_channels":32,
+    "sbv2_num_channels":80,
+    "num_scorebeliefs":8,
+    "v2_size":96,
+}
+
+
 
 b30c128h4tfrs = {
     "version":15,
@@ -2097,6 +2138,7 @@ base_config_of_name = {
 
     "b30c256bt": b30c256bt,  # 6M param CNN for comparition
     "b24c128tf1b": b24c128tf1b,  # old, CNN+transformer mixed, no RoPE/SwiGLU
+    "b16c128h4tfrs":b16c128h4tfrs,
     "b30c128h4tfrs":b30c128h4tfrs, # strong but slow
     "b14c192h6tfrs":b14c192h6tfrs, # good trade-off, Recommended
     "b7c256h8tfrs":b7c256h8tfrs,   # fast but weak
