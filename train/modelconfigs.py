@@ -2279,5 +2279,37 @@ for name, base_config in list(config_of_name.items()):
     config = base_config.copy()
     config["version"] = 102 
     config_of_name[name+"-v102"] = config
+
+for name, base_config in list(config_of_name.items()):
+    if any(
+        "transformer" in block_kind and block_kind != "transformer"
+        for _, block_kind in base_config["block_kind"]
+    ):
+        config = base_config.copy()
+        config["use_qk_norm"] = True
+        config_of_name[name+"-qkn"] = config
+
+for name, base_config in list(config_of_name.items()):
+    if any(
+        "transformer" in block_kind and block_kind.endswith("sg")
+        for _, block_kind in base_config["block_kind"]
+    ):
+        for clip_value in (4.0, 7.0):
+            config = base_config.copy()
+            config["swiglu_clip"] = clip_value
+            config_of_name[name+f"-clip{int(clip_value)}"] = config
+
+for name, base_config in list(config_of_name.items()):
+    if (
+        "swiglu_clip" not in base_config
+        and any(
+            "transformer" in block_kind and block_kind != "transformer"
+            for _, block_kind in base_config["block_kind"]
+        )
+    ):
+        for clip_value in (4.0, 7.0):
+            config = base_config.copy()
+            config["full_int8_clip"] = clip_value
+            config_of_name[name+f"-fullclip{int(clip_value)}"] = config
     
 # print("Len of config = ",len(config_of_name))  # Len of config = 222000 !, so some functions are removed

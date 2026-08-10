@@ -1164,12 +1164,19 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         self.name = name
         self.norm_kind = config.get("norm_kind", "layer")
         self.ffn_dim = config.get("transformer_ffn_channels", c_main * 2)
+        self.full_int8_clip = config.get("full_int8_clip", None)
+        if self.full_int8_clip is not None:
+            assert self.full_int8_clip > 0.0, "Full INT8 clipping threshold must be positive"
         self.use_swiglu = use_swiglu  
+        self.swiglu_clip = config.get("swiglu_clip", None) if use_swiglu else None
+        if self.swiglu_clip is not None:
+            assert self.swiglu_clip > 0.0, "SwiGLU clipping threshold must be positive"
         self.use_rope = use_rope
         # --- GQA Config ---
         self.num_heads = config.get("transformer_heads", 4)             # Query Heads
         self.num_kv_heads = config.get("transformer_kv_heads", self.num_heads) # KV Heads (Key/Value)
         self.learnable_rope = config.get("learnable_rope", False) if self.use_rope else False
+        self.use_qk_norm = config.get("use_qk_norm", False)
         
         # Compute how many query heads each KV head serves (group size)
         self.n_rep = self.num_heads // self.num_kv_heads
@@ -1190,6 +1197,19 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         # Reduce K/V projection dimensions (GQA)
         self.k_proj = torch.nn.Linear(c_main, self.num_kv_heads * self.head_dim,bias=False)
         self.v_proj = torch.nn.Linear(c_main, self.num_kv_heads * self.head_dim,bias=False)
+
+        # Normalize each query/key head independently before applying RoPE.
+        # Identity modules keep old checkpoints and the disabled path unchanged.
+        self.q_norm = (
+            torch.nn.RMSNorm(self.head_dim, eps=1e-6)
+            if self.use_qk_norm
+            else torch.nn.Identity()
+        )
+        self.k_norm = (
+            torch.nn.RMSNorm(self.head_dim, eps=1e-6)
+            if self.use_qk_norm
+            else torch.nn.Identity()
+        )
         
         self.out_proj = torch.nn.Linear(c_main, c_main,bias=False)
 
@@ -1254,6 +1274,11 @@ class TransformerRoPEGQABlock(torch.nn.Module):
 
     def add_brenorm_clippage(self, upper_rclippage, lower_rclippage, dclippage):
         pass
+
+    def _clip_int8_activation(self, x):
+        if self.full_int8_clip is None:
+            return x
+        return torch.clamp(x, -self.full_int8_clip, self.full_int8_clip)
         
     def forward(
         self,
@@ -1266,13 +1291,18 @@ class TransformerRoPEGQABlock(torch.nn.Module):
     ):
         batch_size, channels, height, width = x.shape
         x_in = x.view(batch_size, channels, -1).permute(0, 2, 1)
+        x_in = self._clip_int8_activation(x_in)
         
         x_norm = self.norm1(x_in)
+        x_norm = self._clip_int8_activation(x_norm)
         
         # 1. Linear Projections
         q = self.q_proj(x_norm)
         k = self.k_proj(x_norm)
         v = self.v_proj(x_norm)
+        q = self._clip_int8_activation(q)
+        k = self._clip_int8_activation(k)
+        v = self._clip_int8_activation(v)
         
         seq_len = height * width
         
@@ -1282,6 +1312,9 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         # K, V: (B, S, Num_KV_Heads, D)
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         
         # 3. Apply RoPE (Broadcasting works here automatically)
         if self.use_rope:
@@ -1299,6 +1332,10 @@ class TransformerRoPEGQABlock(torch.nn.Module):
                 q, k = apply_learnable_rotary_emb(q, k, cos_q, sin_q, cos_k, sin_k)
             else:
                 q, k = apply_rotary_emb(q, k, self.cos_cached, self.sin_cached)
+
+        q = self._clip_int8_activation(q)
+        k = self._clip_int8_activation(k)
+        v = self._clip_int8_activation(v)
         
         # 4. Permute to (B, H, S, D)
         q = q.permute(0, 2, 1, 3) 
@@ -1349,24 +1386,41 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         
         # Flatten head dimension -> (B, S, C)
         attn_output = attn_output.view(batch_size, seq_len, channels)
+        attn_output = self._clip_int8_activation(attn_output)
         
         # 7. Output Projection & FFN
         attn_output = self.out_proj(attn_output)
+        attn_output = self._clip_int8_activation(attn_output)
         x = x_in + attn_output
+        x = self._clip_int8_activation(x)
         xn = self.norm2(x)
+        xn = self._clip_int8_activation(xn)
         
         if self.use_swiglu:
             # SwiGLU: (Act(Linear1(x)) * LinearGate(x)) -> Linear2
             x1 = self.ffn_linear1(xn)
+            x1 = self._clip_int8_activation(x1)
             x1 = self.ffn_act(x1)
             x_gate = self.ffn_linear_gate(xn)
+            x_gate = self._clip_int8_activation(x_gate)
+            if self.swiglu_clip is not None:
+                x1 = torch.clamp(x1, -self.swiglu_clip, self.swiglu_clip)
+                x_gate = torch.clamp(
+                    x_gate, -self.swiglu_clip, self.swiglu_clip
+                )
+            x1 = self._clip_int8_activation(x1)
+            x_gate = self._clip_int8_activation(x_gate)
             x1 = x1 * x_gate
         else:
             # Standard: Act(Linear1(x)) -> Linear2
             x1 = self.ffn_linear1(xn)
+            x1 = self._clip_int8_activation(x1)
             x1 = self.ffn_act(x1)
+        x1 = self._clip_int8_activation(x1)
         x1 = self.ffn_linear2(x1)
+        x1 = self._clip_int8_activation(x1)
         x = x + x1
+        x = self._clip_int8_activation(x)
         
         x = x.permute(0, 2, 1).view(batch_size, channels, height, width)
         return x

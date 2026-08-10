@@ -19,6 +19,64 @@ class TransformerOptimizationTests(unittest.TestCase):
     def tearDown(self):
         model_pytorch.LEARNED_ROPE_CAST_TO_INPUT_DTYPE = self.old_rope_cast
 
+    def test_qk_norm_model_config_suffix(self):
+        base_name = "b11c96h4tflrs-bng-silu"
+        qkn_config = modelconfigs.config_of_name[base_name + "-qkn"]
+
+        self.assertTrue(qkn_config["use_qk_norm"])
+        self.assertNotIn("use_qk_norm", modelconfigs.config_of_name[base_name])
+        self.assertNotIn("b1c6nbt-qkn", modelconfigs.config_of_name)
+
+    def test_swiglu_clip_model_config_suffix(self):
+        base_name = "b11c96h4tflrs-bng-silu"
+        clip4_config = modelconfigs.config_of_name[base_name + "-clip4"]
+        clip_config = modelconfigs.config_of_name[base_name + "-clip7"]
+        combined_clip4_config = modelconfigs.config_of_name[
+            base_name + "-qkn-clip4"
+        ]
+        combined_config = modelconfigs.config_of_name[
+            base_name + "-qkn-clip7"
+        ]
+
+        self.assertEqual(clip4_config["swiglu_clip"], 4.0)
+        self.assertEqual(clip_config["swiglu_clip"], 7.0)
+        self.assertNotIn("swiglu_clip", modelconfigs.config_of_name[base_name])
+        self.assertTrue(combined_clip4_config["use_qk_norm"])
+        self.assertEqual(combined_clip4_config["swiglu_clip"], 4.0)
+        self.assertTrue(combined_config["use_qk_norm"])
+        self.assertEqual(combined_config["swiglu_clip"], 7.0)
+        self.assertNotIn("b11c96h3tfr-clip4", modelconfigs.config_of_name)
+        self.assertNotIn("b11c96h3tfr-clip7", modelconfigs.config_of_name)
+
+    def test_full_clip_model_config_suffix(self):
+        swiglu_name = "b11c96h4tflrs-bng-silu"
+        non_swiglu_name = "b11c96h3tfr"
+
+        for clip_value in (4.0, 7.0):
+            suffix = f"-fullclip{int(clip_value)}"
+            with self.subTest(clip_value=clip_value):
+                self.assertEqual(
+                    modelconfigs.config_of_name[swiglu_name + suffix][
+                        "full_int8_clip"
+                    ],
+                    clip_value,
+                )
+                self.assertEqual(
+                    modelconfigs.config_of_name[non_swiglu_name + suffix][
+                        "full_int8_clip"
+                    ],
+                    clip_value,
+                )
+                combined = modelconfigs.config_of_name[
+                    swiglu_name + "-qkn" + suffix
+                ]
+                self.assertTrue(combined["use_qk_norm"])
+                self.assertEqual(combined["full_int8_clip"], clip_value)
+                self.assertNotIn(
+                    swiglu_name + "-clip4" + suffix,
+                    modelconfigs.config_of_name,
+                )
+
     def test_learned_rope_low_precision_rotation_is_close(self):
         torch.manual_seed(5678)
         batch_size = 2
@@ -107,6 +165,213 @@ class TransformerOptimizationTests(unittest.TestCase):
             torch.testing.assert_close(
                 parameter_without_mask.grad, parameter_with_mask.grad
             )
+
+    def test_qk_norm_normalizes_each_head_before_attention(self):
+        torch.manual_seed(24601)
+        config = {
+            "transformer_ffn_channels": 24,
+            "transformer_heads": 4,
+            "transformer_kv_heads": 2,
+            "learnable_rope": False,
+            "use_qk_norm": True,
+        }
+        block = model_pytorch.TransformerRoPEGQABlock(
+            "test", 16, config, "mish", pos_len=3, use_swiglu=True, use_rope=False
+        )
+        captured = {}
+
+        def capture_attention(q, k, v, **kwargs):
+            captured["q"] = q.detach()
+            captured["k"] = k.detach()
+            return torch.zeros_like(q)
+
+        x = torch.randn(2, 16, 3, 3)
+        with mock.patch.object(
+            torch.nn.functional,
+            "scaled_dot_product_attention",
+            side_effect=capture_attention,
+        ):
+            block(x, mask=None, mask_sum_hw=None, mask_sum=None)
+
+        self.assertIsInstance(block.q_norm, torch.nn.RMSNorm)
+        self.assertIsInstance(block.k_norm, torch.nn.RMSNorm)
+        torch.testing.assert_close(
+            captured["q"].float().square().mean(dim=-1),
+            torch.ones_like(captured["q"][..., 0], dtype=torch.float32),
+            rtol=2e-4,
+            atol=2e-4,
+        )
+        torch.testing.assert_close(
+            captured["k"].float().square().mean(dim=-1),
+            torch.ones_like(captured["k"][..., 0], dtype=torch.float32),
+            rtol=2e-4,
+            atol=2e-4,
+        )
+
+        reg_dict = {
+            "normal": [],
+            "normal_gamma": [],
+            "normal_attn": [],
+            "output": [],
+            "noreg": [],
+            "output_noreg": [],
+        }
+        block.add_reg_dict(reg_dict)
+        self.assertTrue(any(param is block.q_norm.weight for param in reg_dict["noreg"]))
+        self.assertTrue(any(param is block.k_norm.weight for param in reg_dict["noreg"]))
+
+    def test_qk_norm_disabled_keeps_parameter_layout_compatible(self):
+        config = {
+            "transformer_ffn_channels": 24,
+            "transformer_heads": 2,
+            "transformer_kv_heads": 2,
+            "learnable_rope": False,
+        }
+        block = model_pytorch.TransformerRoPEGQABlock(
+            "test", 16, config, "mish", pos_len=3, use_swiglu=True, use_rope=False
+        )
+        self.assertIsInstance(block.q_norm, torch.nn.Identity)
+        self.assertIsInstance(block.k_norm, torch.nn.Identity)
+        self.assertFalse(
+            any("q_norm" in key or "k_norm" in key for key in block.state_dict())
+        )
+
+    def test_clip_suffixes_clamp_both_swiglu_multipliers(self):
+        for clip_value in (4.0, 7.0):
+            with self.subTest(clip_value=clip_value):
+                self._check_swiglu_multiplier_clipping(clip_value)
+
+    def _check_swiglu_multiplier_clipping(self, clip_value):
+        config = {
+            "transformer_ffn_channels": 4,
+            "transformer_heads": 1,
+            "transformer_kv_heads": 1,
+            "learnable_rope": False,
+            "swiglu_clip": clip_value,
+        }
+        block = model_pytorch.TransformerRoPEGQABlock(
+            "test", 4, config, "mish", pos_len=1, use_swiglu=True, use_rope=False
+        )
+        with torch.no_grad():
+            block.q_proj.weight.zero_()
+            block.k_proj.weight.zero_()
+            block.v_proj.weight.zero_()
+            block.out_proj.weight.zero_()
+            block.ffn_linear1.weight.fill_(10.0)
+            block.ffn_linear_gate.weight.fill_(-10.0)
+
+        captured = {}
+
+        def capture_linear2_input(module, args):
+            captured["swiglu_product"] = args[0].detach().clone()
+
+        handle = block.ffn_linear2.register_forward_pre_hook(capture_linear2_input)
+        try:
+            block(
+                torch.ones(1, 4, 1, 1),
+                mask=None,
+                mask_sum_hw=None,
+                mask_sum=None,
+            )
+        finally:
+            handle.remove()
+
+        torch.testing.assert_close(
+            captured["swiglu_product"],
+            torch.full_like(captured["swiglu_product"], -(clip_value ** 2)),
+        )
+
+    def test_clip7_is_ignored_by_non_swiglu_blocks(self):
+        config = {
+            "transformer_ffn_channels": 4,
+            "transformer_heads": 1,
+            "transformer_kv_heads": 1,
+            "learnable_rope": False,
+            "swiglu_clip": 7.0,
+        }
+        block = model_pytorch.TransformerRoPEGQABlock(
+            "test", 4, config, "mish", pos_len=1, use_swiglu=False, use_rope=False
+        )
+        self.assertIsNone(block.swiglu_clip)
+
+    def test_full_clip_bounds_transformer_int8_activation_boundaries(self):
+        for use_swiglu in (False, True):
+            with self.subTest(use_swiglu=use_swiglu):
+                self._check_full_clip_boundaries(use_swiglu)
+
+    def _check_full_clip_boundaries(self, use_swiglu):
+        config = {
+            "transformer_ffn_channels": 4,
+            "transformer_heads": 1,
+            "transformer_kv_heads": 1,
+            "learnable_rope": False,
+            "full_int8_clip": 4.0,
+        }
+        block = model_pytorch.TransformerRoPEGQABlock(
+            "test",
+            4,
+            config,
+            "mish",
+            pos_len=1,
+            use_swiglu=use_swiglu,
+            use_rope=False,
+        )
+        with torch.no_grad():
+            for module in block.modules():
+                if isinstance(module, torch.nn.Linear):
+                    module.weight.fill_(100.0)
+
+        captured = {}
+
+        def capture_input(name):
+            def hook(module, args):
+                captured[name] = args[0].detach().clone()
+            return hook
+
+        handles = [
+            block.q_proj.register_forward_pre_hook(capture_input("q_proj")),
+            block.k_proj.register_forward_pre_hook(capture_input("k_proj")),
+            block.v_proj.register_forward_pre_hook(capture_input("v_proj")),
+            block.out_proj.register_forward_pre_hook(capture_input("out_proj")),
+            block.ffn_linear1.register_forward_pre_hook(capture_input("ffn_linear1")),
+            block.ffn_linear2.register_forward_pre_hook(capture_input("ffn_linear2")),
+        ]
+        if use_swiglu:
+            handles.append(
+                block.ffn_linear_gate.register_forward_pre_hook(
+                    capture_input("ffn_linear_gate")
+                )
+            )
+
+        def fake_attention(q, k, v, **kwargs):
+            captured["attention_q"] = q.detach().clone()
+            captured["attention_k"] = k.detach().clone()
+            captured["attention_v"] = v.detach().clone()
+            return q * 100.0
+
+        try:
+            with mock.patch.object(
+                torch.nn.functional,
+                "scaled_dot_product_attention",
+                side_effect=fake_attention,
+            ):
+                output = block(
+                    torch.full((1, 4, 1, 1), 100.0),
+                    mask=None,
+                    mask_sum_hw=None,
+                    mask_sum=None,
+                )
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        for name, tensor in captured.items():
+            self.assertLessEqual(
+                tensor.abs().max().item(),
+                4.0,
+                msg=f"{name} exceeded the full INT8 clipping range",
+            )
+        self.assertLessEqual(output.abs().max().item(), 4.0)
 
     def test_flex_branch_preserves_existing_kv_only_mask_semantics(self):
         torch.manual_seed(1357)

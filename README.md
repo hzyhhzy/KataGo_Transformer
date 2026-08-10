@@ -99,6 +99,10 @@ Parameters can be modified in `./train/train_muon_ki.sh` or passed as arguments 
 *   **Postfixes**:
     *   `-bng-silu`: Recommended. Enables Batch Normalization in Conv layers and SiLU activation in Transformer layers.
     *   `-lrope` / `tflrs`: Uses learnable 2D RoPE frequencies instead of fixed axis-aligned RoPE tables.
+    *   `-qkn`: Enables QK Norm in each supported transformer block. Q and K are reshaped into heads, independently RMS-normalized over `head_dim`, and only then passed through RoPE and attention. Q and K have separate learnable gamma vectors (initialized to one, shared across heads within each projection, and with no beta); their parameters are assigned to the `noreg` optimizer group, which uses the training code's strongly reduced `noreg` weight decay rather than the regular weight decay. Despite the group name, this decay is small but nonzero under the current schedules. This postfix is generated for the `TransformerRoPEGQABlock` family, not for non-transformer models or the legacy block whose kind is exactly `transformer`.
+    *   `-clip4` / `-clip7`: For SwiGLU transformer configurations only, clamps both factors of every SwiGLU product to `[-4, 4]` or `[-7, 7]`: the activated up branch and the linear gate branch. It does not add clipping elsewhere, and these aliases are not generated for non-SwiGLU transformers.
+    *   `-fullclip4` / `-fullclip7`: Simulates bounded INT8 activations throughout each supported transformer block by clamping the block and normalization inputs/outputs, Q/K/V projection and post-RoPE tensors, attention and output-projection tensors, residual outputs, and FFN projection, activation, gate, product, and output tensors to the selected symmetric range. It applies to both SwiGLU and non-SwiGLU transformer configurations, but does not clip the input stem, global projection, or policy/value heads.
+    *   QK Norm may be combined with either clipping mode, for example `b14c192h6tfrs-bng-silu-qkn-clip7` or `b14c192h6tfrs-bng-silu-qkn-fullclip4`. The generated order is `-qkn` followed by the clipping postfix. `-clipN` and `-fullclipN` are mutually exclusive; mixed aliases such as `-clip4-fullclip4` are intentionally not generated.
     *   `-v11`: Use version 11 of the model input features (common for games other than Go).
 
 ---
@@ -130,7 +134,32 @@ python export_onnx.py -checkpoint ../data/train/b14c192h6tfrs_1/checkpoint.ckpt 
 *   `-use-swa`: Whether to use the SWA (Stochastic Weight Averaging) model if available.
 *   `-disable-mask`: Disables masking. This can slightly improve performance.
 
-### 2. TensorRT-ONNX Engine
+### 2. ONNX Runtime CPU Optimization and INT8
+
+Two command-line tools build ONNX Runtime CPU-specific inference graphs:
+
+*   `./train/ort_cpu_optimize_fp32.py` rewrites transformer attention and RoPE to ONNX Runtime `com.microsoft` `MultiHeadAttention` and `RotaryEmbedding` operators, replaces RMSNorm with `SimplifiedLayerNormalization`, and fuses residual additions with normalization as `SkipSimplifiedLayerNormalization` where applicable.
+*   `./train/ort_cpu_quantize_int8.py` converts the optimized FP32 graph to dynamic-trunk W8A8. Activations are quantized dynamically to UINT8 at inference time and weights use symmetric per-tensor QInt8. Only the seven logical transformer projections per block (Q, K, V, attention output, SwiGLU up, gate, and FFN output) are quantized; the spatial stem, global projection, and all policy/value heads remain FP32. Fused and unfused QKV and SwiGLU projection layouts are detected and audited. The current seven-role quantizer therefore requires SwiGLU transformer blocks and rejects an incomplete or mixed block selection.
+
+Install `numpy`, `onnx`, `onnxruntime`, and `onnxsim`, then first export a fixed-batch-1, mask-free, simplified FP32 model. In addition to the normal export arguments, use `-batch-size 1 -fix-batchsize -simplify -disable-mask`; the optimizer requires the simplified topology and `has_mask=false` metadata.
+
+```bash
+python train/ort_cpu_optimize_fp32.py \
+    --input model_fixedb1_simplified.onnx \
+    --output model_ort_cpu_fp32.onnx
+
+python train/ort_cpu_quantize_int8.py \
+    --input model_ort_cpu_fp32.onnx \
+    --output model_ort_cpu_int8.onnx
+```
+
+Both commands write an audit report beside the output by default and fail closed when the expected graph structure cannot be proven. Each model and report file is fully staged beside its own destination and atomically replaces that destination; the two files do not form a cross-file transaction. `--data validation_file.npz` is optional and is used only for numerical validation of all five KataGo outputs; it is not needed to optimize FP32 and is not calibration data for dynamic INT8. For a multi-sample INT8 check, add `--data validation_file.npz --validation-samples 2`. The INT8 tool expects a self-contained ONNX file and rejects external-data models; the normal FP32 optimizer output satisfies this requirement.
+
+The FP32 rewrite supports fixed `tfrs`, per-head learnable-RoPE `tflrs`, QK-Norm fixed-RoPE models, and ordinary SwiGLU `-clip4`/`-clip7` models. It currently rejects `-fullclip4`/`-fullclip7` graphs and the combination of learnable RoPE with QK Norm because those topologies require separate semantics-preserving matchers.
+
+These outputs contain ONNX Runtime-specific contributed operators and target `CPUExecutionProvider`. They are not portable TensorRT graphs; keep the original exported ONNX and use a separate standard ONNX/QDQ calibration pipeline for TensorRT.
+
+### 3. TensorRT-ONNX Engine
 A modified KataGo engine supporting ONNX models is available here (source code only, compilation required):
 [KataGomo (branch: go_onnx_test)](https://github.com/hzyhhzy/KataGomo/tree/go_onnx_test)
 *(Mostly developed by @yehu3d)*
