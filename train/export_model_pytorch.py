@@ -11,6 +11,7 @@ import json
 import datetime
 import logging
 import gzip
+import io
 import numpy as np
 from collections import defaultdict
 from typing import Dict, List
@@ -28,6 +29,7 @@ from model_pytorch import (
     TransformerRoPEGQABlock,
 )
 from load_model import load_model
+from native_int8_v104 import upgrade_v102_bytes
 
 #Command and args-------------------------------------------------------------------
 
@@ -44,6 +46,12 @@ parser.add_argument('-use-swa', help='Use SWA model', action="store_true", requi
 parser.add_argument('-export-14-as-15', help='Export model version 14 as 15', action="store_true", required=False)
 parser.add_argument('-pos-len', help='Board side length used to construct the model', type=int, default=19, required=False)
 parser.add_argument('-gzip', help='Write a deterministic .bin.gz file instead of .bin', action="store_true", required=False)
+parser.add_argument(
+    '-int8-pt-clip4',
+    help='Explicitly export native v104 with embedded clip4/per-tensor INT8 weights',
+    action="store_true",
+    required=False,
+)
 args = vars(parser.parse_args())
 
 
@@ -56,6 +64,7 @@ def main(args):
     export_14_as_15 = args["export_14_as_15"]
     pos_len = args["pos_len"]
     gzip_output = args["gzip"]
+    int8_pt_clip4 = args["int8_pt_clip4"]
 
     if pos_len <= 0:
         raise ValueError("-pos-len must be positive")
@@ -89,12 +98,19 @@ def main(args):
     extension = ".bin.gz" if gzip_output else ".bin"
     mode = "wb"
     output_path = os.path.join(export_dir, filename_prefix + extension)
-    raw_f = open(output_path, mode)
-    if gzip_output:
+    raw_f = None
+    if int8_pt_clip4:
+        # Preserve the ordinary v102 serialization exactly, then derive all
+        # explicit INT8 bytes from those serialized FP32 masters in one strict
+        # in-memory transaction. The default v102 path below remains untouched.
+        f = io.BytesIO()
+    else:
+        raw_f = open(output_path, mode)
+    if gzip_output and not int8_pt_clip4:
         # Do not embed a timestamp or source filename. Given the same checkpoint,
         # CLI arguments, and zlib runtime, this makes the compressed stream stable.
         f = gzip.GzipFile(filename="", mode=mode, fileobj=raw_f, mtime=0)
-    else:
+    elif not int8_pt_clip4:
         f = raw_f
     def writeln(s):
         f.write((str(s)+"\n").encode(encoding="ascii",errors="backslashreplace"))
@@ -108,6 +124,8 @@ def main(args):
     # Hack to be able to export version 14 as version 15
     if version == 14 and export_14_as_15:
         version = 15
+    if int8_pt_clip4 and version != 102:
+        raise ValueError("-int8-pt-clip4 requires a native v102 model")
 
     writeln(model_name)
     writeln(version)
@@ -592,9 +610,27 @@ def main(args):
     else:
         logging.info("Writing model")
         write_model(model)
-    f.close()
-    if gzip_output:
+    if int8_pt_clip4:
+        v102_body = f.getvalue()
+        f.close()
+        upgraded = upgrade_v102_bytes(v102_body)
+        raw_f = open(output_path, mode)
+        if gzip_output:
+            with gzip.GzipFile(filename="", mode=mode, fileobj=raw_f, mtime=0) as gzip_f:
+                gzip_f.write(upgraded.data)
+        else:
+            raw_f.write(upgraded.data)
         raw_f.close()
+        logging.info(
+            "Embedded native v104 INT8 trailer: entries=%d payload_bytes=%d payload_sha256=%s",
+            len(upgraded.entries),
+            len(upgraded.payload),
+            upgraded.payload_sha256,
+        )
+    else:
+        f.close()
+        if gzip_output:
+            raw_f.close()
 
     with open(os.path.join(export_dir,"metadata.json"),"w") as f:
         train_state = other_state_dict["train_state"]

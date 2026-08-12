@@ -67,7 +67,7 @@ class NativeTransformerExportTests(unittest.TestCase):
         config.update(updates)
         return config
 
-    def _run_export(self, checkpoint, export_dir, gzip_output):
+    def _export_command(self, checkpoint, export_dir, gzip_output, int8_pt_clip4=False):
         command = [
             sys.executable,
             str(TRAIN_DIR / "export_model_pytorch.py"),
@@ -84,6 +84,12 @@ class NativeTransformerExportTests(unittest.TestCase):
         ]
         if gzip_output:
             command.append("-gzip")
+        if int8_pt_clip4:
+            command.append("-int8-pt-clip4")
+        return command
+
+    def _run_export(self, checkpoint, export_dir, gzip_output):
+        command = self._export_command(checkpoint, export_dir, gzip_output)
         completed = subprocess.run(
             command,
             cwd=TRAIN_DIR,
@@ -187,6 +193,31 @@ class NativeTransformerExportTests(unittest.TestCase):
             # including its header.
             self._run_export(checkpoint, export_dir, gzip_output=True)
             self.assertEqual(compressed_path.read_bytes(), compressed_first)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_int8_v104_flag_rejects_nonproduction_topology(self):
+        temp_dir = TRAIN_DIR / "tests" / ("native_export_" + uuid.uuid4().hex)
+        temp_dir.mkdir()
+        try:
+            checkpoint = temp_dir / "checkpoint.ckpt"
+            self._save_checkpoint(checkpoint, self._tiny_config())
+            completed = subprocess.run(
+                self._export_command(
+                    checkpoint,
+                    temp_dir / "export",
+                    gzip_output=False,
+                    int8_pt_clip4=True,
+                ),
+                cwd=TRAIN_DIR,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("requires C256/H8 learned-RoPE attention", completed.stdout)
+            self.assertFalse((temp_dir / "export" / "model.bin").exists())
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
