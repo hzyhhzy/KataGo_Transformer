@@ -10,6 +10,7 @@ import struct
 import json
 import datetime
 import logging
+import gzip
 import numpy as np
 from collections import defaultdict
 from typing import Dict, List
@@ -19,7 +20,13 @@ import torch.nn
 from torch.optim.swa_utils import AveragedModel
 
 import modelconfigs
-from model_pytorch import Model, ResBlock, NestedBottleneckResBlock
+from model_pytorch import (
+    Model,
+    ResBlock,
+    NestedBottleneckResBlock,
+    NestedBottleneckTransformerBlock,
+    TransformerRoPEGQABlock,
+)
 from load_model import load_model
 
 #Command and args-------------------------------------------------------------------
@@ -35,6 +42,8 @@ parser.add_argument('-model-name', help='name to record in model file', required
 parser.add_argument('-filename-prefix', help='filename prefix to save to within dir', required=True)
 parser.add_argument('-use-swa', help='Use SWA model', action="store_true", required=False)
 parser.add_argument('-export-14-as-15', help='Export model version 14 as 15', action="store_true", required=False)
+parser.add_argument('-pos-len', help='Board side length used to construct the model', type=int, default=19, required=False)
+parser.add_argument('-gzip', help='Write a deterministic .bin.gz file instead of .bin', action="store_true", required=False)
 args = vars(parser.parse_args())
 
 
@@ -45,6 +54,11 @@ def main(args):
     filename_prefix = args["filename_prefix"]
     use_swa = args["use_swa"]
     export_14_as_15 = args["export_14_as_15"]
+    pos_len = args["pos_len"]
+    gzip_output = args["gzip"]
+
+    if pos_len <= 0:
+        raise ValueError("-pos-len must be positive")
 
     os.makedirs(export_dir,exist_ok=True)
 
@@ -62,13 +76,26 @@ def main(args):
     logging.info(str(sys.argv))
 
     # LOAD MODEL ---------------------------------------------------------------------
-    model, swa_model, other_state_dict = load_model(checkpoint_file, use_swa, device="cpu", verbose=True)
+    model, swa_model, other_state_dict = load_model(
+        checkpoint_file,
+        use_swa,
+        device="cpu",
+        pos_len=pos_len,
+        verbose=True,
+    )
     model_config = model.config
 
     # WRITING MODEL ----------------------------------------------------------------
-    extension = ".bin"
+    extension = ".bin.gz" if gzip_output else ".bin"
     mode = "wb"
-    f = open(export_dir + "/" + filename_prefix + extension, mode)
+    output_path = os.path.join(export_dir, filename_prefix + extension)
+    raw_f = open(output_path, mode)
+    if gzip_output:
+        # Do not embed a timestamp or source filename. Given the same checkpoint,
+        # CLI arguments, and zlib runtime, this makes the compressed stream stable.
+        f = gzip.GzipFile(filename="", mode=mode, fileobj=raw_f, mtime=0)
+    else:
+        f = raw_f
     def writeln(s):
         f.write((str(s)+"\n").encode(encoding="ascii",errors="backslashreplace"))
     def writestr(s):
@@ -219,6 +246,8 @@ def main(args):
             writeln("ACTIVATION_RELU")
         elif isinstance(activation,torch.nn.Mish):
             writeln("ACTIVATION_MISH")
+        elif isinstance(activation,torch.nn.SiLU):
+            writeln("ACTIVATION_SILU")
         elif isinstance(activation,torch.nn.Identity):
             writeln("ACTIVATION_IDENTITY")
         else:
@@ -272,6 +301,134 @@ def main(args):
             write_matmul(name+".convpool.linear_g", normactconv.convpool.linear_g.weight)
             assert normactconv.convpool.linear_g.bias is None
 
+    def write_transformer_norm(name,rmsnorm):
+        if not isinstance(rmsnorm, torch.nn.RMSNorm):
+            raise ValueError(f"{name}: native transformer format requires RMSNorm")
+        if not rmsnorm.elementwise_affine or rmsnorm.weight is None or rmsnorm.weight.ndim != 1:
+            raise ValueError(f"{name}: native transformer RMSNorm requires one-dimensional affine weights")
+        if not isinstance(rmsnorm.eps, float) or not math.isfinite(rmsnorm.eps) or rmsnorm.eps <= 0.0 or rmsnorm.eps > 1.0:
+            raise ValueError(f"{name}: RMSNorm epsilon must be finite and in (0, 1]")
+        writeln(name)
+        writeln(rmsnorm.weight.shape[0])
+        writeln(rmsnorm.eps)
+        write_weights(rmsnorm.weight)
+
+    def validate_combined_transformer(name,block):
+        if not isinstance(block, TransformerRoPEGQABlock):
+            raise ValueError(f"{name}: expected TransformerRoPEGQABlock, got {type(block)}")
+        # These are semantic compatibility gates rather than internal
+        # invariants. Keep them active under ``python -O`` so an exporter can
+        # never silently discard a trained operation.
+        if block.full_int8_clip is not None:
+            raise ValueError(f"{name}: full_int8_clip is not supported by the native model format")
+        if block.swiglu_clip is not None:
+            raise ValueError(f"{name}: swiglu_clip is not supported by the native model format")
+        if block.use_qk_norm or not isinstance(block.q_norm, torch.nn.Identity) or not isinstance(block.k_norm, torch.nn.Identity):
+            raise ValueError(f"{name}: QK norm is not supported by the native model format")
+        if not block.use_swiglu:
+            raise ValueError(f"{name}: the native CUDA transformer backend requires SwiGLU")
+        if block.num_heads <= 0 or block.num_kv_heads <= 0 or block.num_heads % block.num_kv_heads != 0:
+            raise ValueError(f"{name}: invalid query/KV head counts")
+        if block.head_dim <= 0 or block.head_dim % 2 != 0:
+            raise ValueError(f"{name}: head_dim must be positive and even")
+        trunk_channels = block.q_proj.in_features
+        projection_shapes_match = (
+            block.q_proj.out_features == block.num_heads * block.head_dim and
+            block.k_proj.in_features == trunk_channels and
+            block.k_proj.out_features == block.num_kv_heads * block.head_dim and
+            block.v_proj.in_features == trunk_channels and
+            block.v_proj.out_features == block.num_kv_heads * block.head_dim and
+            block.out_proj.in_features == block.num_heads * block.head_dim and
+            block.out_proj.out_features == trunk_channels
+        )
+        if block.q_proj.out_features != trunk_channels or not projection_shapes_match:
+            raise ValueError(f"{name}: attention projection shapes do not match the declared geometry")
+        ffn_shapes_match = (
+            block.ffn_dim > 0 and
+            block.ffn_linear1.in_features == trunk_channels and
+            block.ffn_linear1.out_features == block.ffn_dim and
+            block.ffn_linear_gate.in_features == trunk_channels and
+            block.ffn_linear_gate.out_features == block.ffn_dim and
+            block.ffn_linear2.in_features == block.ffn_dim and
+            block.ffn_linear2.out_features == trunk_channels
+        )
+        if not ffn_shapes_match:
+            raise ValueError(f"{name}: FFN projection shapes do not match the declared geometry")
+        if any(layer.bias is not None for layer in (
+            block.q_proj,
+            block.k_proj,
+            block.v_proj,
+            block.out_proj,
+            block.ffn_linear1,
+            block.ffn_linear_gate,
+            block.ffn_linear2,
+        )):
+            raise ValueError(f"{name}: native transformer projections do not support bias")
+        if not isinstance(block.norm1, torch.nn.RMSNorm) or not isinstance(block.norm2, torch.nn.RMSNorm):
+            raise ValueError(f"{name}: native transformer format requires RMSNorm")
+        if block.use_rope:
+            if block.learnable_rope:
+                expected_shape = (block.num_kv_heads, block.head_dim // 2, 2)
+                if tuple(block.rope_freqs.shape) != expected_shape:
+                    raise ValueError(f"{name}: learnable RoPE shape must be {expected_shape}")
+            else:
+                if block.head_dim % 4 != 0:
+                    raise ValueError(f"{name}: fixed 2D RoPE requires head_dim divisible by 4")
+                if not math.isfinite(block.rope_theta) or block.rope_theta <= 0.0:
+                    raise ValueError(f"{name}: fixed RoPE theta must be finite and positive")
+        else:
+            if block.learnable_rope:
+                raise ValueError(f"{name}: learnable_rope requires use_rope")
+
+    def write_transformer_attention_block(name,block):
+        validate_combined_transformer(name, block)
+        writeln("transformer_attention_block")
+        writeln(name)
+        writeln(block.num_heads)
+        writeln(block.num_kv_heads)
+        writeln(block.head_dim)
+        writeln(block.head_dim)
+        writeln(1 if block.use_rope else 0)
+        writeln(1 if block.learnable_rope else 0)
+
+        write_transformer_norm(name+".norm1", block.norm1)
+        write_matmul(name+".q_proj", block.q_proj.weight)
+        write_matmul(name+".k_proj", block.k_proj.weight)
+        write_matmul(name+".v_proj", block.v_proj.weight)
+        write_matmul(name+".out_proj", block.out_proj.weight)
+
+        if block.use_rope:
+            if block.learnable_rope:
+                freqs = block.rope_freqs.detach()
+                writeln(name+".rope_freqs")
+                writeln(freqs.shape[0])
+                writeln(freqs.shape[1])
+                writeln(freqs.shape[2])
+                write_weights(freqs)
+            else:
+                writeln(name+".rope_theta")
+                writeln(block.rope_theta)
+
+    def write_transformer_ffn_block(name,block):
+        validate_combined_transformer(name, block)
+        writeln("transformer_ffn_block")
+        writeln(name)
+        writeln(block.q_proj.in_features)
+        writeln(block.ffn_dim)
+        writeln(1 if block.use_swiglu else 0)
+
+        write_transformer_norm(name+".norm", block.norm2)
+        write_matmul(name+".ffn_linear1", block.ffn_linear1.weight)
+        if block.use_swiglu:
+            write_matmul(name+".ffn_linear_gate", block.ffn_linear_gate.weight)
+        write_matmul(name+".ffn_linear2", block.ffn_linear2.weight)
+
+    def logical_block_count(block):
+        # A combined PyTorch transformer block has two residual operations on
+        # the wire. Other block kinds, including nested blocks, have one outer
+        # descriptor (their own inner count is written inside that descriptor).
+        return 2 if isinstance(block, TransformerRoPEGQABlock) else 1
+
     def write_block(name,block):
         if isinstance(block,ResBlock) and block.normactconv1.c_gpool is None:
             assert block.normactconv2.c_gpool is None
@@ -285,17 +442,23 @@ def main(args):
             writeln(name)
             write_normactconv(name+".normactconv1", block.normactconv1)
             write_normactconv(name+".normactconv2", block.normactconv2)
-        elif isinstance(block,NestedBottleneckResBlock):
+        elif isinstance(block,(NestedBottleneckResBlock,NestedBottleneckTransformerBlock)):
             writeln("nested_bottleneck_block")
             writeln(name)
-            writeln(block.internal_length)
-            assert block.internal_length == len(block.blockstack)
+            if block.internal_length != len(block.blockstack):
+                raise ValueError(f"{name}: nested block length does not match its block stack")
+            writeln(sum(logical_block_count(subblock) for subblock in block.blockstack))
             write_normactconv(name+".normactconvp", block.normactconvp)
             for i,subblock in enumerate(block.blockstack):
                 write_block(name+".blockstack."+str(i),subblock)
             write_normactconv(name+".normactconvq", block.normactconvq)
+        elif isinstance(block,TransformerRoPEGQABlock):
+            # Training combines attention and FFN in one module, while the
+            # native engine format stores them as two consecutive descriptors.
+            write_transformer_attention_block(name+".attention", block)
+            write_transformer_ffn_block(name+".ffn", block)
         else:
-            assert False, "This kind of block is not supported for export right now"
+            raise ValueError(f"This kind of block is not supported for export right now: {type(block)}")
 
     def write_metadata_encoder(name,encoder):
         writeln(name)
@@ -312,7 +475,7 @@ def main(args):
 
     def write_trunk(name,model):
         writeln("trunk")
-        writeln(len(model.blocks))
+        writeln(sum(logical_block_count(block) for block in model.blocks))
         writeln(model.c_trunk)
         writeln(model.c_mid)
         writeln(model.c_mid-model.c_gpool)
@@ -425,11 +588,13 @@ def main(args):
 
     if swa_model is not None:
         logging.info("Writing SWA model")
-        write_model(swa_model)
+        write_model(swa_model.module if hasattr(swa_model, "module") else swa_model)
     else:
         logging.info("Writing model")
         write_model(model)
     f.close()
+    if gzip_output:
+        raw_f.close()
 
     with open(os.path.join(export_dir,"metadata.json"),"w") as f:
         train_state = other_state_dict["train_state"]
