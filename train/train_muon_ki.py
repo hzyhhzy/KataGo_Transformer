@@ -858,32 +858,28 @@ def main(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes, writ
         t = x/s0
 
         # time ~ wdtc (weight decay time constant)
-        if t < 2.0**-2:
-            return lr0 * 2 ** (1.0)
-        if t < 2.0**-1:
-            return lr0 * 2 ** (0.5)
-        if t < 2.0**0:
+        if t < 4:
             return lr0 * 2 ** (-0.0)
-        if t < 2.0**1:
+        if t < 8:
             return lr0 * 2 ** (-0.5)
-        if t < 2.0**2:
+        if t < 13:
             return lr0 * 2 ** (-1.0)
-        if t < 2.0**3:
+        if t < 20:
             return lr0 * 2 ** (-1.5)
-        if t < 2.0**4:
+        if t < 33:
             return lr0 * 2 ** (-2.0)
-        if t < 22:
+        if t < 41:
             return lr0 * 2 ** (-2.5)
         # final drop
-        if t < 24:
+        if t < 46:
             return lr0 * 2 ** (-3.0)
-        if t < 26:
+        if t < 51:
             return lr0 * 2 ** (-3.5)
-        if t < 28:
+        if t < 54:
             return lr0 * 2 ** (-4.0)
-        if t < 30:
+        if t < 57:
             return lr0 * 2 ** (-5.0)
-        if t < 32:
+        if t < 60:
             return lr0 * 2 ** (-6.0)
         return lr0 * 2 ** (-7.0)
         
