@@ -1168,7 +1168,13 @@ class TransformerRoPEGQABlock(torch.nn.Module):
         if self.full_int8_clip is not None:
             assert self.full_int8_clip > 0.0, "Full INT8 clipping threshold must be positive"
         self.use_swiglu = use_swiglu  
-        self.swiglu_clip = config.get("swiglu_clip", None) if use_swiglu else None
+        configured_swiglu_clip = config.get("swiglu_clip", None) if use_swiglu else None
+        # Native descriptors use zero to mean that SwiGLU factors are not
+        # clipped. Treat an explicit checkpoint/config zero exactly like an
+        # absent field, while continuing to reject negative thresholds.
+        self.swiglu_clip = (
+            None if configured_swiglu_clip == 0 else configured_swiglu_clip
+        )
         if self.swiglu_clip is not None:
             assert self.swiglu_clip > 0.0, "SwiGLU clipping threshold must be positive"
         self.use_rope = use_rope

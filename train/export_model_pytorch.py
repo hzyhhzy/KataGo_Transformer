@@ -14,6 +14,7 @@ import gzip
 import io
 import numpy as np
 from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List
 
 import torch
@@ -30,6 +31,11 @@ from model_pytorch import (
 )
 from load_model import load_model
 from native_int8_v104 import upgrade_v102_bytes
+from native_int8_calibration import (
+    load_calibration_json,
+    transformer_blocks_in_wire_order,
+    validate_calibration_document,
+)
 
 #Command and args-------------------------------------------------------------------
 
@@ -52,6 +58,15 @@ parser.add_argument(
     action="store_true",
     required=False,
 )
+parser.add_argument(
+    '-int8-calibration-json',
+    dest='int8_calibration_json',
+    help=(
+        'Strict PTQ calibration JSON. Supplying it upgrades a supported '
+        'SwiGLU Transformer export to the extended native v105 wire format.'
+    ),
+    required=False,
+)
 args = vars(parser.parse_args())
 
 
@@ -65,6 +80,7 @@ def main(args):
     pos_len = args["pos_len"]
     gzip_output = args["gzip"]
     int8_pt_clip4 = args["int8_pt_clip4"]
+    calibration_json_path = args["int8_calibration_json"]
 
     if pos_len <= 0:
         raise ValueError("-pos-len must be positive")
@@ -93,6 +109,48 @@ def main(args):
         verbose=True,
     )
     model_config = model.config
+    model_to_export = swa_model if swa_model is not None else model
+    transformer_layers = transformer_blocks_in_wire_order(model_to_export)
+    transformer_layer_order = [name for name, _ in transformer_layers]
+
+    if int8_pt_clip4 and calibration_json_path is not None:
+        raise ValueError("-int8-pt-clip4 and -int8-calibration-json are mutually exclusive")
+    if calibration_json_path is not None:
+        if not transformer_layers:
+            raise ValueError("-int8-calibration-json requires at least one Transformer layer")
+        calibration_document = load_calibration_json(
+            Path(calibration_json_path).resolve()
+        )
+        int8_calibration = validate_calibration_document(
+            calibration_document,
+            checkpoint_path=Path(checkpoint_file).resolve(),
+            layer_order=transformer_layer_order,
+            use_swa=use_swa,
+            pos_len=pos_len,
+        )
+    else:
+        int8_calibration = None
+
+    # Ignore what's in the config if less than 11 since a lot of testing models
+    # are on old version but actually have various new architectures.
+    # Native v105 extends the transformer wire format with per-head Q/K
+    # RMSNorm, a SwiGLU operand-clipping scalar, and a mandatory calibrated
+    # product range on every FFN. Old versions retain their original layout.
+    needs_native_v105 = bool(model_config.get("use_qk_norm",False)) or \
+        any(block.swiglu_clip is not None for _, block in transformer_layers) or \
+        int8_calibration is not None
+    version = max(model_config["version"],105 if needs_native_v105 else 11)
+    true_version = version
+    # Hack to be able to export version 14 as version 15
+    if version == 14 and export_14_as_15:
+        version = 15
+    if int8_pt_clip4 and version != 102:
+        raise ValueError("-int8-pt-clip4 requires a native v102 model")
+
+    if version >= 105 and transformer_layers and int8_calibration is None:
+        raise ValueError(
+            "extended native v105 Transformer export requires -int8-calibration-json"
+        )
 
     # WRITING MODEL ----------------------------------------------------------------
     extension = ".bin.gz" if gzip_output else ".bin"
@@ -116,16 +174,6 @@ def main(args):
         f.write((str(s)+"\n").encode(encoding="ascii",errors="backslashreplace"))
     def writestr(s):
         f.write(s.encode(encoding="ascii",errors="backslashreplace"))
-
-    # Ignore what's in the config if less than 11 since a lot of testing models
-    # are on old version but actually have various new architectures.
-    version = max(model_config["version"],11)
-    true_version = version
-    # Hack to be able to export version 14 as version 15
-    if version == 14 and export_14_as_15:
-        version = 15
-    if int8_pt_clip4 and version != 102:
-        raise ValueError("-int8-pt-clip4 requires a native v102 model")
 
     writeln(model_name)
     writeln(version)
@@ -340,9 +388,20 @@ def main(args):
         if block.full_int8_clip is not None:
             raise ValueError(f"{name}: full_int8_clip is not supported by the native model format")
         if block.swiglu_clip is not None:
-            raise ValueError(f"{name}: swiglu_clip is not supported by the native model format")
-        if block.use_qk_norm or not isinstance(block.q_norm, torch.nn.Identity) or not isinstance(block.k_norm, torch.nn.Identity):
-            raise ValueError(f"{name}: QK norm is not supported by the native model format")
+            if not isinstance(block.swiglu_clip,(int,float)) or \
+               not math.isfinite(float(block.swiglu_clip)) or \
+               float(block.swiglu_clip) <= 0.0:
+                raise ValueError(f"{name}: swiglu_clip must be finite and positive")
+        if block.use_qk_norm:
+            if not isinstance(block.q_norm, torch.nn.RMSNorm) or \
+               not isinstance(block.k_norm, torch.nn.RMSNorm):
+                raise ValueError(f"{name}: enabled QK norm requires q/k RMSNorm modules")
+            if block.q_norm.normalized_shape != (block.head_dim,) or \
+               block.k_norm.normalized_shape != (block.head_dim,):
+                raise ValueError(f"{name}: q/k RMSNorm shape must equal head_dim")
+        elif not isinstance(block.q_norm, torch.nn.Identity) or \
+             not isinstance(block.k_norm, torch.nn.Identity):
+            raise ValueError(f"{name}: disabled QK norm must use identity modules")
         if not block.use_swiglu:
             raise ValueError(f"{name}: the native CUDA transformer backend requires SwiGLU")
         if block.num_heads <= 0 or block.num_kv_heads <= 0 or block.num_heads % block.num_kv_heads != 0:
@@ -408,12 +467,22 @@ def main(args):
         writeln(block.head_dim)
         writeln(1 if block.use_rope else 0)
         writeln(1 if block.learnable_rope else 0)
+        if version >= 105:
+            writeln(1 if block.use_qk_norm else 0)
+            layer_name = name[:-len(".attention")]
+            if int8_calibration is None or layer_name not in int8_calibration:
+                raise ValueError(f"{name}: missing INT8 calibration")
+            writeln(int8_calibration[layer_name]["attentionInputQuantMaxAbs"])
+            writeln(int8_calibration[layer_name]["attentionOutputQuantMaxAbs"])
 
         write_transformer_norm(name+".norm1", block.norm1)
         write_matmul(name+".q_proj", block.q_proj.weight)
         write_matmul(name+".k_proj", block.k_proj.weight)
         write_matmul(name+".v_proj", block.v_proj.weight)
         write_matmul(name+".out_proj", block.out_proj.weight)
+        if version >= 105 and block.use_qk_norm:
+            write_transformer_norm(name+".q_norm",block.q_norm)
+            write_transformer_norm(name+".k_norm",block.k_norm)
 
         if block.use_rope:
             if block.learnable_rope:
@@ -427,6 +496,8 @@ def main(args):
                 writeln(name+".rope_theta")
                 writeln(block.rope_theta)
 
+    used_int8_calibration_layers = set()
+
     def write_transformer_ffn_block(name,block):
         validate_combined_transformer(name, block)
         writeln("transformer_ffn_block")
@@ -434,6 +505,16 @@ def main(args):
         writeln(block.q_proj.in_features)
         writeln(block.ffn_dim)
         writeln(1 if block.use_swiglu else 0)
+        if version >= 105:
+            # This is a model semantic, never a PTQ override. Zero means the
+            # checkpoint has no SwiGLU operand clipping.
+            writeln(0.0 if block.swiglu_clip is None else float(block.swiglu_clip))
+            layer_name = name[:-len(".ffn")]
+            if int8_calibration is None or layer_name not in int8_calibration:
+                raise ValueError(f"{name}: missing INT8 calibration")
+            writeln(int8_calibration[layer_name]["ffnInputQuantMaxAbs"])
+            writeln(int8_calibration[layer_name]["productQuantMaxAbs"])
+            used_int8_calibration_layers.add(layer_name)
 
         write_transformer_norm(name+".norm", block.norm2)
         write_matmul(name+".ffn_linear1", block.ffn_linear1.weight)
@@ -610,6 +691,10 @@ def main(args):
     else:
         logging.info("Writing model")
         write_model(model)
+    if int8_calibration is not None and used_int8_calibration_layers != set(transformer_layer_order):
+        raise ValueError(
+            "INT8 calibration consumption did not match Transformer wire order"
+        )
     if int8_pt_clip4:
         v102_body = f.getvalue()
         f.close()
