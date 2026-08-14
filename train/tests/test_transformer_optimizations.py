@@ -48,6 +48,28 @@ class TransformerOptimizationTests(unittest.TestCase):
         self.assertNotIn("b11c96h3tfr-clip4", modelconfigs.config_of_name)
         self.assertNotIn("b11c96h3tfr-clip7", modelconfigs.config_of_name)
 
+    def test_b36c384h12_transformer_config_and_variants(self):
+        base = modelconfigs.config_of_name["b36c384h12tfrs"]
+        self.assertEqual(base["trunk_num_channels"], 384)
+        self.assertEqual(base["transformer_ffn_channels"], 1024)
+        self.assertEqual(base["transformer_heads"], 12)
+        self.assertEqual(base["transformer_kv_heads"], 12)
+        self.assertEqual(
+            base["block_kind"],
+            [[f"rconv{i}", "transformerropesg"] for i in range(1, 37)],
+        )
+
+        production = modelconfigs.config_of_name[
+            "b36c384h12tflrs-bng-silu-v102-qkn-clip4"
+        ]
+        self.assertTrue(production["learnable_rope"])
+        self.assertEqual(production["norm_kind"], "bnorm")
+        self.assertTrue(production["bnorm_use_gamma"])
+        self.assertEqual(production["activation"], "silu")
+        self.assertEqual(production["version"], 102)
+        self.assertTrue(production["use_qk_norm"])
+        self.assertEqual(production["swiglu_clip"], 4.0)
+
     def test_full_clip_model_config_suffix(self):
         swiglu_name = "b11c96h4tflrs-bng-silu"
         non_swiglu_name = "b11c96h3tfr"

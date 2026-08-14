@@ -1462,6 +1462,31 @@ b18c384h12tfrs = {
     "v2_size":128,
 }
 
+b36c384h12tfrs = {
+    "version":15,
+    "norm_kind":"fixup",
+    "bnorm_epsilon": 1e-4,
+    "bnorm_running_avg_momentum": 0.001,
+    "initial_conv_1x1": False,
+    "trunk_num_channels":384,
+    "mid_num_channels":384,
+    "gpool_num_channels":64,
+    "transformer_ffn_channels":1024,
+    "transformer_heads":12,
+    "transformer_kv_heads":12,
+    "use_attention_pool":False,
+    "num_attention_pool_heads":4,
+    "block_kind": [
+        [f"rconv{i}","transformerropesg"] for i in range(1,37)
+    ],
+    "p1_num_channels":48,
+    "g1_num_channels":48,
+    "v1_num_channels":96,
+    "sbv2_num_channels":112,
+    "num_scorebeliefs":8,
+    "v2_size":128,
+}
+
 b10c768h24tfrs = {
     "version":15,
     "norm_kind":"fixup",
@@ -2119,6 +2144,7 @@ base_config_of_name = {
 # 70M parameter:
     "b10c768h24tfrs":b10c768h24tfrs, 
     "b21c512h16tfrs":b21c512h16tfrs, 
+    "b36c384h12tfrs":b36c384h12tfrs,
     "b40c384h12tfrs":b40c384h12tfrs, 
     "b40c384h12tfr":b40c384h12tfr, 
     "b80c256h8tfrs":b80c256h8tfrs, 
