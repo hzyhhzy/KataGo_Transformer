@@ -1,3 +1,23 @@
 __pycache__/
 train/__pycache__/
 runtime_data/
+
+# Local audit, benchmark, build, and verification scratch directories.
+/.audit_*/
+/.b28fresh-*/
+/.b28test-*/
+/.d4_*_probe/
+/.fa4_*_probe/
+/.review_*/
+/.t/
+/.tmp_*/
+/.trt_*/
+/b28_*_tmp/
+/pytest-cache-files-*/
+/qkn_v*_fx/
+/torchinductor_*/
+
+# Root-level generated objects and one-off helper scripts.
+/*.obj
+/tmp_*.py
+/tmp_*.sh
