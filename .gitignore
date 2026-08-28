@@ -11,13 +11,18 @@ runtime_data/
 /.review_*/
 /.t/
 /.tmp_*/
+/.tmp_*
 /.trt_*/
 /b28_*_tmp/
 /pytest-cache-files-*/
 /qkn_v*_fx/
 /torchinductor_*/
+/tmp/
+/train/tests/tmp*/
 
 # Root-level generated objects and one-off helper scripts.
 /*.obj
+/*.bundle
+/*.patch
 /tmp_*.py
 /tmp_*.sh

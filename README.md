@@ -159,7 +159,47 @@ The FP32 rewrite supports fixed `tfrs`, per-head learnable-RoPE `tflrs`, QK-Norm
 
 These outputs contain ONNX Runtime-specific contributed operators and target `CPUExecutionProvider`. They are not portable TensorRT graphs; keep the original exported ONNX and use a separate standard ONNX/QDQ calibration pipeline for TensorRT.
 
-### 3. TensorRT-ONNX Engine
+### 3. Native v106 CPU-PTQ calibration
+
+`./train/calibrate_cpu_ptq_v106.py` produces the GPTQ projection manifest used
+by KataGo's specialized native v106 CPU-PTQ backend. It loads the SWA model
+directly from a checkpoint and fake-quantizes the same projection and attention
+paths used by the engine while collecting activation moments.
+
+The qualified defaults use 4,096 full-board calibration rows:
+
+```bash
+# AVX-512 VNNI: symmetric S8 weights, act-order GPTQ, damping 0.05
+python train/calibrate_cpu_ptq_v106.py \
+    --checkpoint checkpoint.ckpt \
+    --data runtime_data/calibration.npz \
+    --output runtime_data/model-s8-gptq.npz \
+    --qmax 127 --board-size 15
+
+# Strict AVX2: saturation-safe symmetric S7 weights, damping 0.001
+python train/calibrate_cpu_ptq_v106.py \
+    --checkpoint checkpoint.ckpt \
+    --data runtime_data/calibration.npz \
+    --output runtime_data/model-s7-gptq.npz \
+    --qmax 63 --board-size 15
+```
+
+Pass the resulting manifest to `python/convert_cpu_ptq_v106.py` in the KataGo
+engine repository together with a native v105 export from the same checkpoint.
+The converter checks every source projection SHA-256 before producing the v106
+`.bin.gz`; a manifest cannot silently be paired with another model. GPTQ only
+changes stored projection codes and scales, so it adds no inference-time work.
+The v106 container itself does not store a board size; `--board-size` selects
+calibration data and model positional geometry only.
+
+Generated manifests and reports should stay under the gitignored
+`runtime_data/` directory. Run the focused unit tests with:
+
+```bash
+python -m unittest train.tests.test_cpu_ptq_v106 -v
+```
+
+### 4. TensorRT-ONNX Engine
 A modified KataGo engine supporting ONNX models is available here (source code only, compilation required):
 [KataGomo (branch: go_onnx_test)](https://github.com/hzyhhzy/KataGomo/tree/go_onnx_test)
 *(Mostly developed by @yehu3d)*
