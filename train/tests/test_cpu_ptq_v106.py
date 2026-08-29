@@ -8,10 +8,53 @@ import torch
 TRAIN_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(TRAIN_DIR))
 
-from calibrate_cpu_ptq_v106 import Moments, gptq_matrix, symmetric_codes
+from calibrate_cpu_ptq_v106 import (
+    PROJECTION_ROLES,
+    Moments,
+    ProjectionQuantController,
+    cpu_ptq_model_version,
+    gptq_matrix,
+    symmetric_codes,
+)
 
 
 class CpuPtqV106Tests(unittest.TestCase):
+    def test_cpu_ptq_wire_version_follows_source_input_version(self) -> None:
+        self.assertEqual(cpu_ptq_model_version(102), 106)
+        self.assertEqual(cpu_ptq_model_version(11), 206)
+        with self.assertRaises(ValueError):
+            cpu_ptq_model_version(15)
+
+    def test_projection_controller_accepts_model_sized_overrides(self) -> None:
+        class Block(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                for role in PROJECTION_ROLES:
+                    setattr(self, role, torch.nn.Linear(2, 2, bias=False))
+
+        class Model(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.blocks = torch.nn.ModuleList([Block()])
+
+        model = Model()
+        original = model.blocks[0].q_proj(torch.ones(1, 2)).detach()
+        overrides = {
+            f"blocks.0.{role}": (
+                torch.zeros(2, 2, dtype=torch.int8),
+                torch.ones(2, dtype=torch.float32),
+            )
+            for role in PROJECTION_ROLES
+        }
+        controller = ProjectionQuantController(model, 127, overrides)
+        try:
+            quantized = model.blocks[0].q_proj(torch.ones(1, 2))
+            self.assertTrue(torch.equal(quantized, torch.zeros_like(quantized)))
+        finally:
+            controller.close()
+        restored = model.blocks[0].q_proj(torch.ones(1, 2)).detach()
+        torch.testing.assert_close(restored, original)
+
     def test_symmetric_codes_are_per_row_and_ties_to_even(self) -> None:
         values = torch.tensor(
             [[0.0, 0.0], [1.0, -0.5], [2.0, 1.0]],

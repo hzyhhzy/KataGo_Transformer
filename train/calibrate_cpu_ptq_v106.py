@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Generate GPTQ projection overrides for a native CPU-PTQ v106 model.
+"""Generate GPTQ projection overrides for a native CPU-PTQ model.
 
-The output is an intermediate NPZ manifest consumed by KataGo's
-``python/convert_cpu_ptq_v106.py --gptq-overrides``. The final ``.bin.gz``
-remains board-size agnostic: the board size here only selects calibration
-activations for a particular runtime profile.
+The same quantization recipe is shared by CPU-PTQ v106 (source model v102)
+and v206 (source model v11). The output is an intermediate NPZ projection
+manifest; selecting and writing the native wire version is a separate export
+step. The final ``.bin.gz`` remains board-size agnostic: the board size here
+only selects calibration activations for a particular runtime profile.
 
 The calibration forward pass mirrors the CPU-PTQ projection and attention
 quantizers. Projection activations use one symmetric S8 scale per token. S8
@@ -48,6 +49,18 @@ GROUP_HOOK = {
     "upgate": "ffn_linear1",
     "down": "ffn_linear2",
 }
+
+
+def cpu_ptq_model_version(source_model_version: int) -> int:
+    """Map a training model/input ABI to its reserved CPU-PTQ wire version."""
+    if source_model_version == 102:
+        return 106
+    if source_model_version == 11:
+        return 206
+    raise ValueError(
+        "CPU-PTQ supports source model versions 102 and 11 only, got "
+        f"{source_model_version}"
+    )
 
 
 def sha256_file(path: Path) -> str:
@@ -132,13 +145,42 @@ def symmetric_codes(
 class ProjectionQuantController:
     """Fake-quantize the operations that feed GPTQ activation moments."""
 
-    def __init__(self, model: Any, qmax: int) -> None:
+    def __init__(
+        self,
+        model: Any,
+        qmax: int,
+        quantized_overrides: dict[
+            str, tuple[torch.Tensor, torch.Tensor]
+        ] | None = None,
+    ) -> None:
+        if qmax not in (63, 127):
+            raise ValueError(f"CPU-PTQ qmax must be 63 or 127, got {qmax}")
         self.qmax = qmax
+        self.quantized_overrides = quantized_overrides
+        if quantized_overrides is not None:
+            expected = {
+                f"blocks.{block_index}.{role}"
+                for block_index in range(len(model.blocks))
+                for role in PROJECTION_ROLES
+            }
+            actual = set(quantized_overrides)
+            if actual != expected:
+                raise ValueError(
+                    "CPU-PTQ projection override set mismatch: "
+                    f"missing={sorted(expected - actual)}, "
+                    f"extra={sorted(actual - expected)}"
+                )
         self.original_sdpa = functional.scaled_dot_product_attention
         self.original_forwards: list[tuple[Any, Any]] = []
         self.linear_names: list[str] = []
-        self._install_linears(model)
-        functional.scaled_dot_product_attention = self.attention
+        try:
+            self._install_linears(model)
+            functional.scaled_dot_product_attention = self.attention
+        except Exception:
+            while self.original_forwards:
+                module, original = self.original_forwards.pop()
+                module.forward = original
+            raise
 
     def close(self) -> None:
         functional.scaled_dot_product_attention = self.original_sdpa
@@ -162,17 +204,44 @@ class ProjectionQuantController:
                     raise TypeError(f"blocks.{block_index}.{role} is not Linear")
                 name = f"blocks.{block_index}.{role}"
                 weight = module.weight.detach().float()
-                maximum = weight.abs().amax(dim=1, keepdim=True)
-                weight_scale = torch.where(
-                    maximum > 0.0,
-                    maximum / float(self.qmax),
-                    torch.ones_like(maximum),
-                )
-                weight_codes = torch.clamp(
-                    torch.round(weight / weight_scale),
-                    -self.qmax,
-                    self.qmax,
-                )
+                if self.quantized_overrides is None:
+                    maximum = weight.abs().amax(dim=1, keepdim=True)
+                    weight_scale = torch.where(
+                        maximum > 0.0,
+                        maximum / float(self.qmax),
+                        torch.ones_like(maximum),
+                    )
+                    weight_codes = torch.clamp(
+                        torch.round(weight / weight_scale),
+                        -self.qmax,
+                        self.qmax,
+                    )
+                else:
+                    weight_codes, weight_scale = self.quantized_overrides[name]
+                    weight_codes = weight_codes.to(
+                        device=weight.device, dtype=weight.dtype
+                    )
+                    weight_scale = weight_scale.to(
+                        device=weight.device, dtype=weight.dtype
+                    ).reshape(-1, 1)
+                    if weight_codes.shape != weight.shape:
+                        raise ValueError(
+                            f"{name}: code shape {tuple(weight_codes.shape)} "
+                            f"does not match weight shape {tuple(weight.shape)}"
+                        )
+                    if weight_scale.shape != (weight.shape[0], 1):
+                        raise ValueError(
+                            f"{name}: scale shape {tuple(weight_scale.shape)} "
+                            f"does not match {(weight.shape[0], 1)}"
+                        )
+                    if not torch.isfinite(weight_scale).all() or not torch.all(
+                        weight_scale > 0.0
+                    ):
+                        raise ValueError(f"{name}: scales must be finite and positive")
+                    if torch.any(weight_codes != torch.round(weight_codes)):
+                        raise ValueError(f"{name}: projection codes must be integral")
+                    if int(weight_codes.abs().max().item()) > self.qmax:
+                        raise ValueError(f"{name}: projection code exceeds qmax")
                 bias = module.bias
                 self.original_forwards.append((module, module.forward))
 
@@ -462,6 +531,8 @@ def main() -> None:
     if swa is None:
         raise ValueError("checkpoint has no SWA model")
     model = swa.to(device).eval()
+    source_model_version = int(model.config["version"])
+    target_model_version = cpu_ptq_model_version(source_model_version)
 
     damp = args.damp
     if damp is None:
@@ -557,6 +628,8 @@ def main() -> None:
         "boardSize": args.board_size,
         "calibrationOffset": args.calib_offset,
         "calibrationSamples": args.calib_samples,
+        "sourceModelVersion": source_model_version,
+        "cpuPtqModelVersion": target_model_version,
         "qmax": args.qmax,
         "recipe": recipe,
         "projectionCount": len(names),

@@ -159,38 +159,81 @@ The FP32 rewrite supports fixed `tfrs`, per-head learnable-RoPE `tflrs`, QK-Norm
 
 These outputs contain ONNX Runtime-specific contributed operators and target `CPUExecutionProvider`. They are not portable TensorRT graphs; keep the original exported ONNX and use a separate standard ONNX/QDQ calibration pipeline for TensorRT.
 
-### 3. Native v106 CPU-PTQ calibration
+### 3. Native CPU-PTQ calibration and loss validation
 
-`./train/calibrate_cpu_ptq_v106.py` produces the GPTQ projection manifest used
-by KataGo's specialized native v106 CPU-PTQ backend. It loads the SWA model
-directly from a checkpoint and fake-quantizes the same projection and attention
-paths used by the engine while collecting activation moments.
+`./train/calibrate_cpu_ptq.py` produces the GPTQ projection manifest used by
+KataGo's specialized native CPU-PTQ backends. It loads the SWA model directly
+from a checkpoint and fake-quantizes the same projection and attention paths
+used by the engine while collecting activation moments. The legacy
+`calibrate_cpu_ptq_v106.py` entry point remains available.
+
+The native CPU-PTQ wire version follows the source model/input ABI:
+
+- source model v102 produces CPU-PTQ v106;
+- source model v11 produces CPU-PTQ v206.
+
+Calibration manifests are version-neutral projection data. The calibration
+report records both `sourceModelVersion` and `cpuPtqModelVersion` so results
+cannot be mislabeled.
 
 The qualified defaults use 4,096 full-board calibration rows:
 
 ```bash
 # AVX-512 VNNI: symmetric S8 weights, act-order GPTQ, damping 0.05
-python train/calibrate_cpu_ptq_v106.py \
+python train/calibrate_cpu_ptq.py \
     --checkpoint checkpoint.ckpt \
     --data runtime_data/calibration.npz \
     --output runtime_data/model-s8-gptq.npz \
     --qmax 127 --board-size 15
 
 # Strict AVX2: saturation-safe symmetric S7 weights, damping 0.001
-python train/calibrate_cpu_ptq_v106.py \
+python train/calibrate_cpu_ptq.py \
     --checkpoint checkpoint.ckpt \
     --data runtime_data/calibration.npz \
     --output runtime_data/model-s7-gptq.npz \
     --qmax 63 --board-size 15
 ```
 
-Pass the resulting manifest to `python/convert_cpu_ptq_v106.py` in the KataGo
-engine repository together with a native v105 export from the same checkpoint.
-The converter checks every source projection SHA-256 before producing the v106
-`.bin.gz`; a manifest cannot silently be paired with another model. GPTQ only
-changes stored projection codes and scales, so it adds no inference-time work.
-The v106 container itself does not store a board size; `--board-size` selects
-calibration data and model positional geometry only.
+For source v102, pass the resulting manifest to
+`python/convert_cpu_ptq_v106.py` in the KataGo engine repository together with
+a native v105 export from the same checkpoint. The converter checks every
+source projection SHA-256; a manifest cannot silently be paired with another
+model. GPTQ only changes stored projection codes and scales, so it adds no
+inference-time work. CPU-PTQ containers do not store a board size;
+`--board-size` selects calibration data and model positional geometry only.
+
+For an Ataxx source-v11 checkpoint, `export_cpu_ptq_v206.py` validates the
+checkpoint geometry and every manifest projection hash, then writes the
+dedicated v206 S8 model and a provenance JSON report:
+
+```bash
+python train/export_cpu_ptq_v206.py \
+    --checkpoint checkpoint.ckpt \
+    --manifest runtime_data/model-s8-gptq.npz \
+    --output runtime_data/model-v206.bin.gz \
+    --model-name ataxx-b16c128h4-v206
+```
+
+The current v206 exporter accepts the qualified Ataxx 7x7
+`b11c96h3-f256` and `b16c128h4-f384` profiles and full-range symmetric S8
+manifests (`qmax=127`). Its gzip stream is deterministic and the native engine
+repackages projection matrices for its VNNI microkernel when loading.
+
+Loss validation does not require a converter, native model, or inference
+engine. `evaluate_cpu_ptq.py` reads one or more manifests, verifies their
+projection hashes against the checkpoint, and evaluates FP32 and fake-quantized
+models through the checkpoint's own input version and KataGo's official
+training metrics:
+
+```bash
+python train/evaluate_cpu_ptq.py \
+    --checkpoint checkpoint.ckpt \
+    --data runtime_data/validation.npz \
+    --manifest vnni-s8=runtime_data/model-s8-gptq.npz \
+    --manifest avx2-s7=runtime_data/model-s7-gptq.npz \
+    --output runtime_data/cpu-ptq-loss.json \
+    --board-size 15 --samples 65536
+```
 
 Generated manifests and reports should stay under the gitignored
 `runtime_data/` directory. Run the focused unit tests with:
