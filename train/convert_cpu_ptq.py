@@ -40,7 +40,6 @@ class FormatSpec:
     source_checkpoint_version: int
     spatial_inputs: int
     global_inputs: int
-    profiles: dict[tuple[int, int, int, int], str]
 
 
 FORMAT_BY_BASE_VERSION = {
@@ -50,11 +49,6 @@ FORMAT_BY_BASE_VERSION = {
         102,
         22,
         39,
-        {
-            (11, 96, 3, 256): "b11c96h3-f256",
-            (16, 128, 4, 384): "b16c128h4-f384",
-            (24, 192, 6, 512): "b24c192h6-f512",
-        },
     ),
     11: FormatSpec(
         11,
@@ -62,10 +56,6 @@ FORMAT_BY_BASE_VERSION = {
         11,
         22,
         19,
-        {
-            (11, 96, 3, 256): "b11c96h3-f256",
-            (16, 128, 4, 384): "b16c128h4-f384",
-        },
     ),
 }
 FORMAT_BY_QUANTIZED_VERSION = {
@@ -340,11 +330,6 @@ def validate_geometry(
     channels = first.inputs
     ffn = by_name["blocks.0.ffn_linear1"].outputs
     heads = attention_by_block[0].heads
-    profile_key = (len(block_ids), channels, heads, ffn)
-    if profile_key not in spec.profiles:
-        raise ValueError(
-            f"unsupported v{expected_version} CPU-PTQ profile {profile_key}"
-        )
     for block in block_ids:
         attention = attention_by_block[block]
         if (
@@ -373,7 +358,7 @@ def validate_geometry(
         qmaxes = {projection.qmax for projection in projections}
         if len(qmaxes) != 1:
             raise ValueError("one model may not mix S7 and S8 projection blocks")
-    return spec.profiles[profile_key]
+    return f"b{len(block_ids)}c{channels}h{heads}-f{ffn}"
 
 
 def load_manifest(path: Path) -> Manifest:

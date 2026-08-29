@@ -1,6 +1,8 @@
 from pathlib import Path
+import shutil
 import sys
 import unittest
+import uuid
 
 import numpy as np
 import torch
@@ -21,7 +23,9 @@ from convert_cpu_ptq import (
     FORMAT_BY_BASE_VERSION,
     FP32_MARKER,
     S7_MARKER,
+    convert,
     parse_header,
+    read_model,
     scan_attention_headers,
     scan_projections,
 )
@@ -159,6 +163,92 @@ class CpuPtqV106Tests(unittest.TestCase):
         )
         self.assertTrue(attention.use_rope)
         self.assertFalse(attention.learnable_rope)
+
+    def test_v106_v206_share_qkn_clip_wire_for_arbitrary_profile(self) -> None:
+        blocks = 2
+        channels = 64
+        heads = 2
+        ffn = 80
+
+        def matrix(name: str, inputs: int, outputs: int) -> bytes:
+            values = np.linspace(
+                -1.0,1.0,inputs * outputs,dtype=np.dtype("<f4")
+            )
+            return (
+                f"{name}\n{inputs}\n{outputs}\n".encode("ascii")
+                + FP32_MARKER
+                + values.tobytes(order="C")
+                + b"\n"
+            )
+
+        def norm(name: str, width: int) -> bytes:
+            return (
+                f"{name}\n{width}\n1e-06\n".encode("ascii")
+                + FP32_MARKER
+                + np.ones(width,dtype=np.dtype("<f4")).tobytes(order="C")
+                + b"\n"
+            )
+
+        body = bytearray()
+        for block in range(blocks):
+            attention = f"model.blocks.{block}.attention"
+            body.extend(
+                (
+                    "transformer_attention_block\n"
+                    f"{attention}\n{heads}\n{heads}\n32\n32\n1\n0\n"
+                    "@V102_QKN_CLIP@\n1\n"
+                ).encode("ascii")
+            )
+            body.extend(norm(attention + ".norm1",channels))
+            for role in ("q_proj","k_proj","v_proj","out_proj"):
+                body.extend(matrix(attention + "." + role,channels,channels))
+            body.extend(norm(attention + ".q_norm",32))
+            body.extend(norm(attention + ".k_norm",32))
+            body.extend((attention + ".rope_theta\n100.0\n").encode("ascii"))
+
+            ffn_name = f"model.blocks.{block}.ffn"
+            body.extend(
+                (
+                    "transformer_ffn_block\n"
+                    f"{ffn_name}\n{channels}\n{ffn}\n1\n"
+                    "@V102_QKN_CLIP@\n4.0\n"
+                ).encode("ascii")
+            )
+            body.extend(norm(ffn_name + ".norm",channels))
+            body.extend(matrix(ffn_name + ".ffn_linear1",channels,ffn))
+            body.extend(matrix(ffn_name + ".ffn_linear_gate",channels,ffn))
+            body.extend(matrix(ffn_name + ".ffn_linear2",ffn,channels))
+
+        temp_dir = TRAIN_DIR / "tests" / ("cpu_ptq_wire_" + uuid.uuid4().hex)
+        temp_dir.mkdir()
+        try:
+            outputs = []
+            for base_version,global_inputs,target_version in (
+                (102,39,106),(11,19,206)
+            ):
+                source = temp_dir / f"v{base_version}.bin"
+                target = temp_dir / f"v{target_version}.bin.gz"
+                source.write_bytes(
+                    f"toy\n{base_version}\n22\n{global_inputs}\n".encode("ascii")
+                    + body
+                )
+                report = convert(
+                    source,target,manifest_path=None,projection_bits=7,
+                    force=False,compression_level=1,write_report=False,
+                )
+                self.assertEqual(report["profile"],"b2c64h2-f80")
+                self.assertEqual(report["modelVersion"],target_version)
+                payload = read_model(target)
+                self.assertEqual(parse_header(payload).version,target_version)
+                self.assertEqual(payload.count(b"@V102_QKN_CLIP@\n"),4)
+                self.assertTrue(all(
+                    projection.marker == S7_MARKER
+                    for projection in scan_projections(payload)
+                ))
+                outputs.append(payload.split(b"\n",4)[4])
+            self.assertEqual(outputs[0],outputs[1])
+        finally:
+            shutil.rmtree(temp_dir,ignore_errors=True)
 
 
 if __name__ == "__main__":

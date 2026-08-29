@@ -62,7 +62,9 @@ parser.add_argument(
 )
 
 
-V102_TRANSFORMER_EXTENSION_MARKER = "@V102_QKN_CLIP@"
+# Keep the established wire token for backward compatibility. Despite its
+# historical spelling, v102 and v11 use this same Transformer extension.
+TRANSFORMER_QKN_CLIP_EXTENSION_MARKER = "@V102_QKN_CLIP@"
 parser.add_argument(
     '-int8-pt-clip4',
     help='Retired legacy v104 export option; use CUDA v105/v205 calibration instead',
@@ -164,15 +166,17 @@ def main(args):
 
     # Ignore what's in the config if less than 11 since a lot of testing models
     # are on old version but actually have various new architectures.
-    # Q/K RMSNorm and SwiGLU clipping are FP16 transformer semantics carried by
-    # a marker-delimited v102 extension. CUDA INT8 v105/v205 always requires
-    # calibration ranges and is selected independently from QKN/clip.
-    needs_extended_v102 = bool(model_config.get("use_qk_norm",False)) or \
+    # Q/K RMSNorm and SwiGLU clipping are Transformer semantics carried by the
+    # same marker-delimited extension in floating v102 and v11. CUDA INT8
+    # v105/v205 carries the same semantics in its calibrated descriptor and is
+    # selected independently from QKN/clip.
+    needs_transformer_extension = bool(model_config.get("use_qk_norm",False)) or \
         any(block.swiglu_clip is not None for _, block in transformer_layers)
     cuda_int8 = int8_calibration is not None
-    if needs_extended_v102 and not cuda_int8 and source_checkpoint_version != 102:
+    if needs_transformer_extension and not cuda_int8 and \
+       source_checkpoint_version not in (11,102):
         raise ValueError(
-            "FP16 QKN/clip export requires a native v102 checkpoint"
+            "floating QKN/clip export requires a native v102 or v11 checkpoint"
         )
     version = max(model_config["version"],11)
     true_version = version
@@ -496,8 +500,8 @@ def main(args):
                 raise ValueError(f"{name}: missing CUDA INT8 calibration")
             writeln(int8_calibration[layer_name]["attentionInputQuantMaxAbs"])
             writeln(int8_calibration[layer_name]["attentionOutputQuantMaxAbs"])
-        elif version == 102 and block.use_qk_norm:
-            writeln(V102_TRANSFORMER_EXTENSION_MARKER)
+        elif version in (11,102) and block.use_qk_norm:
+            writeln(TRANSFORMER_QKN_CLIP_EXTENSION_MARKER)
             writeln(1)
 
         write_transformer_norm(name+".norm1", block.norm1)
@@ -505,7 +509,7 @@ def main(args):
         write_matmul(name+".k_proj", block.k_proj.weight)
         write_matmul(name+".v_proj", block.v_proj.weight)
         write_matmul(name+".out_proj", block.out_proj.weight)
-        if (cuda_int8 or version == 102) and block.use_qk_norm:
+        if (cuda_int8 or version in (11,102)) and block.use_qk_norm:
             write_transformer_norm(name+".q_norm",block.q_norm)
             write_transformer_norm(name+".k_norm",block.k_norm)
 
@@ -540,8 +544,8 @@ def main(args):
             writeln(int8_calibration[layer_name]["ffnInputQuantMaxAbs"])
             writeln(int8_calibration[layer_name]["productQuantMaxAbs"])
             used_int8_calibration_layers.add(layer_name)
-        elif version == 102 and block.swiglu_clip is not None:
-            writeln(V102_TRANSFORMER_EXTENSION_MARKER)
+        elif version in (11,102) and block.swiglu_clip is not None:
+            writeln(TRANSFORMER_QKN_CLIP_EXTENSION_MARKER)
             writeln(float(block.swiglu_clip))
 
         write_transformer_norm(name+".norm", block.norm2)

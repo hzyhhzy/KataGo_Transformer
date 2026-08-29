@@ -517,7 +517,9 @@ class NativeTransformerExportTests(unittest.TestCase):
         temp_dir.mkdir()
         try:
             checkpoint = temp_dir / "checkpoint-v11.ckpt"
-            config = self._tiny_config(version=11)
+            config = self._tiny_config(
+                version=11,use_qk_norm=True,swiglu_clip=7.0
+            )
             self._save_checkpoint(checkpoint, config)
             calibration_json = temp_dir / "calibration-v205.json"
             self._write_calibration_json(checkpoint,config,calibration_json)
@@ -535,6 +537,20 @@ class NativeTransformerExportTests(unittest.TestCase):
             self.assertEqual(float_export.returncode, 0, float_export.stdout)
             float_raw = (temp_dir / "float" / "model.bin").read_bytes()
             self.assertEqual(float_raw.split(b"\n", 3)[1], b"11")
+            self.assertIn(
+                b"transformer_attention_block\n"
+                b"model.blocks.0.attention\n2\n2\n4\n4\n1\n1\n"
+                b"@V102_QKN_CLIP@\n1\n",
+                float_raw,
+            )
+            self.assertIn(b"model.blocks.0.attention.q_norm\n4\n",float_raw)
+            self.assertIn(b"model.blocks.0.attention.k_norm\n4\n",float_raw)
+            self.assertIn(
+                b"transformer_ffn_block\n"
+                b"model.blocks.0.ffn\n8\n12\n1\n"
+                b"@V102_QKN_CLIP@\n7.0\n",
+                float_raw,
+            )
 
             cuda_export = subprocess.run(
                 self._export_command(
@@ -553,12 +569,92 @@ class NativeTransformerExportTests(unittest.TestCase):
             cuda_raw = (temp_dir / "cuda" / "model.bin").read_bytes()
             self.assertEqual(cuda_raw.split(b"\n", 3)[1], b"205")
             self.assertIn(
+                b"transformer_attention_block\n"
+                b"model.blocks.0.attention\n2\n2\n4\n4\n1\n1\n"
+                b"1\n10.0\n20.0\n",
+                cuda_raw,
+            )
+            self.assertIn(
                 b"transformer_ffn_block\n"
-                b"model.blocks.0.ffn\n8\n12\n1\n0.0\n30.0\n40.0\n",
+                b"model.blocks.0.ffn\n8\n12\n1\n7.0\n30.0\n40.0\n",
                 cuda_raw,
             )
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_transformer_wire_matches_between_v102_v11_and_v105_v205(self):
+        temp_dir = TRAIN_DIR / "tests" / ("native_export_" + uuid.uuid4().hex)
+        temp_dir.mkdir()
+        try:
+            base_config = self._tiny_config(
+                version=102,use_qk_norm=True,swiglu_clip=7.0
+            )
+            base_model = Model(base_config,pos_len=5)
+            base_model.initialize()
+            base_state = base_model.state_dict()
+            payloads = {}
+
+            for source_version in (102,11):
+                config = dict(base_config)
+                config["version"] = source_version
+                model = Model(config,pos_len=5)
+                model.initialize()
+                state = model.state_dict()
+                with torch.no_grad():
+                    for name,value in state.items():
+                        if name in base_state and value.shape == base_state[name].shape:
+                            value.copy_(base_state[name])
+
+                checkpoint = temp_dir / f"checkpoint-v{source_version}.ckpt"
+                torch.save(
+                    {"config": config,"model": state,"train_state": {}},
+                    checkpoint,
+                )
+                calibration = temp_dir / f"calibration-v{source_version}.json"
+                self._write_calibration_json(checkpoint,config,calibration)
+
+                for kind,calibration_path in (
+                    ("float",None),("cuda",calibration)
+                ):
+                    export_dir = temp_dir / f"v{source_version}-{kind}"
+                    completed = subprocess.run(
+                        self._export_command(
+                            checkpoint,
+                            export_dir,
+                            gzip_output=False,
+                            calibration_json=calibration_path,
+                        ),
+                        cwd=TRAIN_DIR,
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                    self.assertEqual(completed.returncode,0,completed.stdout)
+                    payloads[(source_version,kind)] = (
+                        export_dir / "model.bin"
+                    ).read_bytes()
+
+            self.assertEqual(payloads[(102,"float")].split(b"\n",3)[1],b"102")
+            self.assertEqual(payloads[(11,"float")].split(b"\n",3)[1],b"11")
+            self.assertEqual(payloads[(102,"cuda")].split(b"\n",3)[1],b"105")
+            self.assertEqual(payloads[(11,"cuda")].split(b"\n",3)[1],b"205")
+
+            def transformer_wire(payload):
+                start = payload.index(b"transformer_attention_block\n")
+                end = payload.index(b"model.norm_trunkfinal\n",start)
+                return payload[start:end]
+
+            self.assertEqual(
+                transformer_wire(payloads[(102,"float")]),
+                transformer_wire(payloads[(11,"float")]),
+            )
+            self.assertEqual(
+                transformer_wire(payloads[(102,"cuda")]),
+                transformer_wire(payloads[(11,"cuda")]),
+            )
+        finally:
+            shutil.rmtree(temp_dir,ignore_errors=True)
 
     def test_qknorm_clip7_exports_v102_fp16_and_v105_only_with_int8_calibration(self):
         temp_dir = TRAIN_DIR / "tests" / ("native_export_" + uuid.uuid4().hex)
