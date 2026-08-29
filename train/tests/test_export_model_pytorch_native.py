@@ -494,7 +494,7 @@ class NativeTransformerExportTests(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def test_qknorm_clip7_exports_v105_under_python_optimize(self):
+    def test_qknorm_clip7_exports_v102_fp16_and_v105_only_with_int8_calibration(self):
         temp_dir = TRAIN_DIR / "tests" / ("native_export_" + uuid.uuid4().hex)
         temp_dir.mkdir()
         try:
@@ -518,7 +518,7 @@ class NativeTransformerExportTests(unittest.TestCase):
                 "-pos-len",
                 "5",
             ]
-            rejected = subprocess.run(
+            fp16 = subprocess.run(
                 command,
                 cwd=TRAIN_DIR,
                 check=False,
@@ -526,12 +526,25 @@ class NativeTransformerExportTests(unittest.TestCase):
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            self.assertNotEqual(rejected.returncode,0)
+            self.assertEqual(fp16.returncode,0,fp16.stdout)
+            fp16_raw = (temp_dir / "export" / "model.bin").read_bytes()
+            self.assertTrue(fp16_raw.startswith(b"native-v105-test\n102\n"))
             self.assertIn(
-                "requires -int8-calibration-json",
-                rejected.stdout,
+                b"transformer_attention_block\n"
+                b"model.blocks.0.attention\n2\n2\n4\n4\n1\n1\n"
+                b"@V102_QKN_CLIP@\n1\n",
+                fp16_raw,
             )
-            self.assertFalse((temp_dir / "export" / "model.bin").exists())
+            self.assertIn(b"model.blocks.0.attention.q_norm\n4\n",fp16_raw)
+            self.assertIn(b"model.blocks.0.attention.k_norm\n4\n",fp16_raw)
+            self.assertIn(
+                b"transformer_ffn_block\n"
+                b"model.blocks.0.ffn\n8\n12\n1\n"
+                b"@V102_QKN_CLIP@\n7.0\n",
+                fp16_raw,
+            )
+            self.assertNotIn(b"\n10.0\n20.0\n",fp16_raw)
+            self.assertNotIn(b"\n30.0\n40.0\n",fp16_raw)
 
             calibration_json = temp_dir / "calibration.json"
             config = self._tiny_config(use_qk_norm=True,swiglu_clip=7.0)

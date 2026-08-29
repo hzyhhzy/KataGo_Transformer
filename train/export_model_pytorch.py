@@ -61,6 +61,9 @@ parser.add_argument(
     action="store_true",
     required=False,
 )
+
+
+V102_TRANSFORMER_EXTENSION_MARKER = "@V102_QKN_CLIP@"
 parser.add_argument(
     '-int8-pt-clip4',
     help='Explicitly export native v104 with embedded clip4/per-tensor INT8 weights',
@@ -175,13 +178,20 @@ def main(args):
 
     # Ignore what's in the config if less than 11 since a lot of testing models
     # are on old version but actually have various new architectures.
-    # Native v105 extends the transformer wire format with per-head Q/K
-    # RMSNorm, a SwiGLU operand-clipping scalar, and a mandatory calibrated
-    # product range on every FFN. Old versions retain their original layout.
-    needs_native_v105 = bool(model_config.get("use_qk_norm",False)) or \
-        any(block.swiglu_clip is not None for _, block in transformer_layers) or \
-        int8_calibration is not None or \
-        (cpu_ptq_base and source_checkpoint_version == 102)
+    # Q/K RMSNorm and SwiGLU clipping are FP16 transformer semantics carried by
+    # a marker-delimited v102 extension. Native v105 is reserved for the v102
+    # INT8/PTQ representation and therefore always requires calibration ranges.
+    needs_extended_v102 = bool(model_config.get("use_qk_norm",False)) or \
+        any(block.swiglu_clip is not None for _, block in transformer_layers)
+    needs_native_v105 = int8_calibration is not None
+    if needs_extended_v102 and not needs_native_v105 and source_checkpoint_version != 102:
+        raise ValueError(
+            "FP16 QKN/clip export requires a native v102 checkpoint"
+        )
+    if needs_native_v105 and source_checkpoint_version != 102:
+        raise ValueError(
+            "native v105 INT8 export requires a native v102 checkpoint"
+        )
     version = max(model_config["version"],105 if needs_native_v105 else 11)
     true_version = version
     # Hack to be able to export version 14 as version 15
@@ -518,7 +528,10 @@ def main(args):
         writeln(block.head_dim)
         writeln(1 if block.use_rope else 0)
         writeln(1 if block.learnable_rope else 0)
-        if version >= 105:
+        if version == 102 and block.use_qk_norm:
+            writeln(V102_TRANSFORMER_EXTENSION_MARKER)
+            writeln(1)
+        elif version >= 105:
             writeln(1 if block.use_qk_norm else 0)
             layer_name = name[:-len(".attention")]
             if int8_calibration is None or layer_name not in int8_calibration:
@@ -531,7 +544,7 @@ def main(args):
         write_matmul(name+".k_proj", block.k_proj.weight)
         write_matmul(name+".v_proj", block.v_proj.weight)
         write_matmul(name+".out_proj", block.out_proj.weight)
-        if version >= 105 and block.use_qk_norm:
+        if (version == 102 or version >= 105) and block.use_qk_norm:
             write_transformer_norm(name+".q_norm",block.q_norm)
             write_transformer_norm(name+".k_norm",block.k_norm)
 
@@ -556,7 +569,10 @@ def main(args):
         writeln(block.q_proj.in_features)
         writeln(block.ffn_dim)
         writeln(1 if block.use_swiglu else 0)
-        if version >= 105:
+        if version == 102 and block.swiglu_clip is not None:
+            writeln(V102_TRANSFORMER_EXTENSION_MARKER)
+            writeln(float(block.swiglu_clip))
+        elif version >= 105:
             # This is a model semantic, never a PTQ override. Zero means the
             # checkpoint has no SwiGLU operand clipping.
             writeln(0.0 if block.swiglu_clip is None else float(block.swiglu_clip))
