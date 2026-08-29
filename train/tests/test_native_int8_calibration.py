@@ -20,6 +20,7 @@ from native_int8_calibration import (
     TransformerBoundaryHooks,
     activation_qdq_scales_float32,
     canonical_float32,
+    cuda_int8_wire_version,
     dequantize_symmetric_int8_fp16,
     make_activation_samples,
     native_code_domain_swiglu_factor_int8,
@@ -63,6 +64,12 @@ def _config(**updates):
 
 
 class NativeInt8CalibrationTests(unittest.TestCase):
+    def test_cuda_int8_wire_version_follows_float_family(self):
+        self.assertEqual(cuda_int8_wire_version(102),105)
+        self.assertEqual(cuda_int8_wire_version(11),205)
+        with self.assertRaises(ValueError):
+            cuda_int8_wire_version(15)
+
     def test_activation_qdq_uses_independent_float32_dequant_scale(self):
         max_abs = 3.7
         multiplier, dequant = activation_qdq_scales_float32(max_abs)

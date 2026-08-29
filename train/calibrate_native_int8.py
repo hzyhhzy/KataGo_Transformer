@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Calibrate native v105 activation ranges from original training NPZ rows."""
+"""Calibrate native CUDA INT8 v105/v205 ranges from training NPZ rows."""
 
 import argparse
 import logging
@@ -25,9 +25,9 @@ from native_int8_calibration import (
     QMIN,
     SCHEMA_NAME,
     SCHEMA_VERSION,
-    WIRE_VERSION,
     TransformerBoundaryHooks,
     candidate_thresholds,
+    cuda_int8_wire_version,
     dataset_source_record,
     expand_npz_paths,
     make_activation_samples,
@@ -45,7 +45,7 @@ def _parse_args():
         description=(
             "Collect FP16 transformer boundary distributions on one NPZ split, "
             "select a percentile policy using real training loss on an independent "
-            "validation split, and emit a strict native v105 calibration JSON."
+            "validation split, and emit strict native CUDA INT8 calibration JSON."
         )
     )
     parser.add_argument("-checkpoint", required=True)
@@ -260,6 +260,7 @@ def calibrate(args):
         verbose=True,
     )
     model = swa_model if args.use_swa else raw_model
+    wire_version = cuda_int8_wire_version(int(model.config["version"]))
     model.eval()
     model.configure_flex_attention(False)
     layers = transformer_blocks_in_wire_order(model)
@@ -402,7 +403,7 @@ def calibrate(args):
     document = {
         "schema": SCHEMA_NAME,
         "schemaVersion": SCHEMA_VERSION,
-        "wireVersion": WIRE_VERSION,
+        "wireVersion": wire_version,
         "source": {
             "checkpoint": checkpoint_record,
             "calibrationData": dataset_source_record(calibration_files),
@@ -471,6 +472,7 @@ def calibrate(args):
         layer_order=layer_order,
         use_swa=args.use_swa,
         pos_len=args.pos_len,
+        wire_version=wire_version,
     )
     write_calibration_json(output, document)
     logging.info(

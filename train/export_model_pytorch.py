@@ -11,7 +11,6 @@ import json
 import datetime
 import logging
 import gzip
-import io
 import numpy as np
 from collections import defaultdict
 from pathlib import Path
@@ -30,8 +29,8 @@ from model_pytorch import (
     TransformerRoPEGQABlock,
 )
 from load_model import load_model
-from native_int8_v104 import upgrade_v102_bytes
 from native_int8_calibration import (
+    cuda_int8_wire_version,
     load_calibration_json,
     transformer_blocks_in_wire_order,
     validate_calibration_document,
@@ -55,8 +54,8 @@ parser.add_argument('-gzip', help='Write a deterministic .bin.gz file instead of
 parser.add_argument(
     '-cpu-ptq-base',
     help=(
-        'Export the FP32 staging format used by the unified CPU-PTQ exporter: '
-        'checkpoint v102 becomes native v105 and checkpoint v11 becomes native v205.'
+        'Deprecated compatibility flag. CPU quantization now stages through the '
+        'ordinary floating v102/v11 model instead of v105/v205.'
     ),
     action="store_true",
     required=False,
@@ -66,16 +65,17 @@ parser.add_argument(
 V102_TRANSFORMER_EXTENSION_MARKER = "@V102_QKN_CLIP@"
 parser.add_argument(
     '-int8-pt-clip4',
-    help='Explicitly export native v104 with embedded clip4/per-tensor INT8 weights',
+    help='Retired legacy v104 export option; use CUDA v105/v205 calibration instead',
     action="store_true",
     required=False,
 )
 parser.add_argument(
+    '-cuda-int8-calibration-json',
     '-int8-calibration-json',
     dest='int8_calibration_json',
     help=(
-        'Strict PTQ calibration JSON. Supplying it upgrades a supported '
-        'SwiGLU Transformer export to the extended native v105 wire format.'
+        'Strict CUDA INT8 calibration JSON. Supplying it maps floating v102/v11 '
+        'to CUDA INT8 v105/v205 respectively.'
     ),
     required=False,
 )
@@ -94,6 +94,12 @@ def main(args):
     cpu_ptq_base = args["cpu_ptq_base"]
     int8_pt_clip4 = args["int8_pt_clip4"]
     calibration_json_path = args["int8_calibration_json"]
+
+    if int8_pt_clip4:
+        raise ValueError(
+            "native v104 export is retired; CUDA INT8 must use v105/v205 with "
+            "-cuda-int8-calibration-json"
+        )
 
     if pos_len <= 0:
         raise ValueError("-pos-len must be positive")
@@ -122,114 +128,69 @@ def main(args):
         verbose=True,
     )
     model_config = model.config
+    source_checkpoint_version = int(model_config["version"])
     model_to_export = swa_model if swa_model is not None else model
     transformer_layers = transformer_blocks_in_wire_order(model_to_export)
     transformer_layer_order = [name for name, _ in transformer_layers]
 
-    if int8_pt_clip4 and calibration_json_path is not None:
-        raise ValueError("-int8-pt-clip4 and -int8-calibration-json are mutually exclusive")
     if calibration_json_path is not None:
         if not transformer_layers:
             raise ValueError("-int8-calibration-json requires at least one Transformer layer")
         calibration_document = load_calibration_json(
             Path(calibration_json_path).resolve()
         )
+        cuda_wire_version = cuda_int8_wire_version(source_checkpoint_version)
         int8_calibration = validate_calibration_document(
             calibration_document,
             checkpoint_path=Path(checkpoint_file).resolve(),
             layer_order=transformer_layer_order,
             use_swa=use_swa,
             pos_len=pos_len,
+            wire_version=cuda_wire_version,
         )
     else:
         int8_calibration = None
+        cuda_wire_version = None
 
-    source_checkpoint_version = int(model_config["version"])
-    if cpu_ptq_base and source_checkpoint_version not in (11, 102):
+    if cpu_ptq_base and cuda_wire_version is not None:
         raise ValueError(
-            "-cpu-ptq-base supports checkpoint versions 11 and 102 only"
+            "-cpu-ptq-base and CUDA INT8 calibration are mutually exclusive"
         )
-    if cpu_ptq_base and int8_pt_clip4:
-        raise ValueError("-cpu-ptq-base and -int8-pt-clip4 are mutually exclusive")
-    if (
-        cpu_ptq_base
-        and source_checkpoint_version == 11
-        and int8_calibration is not None
-    ):
-        raise ValueError(
-            "checkpoint v11 uses the v205 staging schema and does not accept "
-            "native-v105 static activation calibration"
+    if cpu_ptq_base:
+        logging.warning(
+            "-cpu-ptq-base is deprecated; exporting the ordinary floating v%d base",
+            source_checkpoint_version,
         )
-    if cpu_ptq_base and source_checkpoint_version == 102 and int8_calibration is None:
-        # v105 has four legacy static-activation fields per Transformer layer.
-        # v106 performs dynamic rowwise activation quantization and deliberately
-        # does not consume them, but the staging body must remain structurally
-        # valid. Positive unit placeholders avoid coupling CPU-PTQ export to the
-        # unrelated native-v105 static-activation calibration workflow.
-        int8_calibration = {
-            layer_name: {
-                "attentionInputQuantMaxAbs": 1.0,
-                "attentionOutputQuantMaxAbs": 1.0,
-                "ffnInputQuantMaxAbs": 1.0,
-                "productQuantMaxAbs": 1.0,
-            }
-            for layer_name in transformer_layer_order
-        }
 
     # Ignore what's in the config if less than 11 since a lot of testing models
     # are on old version but actually have various new architectures.
     # Q/K RMSNorm and SwiGLU clipping are FP16 transformer semantics carried by
-    # a marker-delimited v102 extension. Native v105 is reserved for the v102
-    # INT8/PTQ representation and therefore always requires calibration ranges.
+    # a marker-delimited v102 extension. CUDA INT8 v105/v205 always requires
+    # calibration ranges and is selected independently from QKN/clip.
     needs_extended_v102 = bool(model_config.get("use_qk_norm",False)) or \
         any(block.swiglu_clip is not None for _, block in transformer_layers)
-    needs_native_v105 = int8_calibration is not None
-    if needs_extended_v102 and not needs_native_v105 and source_checkpoint_version != 102:
+    cuda_int8 = int8_calibration is not None
+    if needs_extended_v102 and not cuda_int8 and source_checkpoint_version != 102:
         raise ValueError(
             "FP16 QKN/clip export requires a native v102 checkpoint"
         )
-    if needs_native_v105 and source_checkpoint_version != 102:
-        raise ValueError(
-            "native v105 INT8 export requires a native v102 checkpoint"
-        )
-    version = max(model_config["version"],105 if needs_native_v105 else 11)
+    version = max(model_config["version"],11)
     true_version = version
     # Hack to be able to export version 14 as version 15
     if version == 14 and export_14_as_15:
         version = 15
-    output_version = version
-    if cpu_ptq_base:
-        if version == 11:
-            output_version = 205
-        elif version != 105:
-            raise ValueError(
-                f"-cpu-ptq-base expected a v105 or v11 native schema, got v{version}"
-            )
-    if int8_pt_clip4 and version != 102:
-        raise ValueError("-int8-pt-clip4 requires a native v102 model")
-
-    if version >= 105 and transformer_layers and int8_calibration is None:
-        raise ValueError(
-            "extended native v105 Transformer export requires -int8-calibration-json"
-        )
-
+    output_version = cuda_wire_version if cuda_int8 else version
     # WRITING MODEL ----------------------------------------------------------------
     extension = ".bin.gz" if gzip_output else ".bin"
     mode = "wb"
     output_path = os.path.join(export_dir, filename_prefix + extension)
     raw_f = None
-    if int8_pt_clip4:
-        # Preserve the ordinary v102 serialization exactly, then derive all
-        # explicit INT8 bytes from those serialized FP32 masters in one strict
-        # in-memory transaction. The default v102 path below remains untouched.
-        f = io.BytesIO()
-    else:
-        raw_f = open(output_path, mode)
-    if gzip_output and not int8_pt_clip4:
+    raw_f = open(output_path, mode)
+    if gzip_output:
         # Do not embed a timestamp or source filename. Given the same checkpoint,
         # CLI arguments, and zlib runtime, this makes the compressed stream stable.
         f = gzip.GzipFile(filename="", mode=mode, fileobj=raw_f, mtime=0)
-    elif not int8_pt_clip4:
+    else:
         f = raw_f
     def writeln(s):
         f.write((str(s)+"\n").encode(encoding="ascii",errors="backslashreplace"))
@@ -528,23 +489,23 @@ def main(args):
         writeln(block.head_dim)
         writeln(1 if block.use_rope else 0)
         writeln(1 if block.learnable_rope else 0)
-        if version == 102 and block.use_qk_norm:
-            writeln(V102_TRANSFORMER_EXTENSION_MARKER)
-            writeln(1)
-        elif version >= 105:
+        if cuda_int8:
             writeln(1 if block.use_qk_norm else 0)
             layer_name = name[:-len(".attention")]
-            if int8_calibration is None or layer_name not in int8_calibration:
-                raise ValueError(f"{name}: missing INT8 calibration")
+            if layer_name not in int8_calibration:
+                raise ValueError(f"{name}: missing CUDA INT8 calibration")
             writeln(int8_calibration[layer_name]["attentionInputQuantMaxAbs"])
             writeln(int8_calibration[layer_name]["attentionOutputQuantMaxAbs"])
+        elif version == 102 and block.use_qk_norm:
+            writeln(V102_TRANSFORMER_EXTENSION_MARKER)
+            writeln(1)
 
         write_transformer_norm(name+".norm1", block.norm1)
         write_matmul(name+".q_proj", block.q_proj.weight)
         write_matmul(name+".k_proj", block.k_proj.weight)
         write_matmul(name+".v_proj", block.v_proj.weight)
         write_matmul(name+".out_proj", block.out_proj.weight)
-        if (version == 102 or version >= 105) and block.use_qk_norm:
+        if (cuda_int8 or version == 102) and block.use_qk_norm:
             write_transformer_norm(name+".q_norm",block.q_norm)
             write_transformer_norm(name+".k_norm",block.k_norm)
 
@@ -569,19 +530,19 @@ def main(args):
         writeln(block.q_proj.in_features)
         writeln(block.ffn_dim)
         writeln(1 if block.use_swiglu else 0)
-        if version == 102 and block.swiglu_clip is not None:
-            writeln(V102_TRANSFORMER_EXTENSION_MARKER)
-            writeln(float(block.swiglu_clip))
-        elif version >= 105:
-            # This is a model semantic, never a PTQ override. Zero means the
-            # checkpoint has no SwiGLU operand clipping.
+        if cuda_int8:
+            # This is a model semantic, never a quantization override. Zero
+            # means the checkpoint has no SwiGLU operand clipping.
             writeln(0.0 if block.swiglu_clip is None else float(block.swiglu_clip))
             layer_name = name[:-len(".ffn")]
-            if int8_calibration is None or layer_name not in int8_calibration:
-                raise ValueError(f"{name}: missing INT8 calibration")
+            if layer_name not in int8_calibration:
+                raise ValueError(f"{name}: missing CUDA INT8 calibration")
             writeln(int8_calibration[layer_name]["ffnInputQuantMaxAbs"])
             writeln(int8_calibration[layer_name]["productQuantMaxAbs"])
             used_int8_calibration_layers.add(layer_name)
+        elif version == 102 and block.swiglu_clip is not None:
+            writeln(V102_TRANSFORMER_EXTENSION_MARKER)
+            writeln(float(block.swiglu_clip))
 
         write_transformer_norm(name+".norm", block.norm2)
         write_matmul(name+".ffn_linear1", block.ffn_linear1.weight)
@@ -758,31 +719,13 @@ def main(args):
     else:
         logging.info("Writing model")
         write_model(model)
-    if int8_calibration is not None and used_int8_calibration_layers != set(transformer_layer_order):
+    if cuda_int8 and used_int8_calibration_layers != set(transformer_layer_order):
         raise ValueError(
             "INT8 calibration consumption did not match Transformer wire order"
         )
-    if int8_pt_clip4:
-        v102_body = f.getvalue()
-        f.close()
-        upgraded = upgrade_v102_bytes(v102_body)
-        raw_f = open(output_path, mode)
-        if gzip_output:
-            with gzip.GzipFile(filename="", mode=mode, fileobj=raw_f, mtime=0) as gzip_f:
-                gzip_f.write(upgraded.data)
-        else:
-            raw_f.write(upgraded.data)
+    f.close()
+    if gzip_output:
         raw_f.close()
-        logging.info(
-            "Embedded native v104 INT8 trailer: entries=%d payload_bytes=%d payload_sha256=%s",
-            len(upgraded.entries),
-            len(upgraded.payload),
-            upgraded.payload_sha256,
-        )
-    else:
-        f.close()
-        if gzip_output:
-            raw_f.close()
 
     with open(os.path.join(export_dir,"metadata.json"),"w") as f:
         train_state = other_state_dict["train_state"]

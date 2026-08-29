@@ -3,8 +3,8 @@
 
 The two supported format pairs intentionally share one projection encoding:
 
-* v105 -> v106 for source checkpoint version 102
-* v205 -> v206 for source checkpoint version 11
+* v102 -> v106
+* v11 -> v206
 
 Every non-projection byte is preserved.  Each Transformer Q/K/V/O and SwiGLU
 up/gate/down ``@BIN@`` FP32 block is replaced by an ``@S7P@`` or ``@S8P@``
@@ -44,8 +44,8 @@ class FormatSpec:
 
 
 FORMAT_BY_BASE_VERSION = {
-    105: FormatSpec(
-        105,
+    102: FormatSpec(
+        102,
         106,
         102,
         22,
@@ -56,8 +56,8 @@ FORMAT_BY_BASE_VERSION = {
             (24, 192, 6, 512): "b24c192h6-f512",
         },
     ),
-    205: FormatSpec(
-        205,
+    11: FormatSpec(
+        11,
         206,
         11,
         22,
@@ -547,7 +547,7 @@ def convert(
     spec = FORMAT_BY_BASE_VERSION.get(header.version)
     if spec is None:
         raise ValueError(
-            f"source must be a CPU-PTQ FP32 base v105 or v205, got v{header.version}"
+            f"source must be a floating native v102 or v11 model, got v{header.version}"
         )
     projections = scan_projections(source_payload)
     attention_headers = scan_attention_headers(source_payload)
@@ -666,7 +666,7 @@ def convert(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Convert native CPU-PTQ base v105/v205 to v106/v206 using the "
+            "Convert floating native v102/v11 to CPU INT8 v106/v206 using the "
             "same canonical S7/S8 projection format"
         )
     )

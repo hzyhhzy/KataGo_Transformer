@@ -1,4 +1,4 @@
-"""Shared contracts for native v105 post-training INT8 calibration.
+"""Shared contracts for native CUDA INT8 calibration (v105/v205).
 
 The calibration JSON deliberately does not contain SwiGLU clipping. Clipping
 is a trained model semantic and is always read from the checkpoint by the
@@ -29,7 +29,12 @@ from model_pytorch import (
 
 SCHEMA_NAME = "katago.native-int8-calibration"
 SCHEMA_VERSION = 1
-WIRE_VERSION = 105
+CUDA_INT8_WIRE_VERSION_BY_FLOAT_VERSION = {
+    102: 105,
+    11: 205,
+}
+# Backward-compatible name for callers and fixtures targeting the v102 family.
+WIRE_VERSION = CUDA_INT8_WIRE_VERSION_BY_FLOAT_VERSION[102]
 QMIN = -127
 QMAX = 127
 BOUNDARY_FIELDS = (
@@ -62,6 +67,17 @@ DEFAULT_CANDIDATES = (
     ("minmax", None),
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def cuda_int8_wire_version(float_model_version: int) -> int:
+    """Map a floating native model version to its CUDA INT8 wire version."""
+    try:
+        return CUDA_INT8_WIRE_VERSION_BY_FLOAT_VERSION[int(float_model_version)]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "CUDA INT8 export supports floating model versions 102 and 11 only, "
+            f"got {float_model_version}"
+        ) from exc
 
 
 def sha256_file(path: Path) -> str:
@@ -877,6 +893,7 @@ def validate_calibration_document(
     layer_order: Sequence[str],
     use_swa: bool,
     pos_len: int,
+    wire_version: int = WIRE_VERSION,
 ) -> Dict[str, Dict[str, float]]:
     """Fail closed and return the selected per-layer ranges for export."""
     _reject_clip_keys(document)
@@ -890,8 +907,10 @@ def validate_calibration_document(
     )
     if document["schema"] != SCHEMA_NAME or document["schemaVersion"] != SCHEMA_VERSION:
         raise ValueError("unsupported native INT8 calibration schema")
-    if document["wireVersion"] != WIRE_VERSION:
-        raise ValueError(f"calibration wireVersion must be {WIRE_VERSION}")
+    if wire_version not in CUDA_INT8_WIRE_VERSION_BY_FLOAT_VERSION.values():
+        raise ValueError(f"unsupported CUDA INT8 wire version {wire_version}")
+    if document["wireVersion"] != wire_version:
+        raise ValueError(f"calibration wireVersion must be {wire_version}")
 
     source = document["source"]
     _require_exact_keys(

@@ -19,8 +19,8 @@ from native_int8_calibration import (
     BOUNDARY_FIELDS,
     SCHEMA_NAME,
     SCHEMA_VERSION,
-    WIRE_VERSION,
     WEIGHT_SCALE_FIELDS,
+    cuda_int8_wire_version,
     sha256_file,
     transformer_blocks_in_wire_order,
 )
@@ -176,7 +176,7 @@ class NativeTransformerExportTests(unittest.TestCase):
         document = {
             "schema": SCHEMA_NAME,
             "schemaVersion": SCHEMA_VERSION,
-            "wireVersion": WIRE_VERSION,
+            "wireVersion": cuda_int8_wire_version(int(config["version"])),
             "source": {
                 "checkpoint": {
                     "sha256": sha256_file(checkpoint),
@@ -375,7 +375,7 @@ class NativeTransformerExportTests(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def test_int8_v104_flag_rejects_nonproduction_topology(self):
+    def test_int8_v104_flag_is_retired(self):
         temp_dir = TRAIN_DIR / "tests" / ("native_export_" + uuid.uuid4().hex)
         temp_dir.mkdir()
         try:
@@ -395,7 +395,7 @@ class NativeTransformerExportTests(unittest.TestCase):
                 text=True,
             )
             self.assertNotEqual(completed.returncode, 0)
-            self.assertIn("requires C256/H8 learned-RoPE attention", completed.stdout)
+            self.assertIn("native v104 export is retired", completed.stdout)
             self.assertFalse((temp_dir / "export" / "model.bin").exists())
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -427,7 +427,7 @@ class NativeTransformerExportTests(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def test_cpu_ptq_flag_isolated_from_cuda_v104_and_v105(self):
+    def test_cpu_float_staging_is_separate_from_cuda_int8(self):
         temp_dir = TRAIN_DIR / "tests" / ("native_export_" + uuid.uuid4().hex)
         temp_dir.mkdir()
         try:
@@ -455,9 +455,8 @@ class NativeTransformerExportTests(unittest.TestCase):
             cpu_staging_export = subprocess.run(
                 self._export_command(
                     checkpoint,
-                    temp_dir / "cpu-v105",
+                    temp_dir / "cpu-v102",
                     gzip_output=False,
-                    calibration_json=calibration_json,
                     cpu_ptq_base=True,
                 ),
                 cwd=TRAIN_DIR,
@@ -469,10 +468,29 @@ class NativeTransformerExportTests(unittest.TestCase):
             self.assertEqual(
                 cpu_staging_export.returncode, 0, cpu_staging_export.stdout
             )
-            self.assertEqual(
-                (temp_dir / "cuda-v105" / "model.bin").read_bytes(),
-                (temp_dir / "cpu-v105" / "model.bin").read_bytes(),
+            cuda_raw = (temp_dir / "cuda-v105" / "model.bin").read_bytes()
+            cpu_base_raw = (temp_dir / "cpu-v102" / "model.bin").read_bytes()
+            self.assertEqual(cuda_raw.split(b"\n", 3)[1], b"105")
+            self.assertEqual(cpu_base_raw.split(b"\n", 3)[1], b"102")
+            self.assertNotEqual(cuda_raw, cpu_base_raw)
+            self.assertIn(b"@V102_QKN_CLIP@\n", cpu_base_raw)
+
+            mixed_targets = subprocess.run(
+                self._export_command(
+                    checkpoint,
+                    temp_dir / "mixed-targets",
+                    gzip_output=False,
+                    calibration_json=calibration_json,
+                    cpu_ptq_base=True,
+                ),
+                cwd=TRAIN_DIR,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
             )
+            self.assertNotEqual(mixed_targets.returncode, 0)
+            self.assertIn("mutually exclusive", mixed_targets.stdout)
 
             mixed = subprocess.run(
                 self._export_command(
@@ -489,8 +507,56 @@ class NativeTransformerExportTests(unittest.TestCase):
                 text=True,
             )
             self.assertNotEqual(mixed.returncode, 0)
-            self.assertIn("mutually exclusive", mixed.stdout)
+            self.assertIn("native v104 export is retired", mixed.stdout)
             self.assertFalse((temp_dir / "mixed" / "model.bin").exists())
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_cuda_int8_version_follows_float_family(self):
+        temp_dir = TRAIN_DIR / "tests" / ("native_export_" + uuid.uuid4().hex)
+        temp_dir.mkdir()
+        try:
+            checkpoint = temp_dir / "checkpoint-v11.ckpt"
+            config = self._tiny_config(version=11)
+            self._save_checkpoint(checkpoint, config)
+            calibration_json = temp_dir / "calibration-v205.json"
+            self._write_calibration_json(checkpoint,config,calibration_json)
+
+            float_export = subprocess.run(
+                self._export_command(
+                    checkpoint, temp_dir / "float", gzip_output=False
+                ),
+                cwd=TRAIN_DIR,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self.assertEqual(float_export.returncode, 0, float_export.stdout)
+            float_raw = (temp_dir / "float" / "model.bin").read_bytes()
+            self.assertEqual(float_raw.split(b"\n", 3)[1], b"11")
+
+            cuda_export = subprocess.run(
+                self._export_command(
+                    checkpoint,
+                    temp_dir / "cuda",
+                    gzip_output=False,
+                    calibration_json=calibration_json,
+                ),
+                cwd=TRAIN_DIR,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self.assertEqual(cuda_export.returncode, 0, cuda_export.stdout)
+            cuda_raw = (temp_dir / "cuda" / "model.bin").read_bytes()
+            self.assertEqual(cuda_raw.split(b"\n", 3)[1], b"205")
+            self.assertIn(
+                b"transformer_ffn_block\n"
+                b"model.blocks.0.ffn\n8\n12\n1\n0.0\n30.0\n40.0\n",
+                cuda_raw,
+            )
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 

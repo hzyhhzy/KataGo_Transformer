@@ -112,14 +112,14 @@ class CpuPtqV106Tests(unittest.TestCase):
         )
 
     def test_native_format_pairs_share_projection_encoding(self) -> None:
-        self.assertEqual(FORMAT_BY_BASE_VERSION[105].quantized_version, 106)
-        self.assertEqual(FORMAT_BY_BASE_VERSION[205].quantized_version, 206)
-        self.assertEqual(FORMAT_BY_BASE_VERSION[105].global_inputs, 39)
-        self.assertEqual(FORMAT_BY_BASE_VERSION[205].global_inputs, 19)
+        self.assertEqual(FORMAT_BY_BASE_VERSION[102].quantized_version, 106)
+        self.assertEqual(FORMAT_BY_BASE_VERSION[11].quantized_version, 206)
+        self.assertEqual(FORMAT_BY_BASE_VERSION[102].global_inputs, 39)
+        self.assertEqual(FORMAT_BY_BASE_VERSION[11].global_inputs, 19)
 
         values = np.arange(6, dtype="<f4").reshape(2, 3)
         fp32_payload = (
-            b"toy\n205\n22\n19\n"
+            b"toy\n11\n22\n19\n"
             b"model.blocks.0.attention.q_proj\n2\n3\n"
             + FP32_MARKER
             + values.tobytes(order="C")
@@ -127,7 +127,7 @@ class CpuPtqV106Tests(unittest.TestCase):
         )
         header = parse_header(fp32_payload)
         self.assertEqual((header.version, header.spatial_inputs, header.global_inputs),
-                         (205, 22, 19))
+                         (11, 22, 19))
         projection = scan_projections(fp32_payload)[0]
         self.assertEqual(projection.canonical_name, "blocks.0.q_proj")
         np.testing.assert_array_equal(projection.values_input_major, values)
