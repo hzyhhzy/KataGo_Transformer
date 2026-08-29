@@ -94,6 +94,8 @@ class NativeTransformerExportTests(unittest.TestCase):
         gzip_output,
         int8_pt_clip4=False,
         calibration_json=None,
+        cpu_ptq_base=False,
+        export_14_as_15=False,
     ):
         command = [
             sys.executable,
@@ -115,6 +117,10 @@ class NativeTransformerExportTests(unittest.TestCase):
             command.append("-int8-pt-clip4")
         if calibration_json is not None:
             command.extend(("-int8-calibration-json",str(calibration_json)))
+        if cpu_ptq_base:
+            command.append("-cpu-ptq-base")
+        if export_14_as_15:
+            command.append("-export-14-as-15")
         return command
 
     def _write_calibration_json(self, checkpoint, config, path, values=None):
@@ -391,6 +397,100 @@ class NativeTransformerExportTests(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("requires C256/H8 learned-RoPE attention", completed.stdout)
             self.assertFalse((temp_dir / "export" / "model.bin").exists())
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_cpu_ptq_change_preserves_export_14_as_15_header(self):
+        temp_dir = TRAIN_DIR / "tests" / ("native_export_" + uuid.uuid4().hex)
+        temp_dir.mkdir()
+        try:
+            checkpoint = temp_dir / "checkpoint.ckpt"
+            self._save_checkpoint(checkpoint, self._tiny_config(version=14))
+            completed = subprocess.run(
+                self._export_command(
+                    checkpoint,
+                    temp_dir / "export",
+                    gzip_output=False,
+                    export_14_as_15=True,
+                ),
+                cwd=TRAIN_DIR,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+            header = (temp_dir / "export" / "model.bin").read_bytes().split(
+                b"\n", 3
+            )
+            self.assertEqual(header[1], b"15")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_cpu_ptq_flag_isolated_from_cuda_v104_and_v105(self):
+        temp_dir = TRAIN_DIR / "tests" / ("native_export_" + uuid.uuid4().hex)
+        temp_dir.mkdir()
+        try:
+            checkpoint = temp_dir / "checkpoint.ckpt"
+            config = self._tiny_config(use_qk_norm=True,swiglu_clip=7.0)
+            self._save_checkpoint(checkpoint, config)
+            calibration_json = temp_dir / "calibration.json"
+            self._write_calibration_json(checkpoint, config, calibration_json)
+
+            cuda_export = subprocess.run(
+                self._export_command(
+                    checkpoint,
+                    temp_dir / "cuda-v105",
+                    gzip_output=False,
+                    calibration_json=calibration_json,
+                ),
+                cwd=TRAIN_DIR,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self.assertEqual(cuda_export.returncode, 0, cuda_export.stdout)
+
+            cpu_staging_export = subprocess.run(
+                self._export_command(
+                    checkpoint,
+                    temp_dir / "cpu-v105",
+                    gzip_output=False,
+                    calibration_json=calibration_json,
+                    cpu_ptq_base=True,
+                ),
+                cwd=TRAIN_DIR,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self.assertEqual(
+                cpu_staging_export.returncode, 0, cpu_staging_export.stdout
+            )
+            self.assertEqual(
+                (temp_dir / "cuda-v105" / "model.bin").read_bytes(),
+                (temp_dir / "cpu-v105" / "model.bin").read_bytes(),
+            )
+
+            mixed = subprocess.run(
+                self._export_command(
+                    checkpoint,
+                    temp_dir / "mixed",
+                    gzip_output=False,
+                    int8_pt_clip4=True,
+                    cpu_ptq_base=True,
+                ),
+                cwd=TRAIN_DIR,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            self.assertNotEqual(mixed.returncode, 0)
+            self.assertIn("mutually exclusive", mixed.stdout)
+            self.assertFalse((temp_dir / "mixed" / "model.bin").exists())
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 

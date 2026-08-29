@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 import unittest
 
+import numpy as np
 import torch
 
 
@@ -15,6 +16,14 @@ from calibrate_cpu_ptq_v106 import (
     cpu_ptq_model_version,
     gptq_matrix,
     symmetric_codes,
+)
+from convert_cpu_ptq import (
+    FORMAT_BY_BASE_VERSION,
+    FP32_MARKER,
+    S7_MARKER,
+    parse_header,
+    scan_attention_headers,
+    scan_projections,
 )
 
 
@@ -101,6 +110,55 @@ class CpuPtqV106Tests(unittest.TestCase):
         torch.testing.assert_close(
             scales[:, 0], weight.abs().amax(dim=1) / 63.0
         )
+
+    def test_native_format_pairs_share_projection_encoding(self) -> None:
+        self.assertEqual(FORMAT_BY_BASE_VERSION[105].quantized_version, 106)
+        self.assertEqual(FORMAT_BY_BASE_VERSION[205].quantized_version, 206)
+        self.assertEqual(FORMAT_BY_BASE_VERSION[105].global_inputs, 39)
+        self.assertEqual(FORMAT_BY_BASE_VERSION[205].global_inputs, 19)
+
+        values = np.arange(6, dtype="<f4").reshape(2, 3)
+        fp32_payload = (
+            b"toy\n205\n22\n19\n"
+            b"model.blocks.0.attention.q_proj\n2\n3\n"
+            + FP32_MARKER
+            + values.tobytes(order="C")
+            + b"\n"
+        )
+        header = parse_header(fp32_payload)
+        self.assertEqual((header.version, header.spatial_inputs, header.global_inputs),
+                         (205, 22, 19))
+        projection = scan_projections(fp32_payload)[0]
+        self.assertEqual(projection.canonical_name, "blocks.0.q_proj")
+        np.testing.assert_array_equal(projection.values_input_major, values)
+
+        scales = np.asarray([0.25, 0.5, 1.0], dtype="<f4")
+        codes = np.asarray(
+            [[1, 2], [3, 4], [-5, -6]], dtype=np.int8
+        )
+        s7_payload = (
+            b"toy\n206\n22\n19\n"
+            b"model.blocks.0.attention.q_proj\n2\n3\n"
+            + S7_MARKER
+            + scales.tobytes(order="C")
+            + codes.tobytes(order="C")
+            + b"\n"
+        )
+        projection = scan_projections(s7_payload)[0]
+        self.assertEqual(projection.qmax, 63)
+        np.testing.assert_array_equal(projection.scales, scales)
+        np.testing.assert_array_equal(projection.codes_output_major, codes)
+
+        attention = scan_attention_headers(
+            b"transformer_attention_block\n"
+            b"model.blocks.0.attention\n3\n3\n32\n32\n1\n0\n"
+        )[0]
+        self.assertEqual(
+            (attention.block, attention.heads, attention.kv_heads),
+            (0, 3, 3),
+        )
+        self.assertTrue(attention.use_rope)
+        self.assertFalse(attention.learnable_rope)
 
 
 if __name__ == "__main__":

@@ -194,30 +194,66 @@ python train/calibrate_cpu_ptq.py \
     --qmax 63 --board-size 15
 ```
 
-For source v102, pass the resulting manifest to
-`python/convert_cpu_ptq_v106.py` in the KataGo engine repository together with
-a native v105 export from the same checkpoint. The converter checks every
-source projection SHA-256; a manifest cannot silently be paired with another
-model. GPTQ only changes stored projection codes and scales, so it adds no
-inference-time work. CPU-PTQ containers do not store a board size;
-`--board-size` selects calibration data and model positional geometry only.
+`export_cpu_ptq.py` is the single native exporter for both format families. It
+accepts either a training checkpoint or an already exported FP32 staging
+model:
 
-For an Ataxx source-v11 checkpoint, `export_cpu_ptq_v206.py` validates the
-checkpoint geometry and every manifest projection hash, then writes the
-dedicated v206 S8 model and a provenance JSON report:
+- checkpoint v102 is staged as native v105 and quantized as v106 (22 spatial,
+  39 global inputs);
+- checkpoint v11 is staged as native v205 and quantized as v206 (22 spatial,
+  19 global inputs).
+
+The three-digit version selects the body schema; the projection marker selects
+S7 (`@S7P@`, qmax 63) or S8 (`@S8P@`, qmax 127). v105/v205 store all weights as
+FP32. v106/v206 preserve the same native body but replace every Transformer
+Q/K/V/O and SwiGLU up/gate/down matrix with per-output-scale INT8 storage.
+S8 is shared by AVX-VNNI and AVX-512 VNNI kernels; S7 is the saturation-safe
+AVX2 representation. The ISA is selected by the engine backend, not encoded in
+the three-digit model version.
+
+The native CUDA INT8 formats remain a separate export path. In particular,
+v104's explicit INT8 trailer and calibrated v105 exports are unchanged;
+`-cpu-ptq-base` is opt-in and is rejected together with `-int8-pt-clip4`.
+
+Export directly from a checkpoint and optionally retain the FP32 staging
+model:
 
 ```bash
-python train/export_cpu_ptq_v206.py \
+python train/export_cpu_ptq.py \
     --checkpoint checkpoint.ckpt \
     --manifest runtime_data/model-s8-gptq.npz \
     --output runtime_data/model-v206.bin.gz \
-    --model-name ataxx-b16c128h4-v206
+    --base-output runtime_data/model-v205.bin.gz \
+    --model-name ataxx-b16c128h4-v206 \
+    --pos-len 7
 ```
 
-The current v206 exporter accepts the qualified Ataxx 7x7
-`b11c96h3-f256` and `b16c128h4-f384` profiles and full-range symmetric S8
-manifests (`qmax=127`). Its gzip stream is deterministic and the native engine
-repackages projection matrices for its VNNI microkernel when loading.
+Or quantize an existing native staging model without loading PyTorch:
+
+```bash
+python train/export_cpu_ptq.py \
+    --source runtime_data/model-v105.bin.gz \
+    --manifest runtime_data/model-s7-gptq.npz \
+    --output runtime_data/model-v106.bin.gz
+```
+
+The converter validates the full supported geometry and every source
+projection SHA-256, so a manifest cannot silently be paired with another
+model. Without `--manifest`, `--projection-bits 7|8` selects deterministic
+per-output max-abs quantization. GPTQ changes only stored codes and scales and
+adds no inference-time work. The gzip stream is deterministic, and the JSON
+report records the input hashes and conversion provenance.
+`export_cpu_ptq_v206.py` and `convert_cpu_ptq_v106.py` remain compatibility
+entry points and call the same implementation.
+
+The supported v106 profiles are `b11c96h3-f256`, `b16c128h4-f384`, and
+`b24c192h6-f512`. The supported v206 profiles are Ataxx
+`b11c96h3-f256` and `b16c128h4-f384`. CPU-PTQ native files do not encode a
+board size; `--pos-len` and `--board-size` select export/calibration geometry,
+while the specialized engine separately asserts its supported board shape.
+Although model v15 has the same 22/19 main input dimensions as v11, it is not
+accepted as v205 because its native schema may include metadata and newer head
+fields.
 
 Loss validation does not require a converter, native model, or inference
 engine. `evaluate_cpu_ptq.py` reads one or more manifests, verifies their

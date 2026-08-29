@@ -53,6 +53,15 @@ parser.add_argument('-export-14-as-15', help='Export model version 14 as 15', ac
 parser.add_argument('-pos-len', help='Board side length used to construct the model', type=int, default=19, required=False)
 parser.add_argument('-gzip', help='Write a deterministic .bin.gz file instead of .bin', action="store_true", required=False)
 parser.add_argument(
+    '-cpu-ptq-base',
+    help=(
+        'Export the FP32 staging format used by the unified CPU-PTQ exporter: '
+        'checkpoint v102 becomes native v105 and checkpoint v11 becomes native v205.'
+    ),
+    action="store_true",
+    required=False,
+)
+parser.add_argument(
     '-int8-pt-clip4',
     help='Explicitly export native v104 with embedded clip4/per-tensor INT8 weights',
     action="store_true",
@@ -79,6 +88,7 @@ def main(args):
     export_14_as_15 = args["export_14_as_15"]
     pos_len = args["pos_len"]
     gzip_output = args["gzip"]
+    cpu_ptq_base = args["cpu_ptq_base"]
     int8_pt_clip4 = args["int8_pt_clip4"]
     calibration_json_path = args["int8_calibration_json"]
 
@@ -131,6 +141,38 @@ def main(args):
     else:
         int8_calibration = None
 
+    source_checkpoint_version = int(model_config["version"])
+    if cpu_ptq_base and source_checkpoint_version not in (11, 102):
+        raise ValueError(
+            "-cpu-ptq-base supports checkpoint versions 11 and 102 only"
+        )
+    if cpu_ptq_base and int8_pt_clip4:
+        raise ValueError("-cpu-ptq-base and -int8-pt-clip4 are mutually exclusive")
+    if (
+        cpu_ptq_base
+        and source_checkpoint_version == 11
+        and int8_calibration is not None
+    ):
+        raise ValueError(
+            "checkpoint v11 uses the v205 staging schema and does not accept "
+            "native-v105 static activation calibration"
+        )
+    if cpu_ptq_base and source_checkpoint_version == 102 and int8_calibration is None:
+        # v105 has four legacy static-activation fields per Transformer layer.
+        # v106 performs dynamic rowwise activation quantization and deliberately
+        # does not consume them, but the staging body must remain structurally
+        # valid. Positive unit placeholders avoid coupling CPU-PTQ export to the
+        # unrelated native-v105 static-activation calibration workflow.
+        int8_calibration = {
+            layer_name: {
+                "attentionInputQuantMaxAbs": 1.0,
+                "attentionOutputQuantMaxAbs": 1.0,
+                "ffnInputQuantMaxAbs": 1.0,
+                "productQuantMaxAbs": 1.0,
+            }
+            for layer_name in transformer_layer_order
+        }
+
     # Ignore what's in the config if less than 11 since a lot of testing models
     # are on old version but actually have various new architectures.
     # Native v105 extends the transformer wire format with per-head Q/K
@@ -138,12 +180,21 @@ def main(args):
     # product range on every FFN. Old versions retain their original layout.
     needs_native_v105 = bool(model_config.get("use_qk_norm",False)) or \
         any(block.swiglu_clip is not None for _, block in transformer_layers) or \
-        int8_calibration is not None
+        int8_calibration is not None or \
+        (cpu_ptq_base and source_checkpoint_version == 102)
     version = max(model_config["version"],105 if needs_native_v105 else 11)
     true_version = version
     # Hack to be able to export version 14 as version 15
     if version == 14 and export_14_as_15:
         version = 15
+    output_version = version
+    if cpu_ptq_base:
+        if version == 11:
+            output_version = 205
+        elif version != 105:
+            raise ValueError(
+                f"-cpu-ptq-base expected a v105 or v11 native schema, got v{version}"
+            )
     if int8_pt_clip4 and version != 102:
         raise ValueError("-int8-pt-clip4 requires a native v102 model")
 
@@ -176,7 +227,7 @@ def main(args):
         f.write(s.encode(encoding="ascii",errors="backslashreplace"))
 
     writeln(model_name)
-    writeln(version)
+    writeln(output_version)
     writeln(modelconfigs.get_num_bin_input_features(model_config))
     writeln(modelconfigs.get_num_global_input_features(model_config))
 
