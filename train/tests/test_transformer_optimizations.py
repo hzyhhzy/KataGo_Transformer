@@ -70,6 +70,35 @@ class TransformerOptimizationTests(unittest.TestCase):
         self.assertTrue(production["use_qk_norm"])
         self.assertEqual(production["swiglu_clip"], 4.0)
 
+    def test_cpu_ptq_profile_configs_and_variants(self):
+        expected = {
+            "b16c128h4tfrs": (16, 128, 4, 384),
+            "b24c192h6tfrs": (24, 192, 6, 512),
+        }
+        for name, (blocks, channels, heads, ffn_channels) in expected.items():
+            with self.subTest(name=name):
+                base = modelconfigs.config_of_name[name]
+                self.assertEqual(base["trunk_num_channels"], channels)
+                self.assertEqual(base["transformer_heads"], heads)
+                self.assertEqual(base["transformer_kv_heads"], heads)
+                self.assertEqual(base["transformer_ffn_channels"], ffn_channels)
+                self.assertEqual(base["v2_size"], 96)
+                self.assertEqual(
+                    base["block_kind"],
+                    [
+                        [f"rconv{i}", "transformerropesg"]
+                        for i in range(1, blocks + 1)
+                    ],
+                )
+
+                production = modelconfigs.config_of_name[
+                    name[:-4] + "tflrs-bng-silu-v102-qkn-clip4"
+                ]
+                self.assertTrue(production["learnable_rope"])
+                self.assertEqual(production["version"], 102)
+                self.assertTrue(production["use_qk_norm"])
+                self.assertEqual(production["swiglu_clip"], 4.0)
+
     def test_full_clip_model_config_suffix(self):
         swiglu_name = "b11c96h4tflrs-bng-silu"
         non_swiglu_name = "b11c96h3tfr"
